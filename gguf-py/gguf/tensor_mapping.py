@@ -1087,6 +1087,7 @@ class TensorNameMap:
             "vision_tower.patch_conv", # pixtral
             "vision_model.patch_embedding.linear", # llama 4
             "visual.patch_embed.proj", # qwen2vl
+            "vision_model.patch_embed.proj",
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_POS: (
@@ -1103,6 +1104,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.q_proj", # llama4
             "vision_tower.transformer.layers.{bid}.attention.q_proj", # pixtral
             "visual.blocks.{bid}.attn.q", # qwen2vl, generated
+            "vision_model.blocks.{bid}.attn.q",
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_Q_NORM: (
@@ -1116,6 +1118,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.k_proj", # llama4
             "vision_tower.transformer.layers.{bid}.attention.k_proj", # pixtral
             "visual.blocks.{bid}.attn.k", # qwen2vl, generated
+            "vision_model.blocks.{bid}.attn.k",
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_K_NORM: (
@@ -1129,6 +1132,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.v_proj", # llama4
             "vision_tower.transformer.layers.{bid}.attention.v_proj", # pixtral
             "visual.blocks.{bid}.attn.v", # qwen2vl, generated
+            "vision_model.blocks.{bid}.attn.v",
         ),
 
         MODEL_TENSOR.V_ENC_INPUT_NORM: (
@@ -1139,6 +1143,7 @@ class TensorNameMap:
             "vision_tower.transformer.layers.{bid}.attention_norm", # pixtral
             "vision_model.model.layers.{bid}.input_layernorm", # llama4
             "visual.blocks.{bid}.norm1", # qwen2vl
+            "vision_model.blocks.{bid}.norm1",
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_O: (
@@ -1149,6 +1154,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.o_proj", # llama4
             "vision_tower.transformer.layers.{bid}.attention.o_proj", # pixtral
             "visual.blocks.{bid}.attn.proj", # qwen2vl
+            "vision_model.blocks.{bid}.attn.proj",
         ),
 
         MODEL_TENSOR.V_ENC_POST_ATTN_NORM: (
@@ -1159,6 +1165,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.post_attention_layernorm", # llama4
             "vision_tower.transformer.layers.{bid}.ffn_norm", # pixtral
             "visual.blocks.{bid}.norm2", # qwen2vl
+            "vision_model.blocks.{bid}.norm2",
         ),
 
         MODEL_TENSOR.V_ENC_FFN_UP: (
@@ -1169,6 +1176,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.mlp.fc1", # llama4
             "visual.blocks.{bid}.mlp.fc1", # qwen2vl
             "visual.blocks.{bid}.mlp.up_proj", # qwen2.5vl
+            "vision_model.blocks.{bid}.mlp.fc1",
         ),
 
         MODEL_TENSOR.V_ENC_FFN_GATE: (
@@ -1184,6 +1192,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.mlp.fc2", # llama4
             "visual.blocks.{bid}.mlp.fc2", # qwen2vl
             "visual.blocks.{bid}.mlp.down_proj", # qwen2.5vl
+            "vision_model.blocks.{bid}.mlp.fc2",
         ),
 
         MODEL_TENSOR.V_LAYER_SCALE_1: (
@@ -1205,6 +1214,7 @@ class TensorNameMap:
             "model.vision_model.post_layernorm", # SmolVLM
             "vision_model.layernorm_post", # llama4
             "visual.merger.ln_q", # qwen2vl
+            "vision_model.ln",
         ),
 
         MODEL_TENSOR.V_MM_INP_PROJ: (

@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+from functools import reduce
 from enum import IntEnum
 from pathlib import Path
 from hashlib import sha256
@@ -1246,7 +1247,7 @@ class MmprojModel(ModelBase):
             self.gguf_writer.add_vision_embedding_length(self.find_vparam(["hidden_size"]))
             self.gguf_writer.add_vision_feed_forward_length(self.find_vparam(["intermediate_size"]))
             self.gguf_writer.add_vision_block_count(self.find_vparam(self.n_block_keys))
-            self.gguf_writer.add_vision_head_count(self.find_vparam(["num_attention_heads"]))
+            self.gguf_writer.add_vision_head_count(self.find_vparam(["num_attention_heads", "num_heads"]))
 
             # preprocessor config
             self.gguf_writer.add_vision_image_mean(self.preprocessor_config["image_mean"])
@@ -2895,7 +2896,7 @@ class Ernie4_5Model(TextModel):
         return [(self.map_tensor_name(name), data_torch)]
 
 
-@ModelBase.register("Ernie4_5_MoeForCausalLM")
+@ModelBase.register("Ernie4_5_MoeForCausalLM", "Ernie4_5_VLMoeForConditionalGeneration")
 class Ernie4_5MoeModel(Ernie4_5Model):
     model_arch = gguf.MODEL_ARCH.ERNIE4_5_MOE
     _experts: list[dict[str, Tensor]] | None = None
@@ -2903,6 +2904,7 @@ class Ernie4_5MoeModel(Ernie4_5Model):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._experts = [{} for _ in range(self.block_count)]
+        self.split_cache = {}
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -2918,6 +2920,18 @@ class Ernie4_5MoeModel(Ernie4_5Model):
                 self.gguf_writer.add_expert_shared_feed_forward_length(shared_expert_intermediate_size // num_key_value_heads)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith((".weight_1", ".bias_1")):
+            self.split_cache[name] = data_torch
+            return []
+
+        part1_name = name + "_1"
+        if part1_name in self.split_cache:
+            part1_tensor = self.split_cache.pop(part1_name)
+            dim = 0
+            if 'down' in name or 'proj' in name and 'up' not in name and 'gate' not in name:
+                dim = 1
+            data_torch = torch.cat((data_torch, part1_tensor), dim=dim)
+
         # Modify correction bias name as in DeepseekV2
         if name.endswith("e_score_correction_bias"):
             name = name.replace("e_score_correction_bias", "e_score_correction.bias")
@@ -2949,7 +2963,8 @@ class Ernie4_5MoeModel(Ernie4_5Model):
                 self._experts = [{} for _ in range(self.block_count)]
 
             self._experts[bid][name] = data_torch
-
+            n_experts_val = self.hparams["moe_num_experts"]
+            n_experts = reduce(lambda x, y: x + y, n_experts_val, 0) if isinstance(n_experts_val, list) else n_experts_val
             if len(self._experts[bid]) >= n_experts * 3:
                 tensors: list[tuple[str, Tensor]] = []
 
@@ -3012,6 +3027,67 @@ class Qwen2VLModel(TextModel):
             # skip multimodal tensors
             return []
         return [(self.map_tensor_name(name), data_torch)]
+@ModelBase.register("Ernie4_5_VLMoeForConditionalGeneration")
+class Ernie45VLModel(MmprojModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_arch = gguf.MODEL_ARCH.ERNIE4_5_VL_MOE
+        if self.hparams_vision is not None and "image_size" not in self.hparams_vision:
+            if "size" in self.preprocessor_config and "height" in self.preprocessor_config["size"]:
+                self.hparams_vision["image_size"] = self.preprocessor_config["size"]["height"]
+            elif "crop_size" in self.preprocessor_config and "height" in self.preprocessor_config["crop_size"]:
+                self.hparams_vision["image_size"] = self.preprocessor_config["crop_size"]["height"]
+        if self.hparams_vision is not None and "intermediate_size" not in self.hparams_vision:
+            self.hparams_vision["intermediate_size"] = self.hparams_vision["hidden_size"] * self.hparams_vision["mlp_ratio"]
+        if self.hparams_vision is not None and "num_hidden_layers" not in self.hparams_vision and "num_layers" not in self.hparams_vision:
+            # FIXME: This is a placeholder calculation.
+            # The actual value may need to be derived differently.
+            self.hparams_vision["num_hidden_layers"] = 32
+
+    def set_gguf_parameters(self):
+        # super().set_gguf_parameters() # don't call parent
+        vision_config = self.hparams_vision
+        assert vision_config is not None
+        self.gguf_writer.add_vision_embedding_length(vision_config["hidden_size"])
+        self.gguf_writer.add_vision_feed_forward_length(vision_config["intermediate_size"])
+        if (block_count := vision_config.get("num_hidden_layers", vision_config.get("num_layers"))) is None:
+            raise KeyError("Could not find num_hidden_layers or num_layers in vision config")
+        self.gguf_writer.add_vision_block_count(block_count)
+        if (head_count := vision_config.get("num_attention_heads", vision_config.get("num_heads"))) is None:
+            raise KeyError("Could not find num_attention_heads or num_heads in vision config")
+        self.gguf_writer.add_vision_head_count(head_count)
+        self.gguf_writer.add_vision_image_size(vision_config["image_size"])
+        self.gguf_writer.add_vision_patch_size(vision_config["patch_size"])
+        self.gguf_writer.add_vision_projection_dim(self.hparams["hidden_size"])
+        self.gguf_writer.add_clip_projector_type("mlp")
+        if "spatial_conv_size" in self.hparams:
+            self.gguf_writer.add_vision_spatial_merge_size(self.hparams["spatial_conv_size"])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        del bid
+        if name.startswith("vision_model."):
+            if ".attn.qkv." in name:
+                if data_torch.ndim == 2: # weight
+                    c3, _ = data_torch.shape
+                else: # bias
+                    c3 = data_torch.shape[0]
+                assert c3 % 3 == 0
+                c = c3 // 3
+                wq = data_torch[:c]
+                wk = data_torch[c: c * 2]
+                wv = data_torch[c * 2:]
+                yield from [
+                    (self.map_tensor_name(name.replace("qkv", "q")), wq),
+                    (self.map_tensor_name(name.replace("qkv", "k")), wk),
+                    (self.map_tensor_name(name.replace("qkv", "v")), wv),
+                ]
+                return
+            if "mm_resampler" in name:
+                name = name.replace("mm_resampler", "resampler")
+            yield self.map_tensor_name(name), data_torch
+        else:
+            # This is a projector model, so we skip the text model tensors.
+            return
 
 
 @ModelBase.register("Qwen2VLModel", "Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration")

@@ -194,6 +194,12 @@ struct clip_hparams {
     int32_t n_wa_pattern = 0;
     int32_t spatial_merge_size = 0;
 
+    // ernie4.5 vl
+    int32_t in_dim = 0;
+    int32_t out_dim = 0;
+    int32_t spatial_conv_size = 0;
+    int32_t temporal_conv_size = 0;
+
     // audio
     int32_t n_mel_bins = 0; // whisper preprocessor
     int32_t proj_stack_factor = 0; // ultravox
@@ -354,6 +360,17 @@ struct clip_model {
     ggml_tensor * conv1d_2_b = nullptr;
     ggml_tensor * mm_norm_pre_w = nullptr;
     ggml_tensor * mm_norm_mid_w = nullptr;
+
+    // ernie4.5 vl
+    ggml_tensor * mm_resampler_in_proj_w = nullptr;
+    ggml_tensor * mm_resampler_in_proj_b = nullptr;
+    ggml_tensor * mm_resampler_out_proj_w = nullptr;
+    ggml_tensor * mm_resampler_out_proj_b = nullptr;
+    ggml_tensor * mm_resampler_pos_emb = nullptr;
+    ggml_tensor * mm_resampler_spatial_conv_w = nullptr;
+    ggml_tensor * mm_resampler_spatial_conv_b = nullptr;
+    ggml_tensor * mm_resampler_temporal_conv_w = nullptr;
+    ggml_tensor * mm_resampler_temporal_conv_b = nullptr;
 };
 
 struct clip_ctx {
@@ -1528,6 +1545,37 @@ struct clip_graph {
         return gf;
     }
 
+    ggml_cgraph * build_ernie45_vl_resampler() {
+        ggml_tensor * inp = build_inp();
+        inp = ggml_add(ctx0, inp, model.mm_resampler_pos_emb);
+
+        inp = ggml_mul_mat(ctx0, model.mm_resampler_in_proj_w, inp);
+        inp = ggml_add(ctx0, inp, model.mm_resampler_in_proj_b);
+
+        const int in_dim = hparams.in_dim;
+        const int out_dim = hparams.out_dim;
+        const int spatial_conv_size = hparams.spatial_conv_size;
+        const int temporal_conv_size = hparams.temporal_conv_size;
+
+        ggml_tensor * cur = inp;
+        for (int i = 0; i < 2; i++) {
+            cur = ggml_reshape_3d(ctx0, cur, in_dim, spatial_conv_size, temporal_conv_size);
+            cur = ggml_conv_1d(ctx0, model.mm_resampler_spatial_conv_w, cur, 1, 1, 0);
+            cur = ggml_add(ctx0, cur, model.mm_resampler_spatial_conv_b);
+            cur = ggml_reshape_3d(ctx0, cur, in_dim, temporal_conv_size, spatial_conv_size);
+            cur = ggml_conv_1d(ctx0, model.mm_resampler_temporal_conv_w, cur, 1, 1, 0);
+            cur = ggml_add(ctx0, cur, model.mm_resampler_temporal_conv_b);
+        }
+
+        cur = ggml_reshape_2d(ctx0, cur, out_dim, temporal_conv_size * spatial_conv_size);
+        cur = ggml_mul_mat(ctx0, model.mm_resampler_out_proj_w, cur);
+        cur = ggml_add(ctx0, cur, model.mm_resampler_out_proj_b);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
 private:
     //
     // utility functions
@@ -1980,6 +2028,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 res = graph.build_whisper_enc();
             } break;
+        case PROJECTOR_TYPE_ERNIE45_VL_RESAMPLER:
+            {
+                res = graph.build_ernie45_vl_resampler();
+            } break;
         default:
             {
                 res = graph.build_llava();
@@ -2258,6 +2310,13 @@ struct clip_model_loader {
                         }
                         hparams.ffn_op = FFN_GELU_ERF;
                         log_ffn_op = "gelu_erf"; // temporary solution for logging
+                    } break;
+                case PROJECTOR_TYPE_ERNIE45_VL_RESAMPLER:
+                    {
+                        get_u32(KEY_IN_DIM, hparams.in_dim);
+                        get_u32(KEY_OUT_DIM, hparams.out_dim);
+                        get_u32(KEY_SPATIAL_CONV_SIZE, hparams.spatial_conv_size);
+                        get_u32(KEY_TEMPORAL_CONV_SIZE, hparams.temporal_conv_size);
                     } break;
                 default:
                     break;
@@ -2549,6 +2608,18 @@ struct clip_model_loader {
                     model.mm_model_proj    = get_tensor(TN_MM_PROJECTOR);
                     model.mm_model_mlp_1_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 1, "weight"));
                     model.mm_model_mlp_2_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 2, "weight"));
+                } break;
+            case PROJECTOR_TYPE_ERNIE45_VL_RESAMPLER:
+                {
+                    model.mm_resampler_in_proj_w = get_tensor(TN_MM_RESAMPLER_IN_PROJ_W);
+                    model.mm_resampler_in_proj_b = get_tensor(TN_MM_RESAMPLER_IN_PROJ_B);
+                    model.mm_resampler_out_proj_w = get_tensor(TN_MM_RESAMPLER_OUT_PROJ_W);
+                    model.mm_resampler_out_proj_b = get_tensor(TN_MM_RESAMPLER_OUT_PROJ_B);
+                    model.mm_resampler_pos_emb = get_tensor(TN_MM_RESAMPLER_POS_EMB);
+                    model.mm_resampler_spatial_conv_w = get_tensor(TN_MM_RESAMPLER_SPATIAL_CONV_W);
+                    model.mm_resampler_spatial_conv_b = get_tensor(TN_MM_RESAMPLER_SPATIAL_CONV_B);
+                    model.mm_resampler_temporal_conv_w = get_tensor(TN_MM_RESAMPLER_TEMPORAL_CONV_W);
+                    model.mm_resampler_temporal_conv_b = get_tensor(TN_MM_RESAMPLER_TEMPORAL_CONV_B);
                 } break;
             default:
                 GGML_ASSERT(false && "unknown projector type");

@@ -45,6 +45,12 @@
 #define KEY_ATTN_WINDOW_SIZE      "clip.vision.window_size"
 #define KEY_MINICPMV_VERSION      "clip.minicpmv_version"
 
+// ernie4.5-vl specific
+#define KEY_IN_DIM                "clip.vision.in_dim"
+#define KEY_OUT_DIM               "clip.vision.out_dim"
+#define KEY_SPATIAL_CONV_SIZE     "clip.vision.spatial_conv_size"
+#define KEY_TEMPORAL_CONV_SIZE    "clip.vision.temporal_conv_size"
+
 // audio-specific
 #define KEY_A_NUM_MEL_BINS      "clip.audio.num_mel_bins"
 #define KEY_A_PROJ_STACK_FACTOR "clip.audio.projector.stack_factor"
@@ -111,6 +117,17 @@
 #define TN_MM_NORM_PRE  "mm.a.norm_pre.%s"
 #define TN_MM_NORM_MID  "mm.a.norm_mid.%s"
 
+// ernie4.5-vl
+#define TN_MM_RESAMPLER_IN_PROJ_W         "mm.resampler.in_proj.weight"
+#define TN_MM_RESAMPLER_IN_PROJ_B         "mm.resampler.in_proj.bias"
+#define TN_MM_RESAMPLER_OUT_PROJ_W        "mm.resampler.out_proj.weight"
+#define TN_MM_RESAMPLER_OUT_PROJ_B        "mm.resampler.out_proj.bias"
+#define TN_MM_RESAMPLER_POS_EMB           "mm.resampler.pos_emb"
+#define TN_MM_RESAMPLER_SPATIAL_CONV_W    "mm.resampler.spatial_conv.weight"
+#define TN_MM_RESAMPLER_SPATIAL_CONV_B    "mm.resampler.spatial_conv.bias"
+#define TN_MM_RESAMPLER_TEMPORAL_CONV_W   "mm.resampler.temporal_conv.weight"
+#define TN_MM_RESAMPLER_TEMPORAL_CONV_B   "mm.resampler.temporal_conv.bias"
+
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
@@ -131,6 +148,7 @@ enum projector_type {
     PROJECTOR_TYPE_LLAMA4,
     PROJECTOR_TYPE_QWEN2A,
     PROJECTOR_TYPE_QWEN25O, // will be replaced by QWEN2A or QWEN25VL depending on clip_ctx
+    PROJECTOR_TYPE_ERNIE45_VL_RESAMPLER,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -150,6 +168,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_LLAMA4,    "llama4"},
     { PROJECTOR_TYPE_QWEN2A,    "qwen2a"},
     { PROJECTOR_TYPE_QWEN25O,   "qwen2.5o"},
+    { PROJECTOR_TYPE_ERNIE45_VL_RESAMPLER, "ernie45_vl_resampler"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

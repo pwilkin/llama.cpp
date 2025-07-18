@@ -365,6 +365,7 @@ class MODEL_ARCH(IntEnum):
     ARCEE            = auto()
     ERNIE4_5         = auto()
     ERNIE4_5_MOE     = auto()
+    ERNIE4_5_VL_MOE  = auto()
     HUNYUAN_MOE      = auto()
     SMOLLM3          = auto()
     LFM2             = auto()
@@ -583,6 +584,7 @@ class MODEL_TENSOR(IntEnum):
     V_RESMPL_QUERY       = auto() # minicpmv
     V_TOK_EMBD_IMG_BREAK = auto() # pixtral
     V_MM_PATCH_MERGER    = auto() # mistral small 3.1
+    
     # audio (mtmd)
     A_ENC_EMBD_POS       = auto()
     A_ENC_CONV1D         = auto()
@@ -682,6 +684,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.ARCEE:            "arcee",
     MODEL_ARCH.ERNIE4_5:         "ernie4_5",
     MODEL_ARCH.ERNIE4_5_MOE:     "ernie4_5-moe",
+    MODEL_ARCH.ERNIE4_5_VL_MOE:  "ernie4_5-vl-moe",
     MODEL_ARCH.FALCON_H1:        "falcon-h1",
     MODEL_ARCH.HUNYUAN_MOE:      "hunyuan-moe",
     MODEL_ARCH.SMOLLM3:          "smollm3",
@@ -901,6 +904,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_RESMPL_QUERY:            "resampler.query",
     MODEL_TENSOR.V_TOK_EMBD_IMG_BREAK:      "v.token_embd.img_break", # pixtral
     MODEL_TENSOR.V_MM_PATCH_MERGER:         "mm.patch_merger", # mistral small 3.1
+    
     # audio (mtmd)
     MODEL_TENSOR.A_ENC_EMBD_POS:            "a.position_embd",
     MODEL_TENSOR.A_ENC_CONV1D:              "a.conv1d.{bid}",
@@ -2045,6 +2049,67 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
+    MODEL_ARCH.ERNIE4_5_VL_MOE: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.V_MMPROJ,
+        MODEL_TENSOR.V_MMPROJ_FC,
+        MODEL_TENSOR.V_MMPROJ_MLP,
+        MODEL_TENSOR.V_MMPROJ_PEG,
+        MODEL_TENSOR.V_ENC_EMBD_CLS,
+        MODEL_TENSOR.V_ENC_EMBD_PATCH,
+        MODEL_TENSOR.V_ENC_EMBD_POS,
+        MODEL_TENSOR.V_ENC_INPUT_NORM,
+        MODEL_TENSOR.V_ENC_ATTN_Q,
+        MODEL_TENSOR.V_ENC_ATTN_Q_NORM,
+        MODEL_TENSOR.V_ENC_ATTN_K,
+        MODEL_TENSOR.V_ENC_ATTN_K_NORM,
+        MODEL_TENSOR.V_ENC_ATTN_V,
+        MODEL_TENSOR.V_ENC_ATTN_O,
+        MODEL_TENSOR.V_ENC_ATTN_O_NORM,
+        MODEL_TENSOR.V_ENC_POST_ATTN_NORM,
+        MODEL_TENSOR.V_ENC_FFN_UP,
+        MODEL_TENSOR.V_ENC_FFN_GATE,
+        MODEL_TENSOR.V_ENC_FFN_DOWN,
+        MODEL_TENSOR.V_LAYER_SCALE_1,
+        MODEL_TENSOR.V_LAYER_SCALE_2,
+        MODEL_TENSOR.V_PRE_NORM,
+        MODEL_TENSOR.V_POST_NORM,
+        MODEL_TENSOR.V_MM_INP_PROJ,
+        MODEL_TENSOR.V_MM_INP_NORM,
+        MODEL_TENSOR.V_MM_SOFT_EMB_NORM,
+        MODEL_TENSOR.V_RESMPL_POS_EMBD_K,
+        MODEL_TENSOR.V_RESMPL_ATTN_Q,
+        MODEL_TENSOR.V_RESMPL_ATTN_K,
+        MODEL_TENSOR.V_RESMPL_ATTN_V,
+        MODEL_TENSOR.V_RESMPL_ATTN_OUT,
+        MODEL_TENSOR.V_RESMPL_KV,
+        MODEL_TENSOR.V_RESMPL_KV_NORM,
+        MODEL_TENSOR.V_RESMPL_POST_NORM,
+        MODEL_TENSOR.V_RESMPL_Q_NORM,
+        MODEL_TENSOR.V_RESMPL_PROJ,
+        MODEL_TENSOR.V_RESMPL_QUERY,
+        MODEL_TENSOR.V_TOK_EMBD_IMG_BREAK,
+        MODEL_TENSOR.V_MM_PATCH_MERGER,
     ],
     MODEL_ARCH.PLM: [
         MODEL_TENSOR.TOKEN_EMBD,
