@@ -2213,9 +2213,10 @@ static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggm
         const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
         const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
 
-        float        * dst_ptr  = (float  *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
-        float        * src  = (float  *)           ((char *)       src0->data  + i03*nb03  + i02*nb02  + i01*nb01 );
-        ggml_vec_tri_f32(ne0, i01, dst_ptr, src, keep_org_val, c, ttype);
+        float * dst_ptr  = (float  *) ((char *) dst->data   + i03*nb3  + i02*nb2  + i01*nb1);
+        float * src_ptr  = (float  *) ((char *) src0->data  + i03*nb03 + i02*nb02 + i01*nb01);
+
+        ggml_vec_tri_f32(ne0, i01, dst_ptr, src_ptr, keep_org_val, c, ttype);
     }
 
 }
