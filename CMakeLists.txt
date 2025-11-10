@@ -189,6 +189,12 @@ endif()
 
 add_subdirectory(src)
 
+# ---- JSON Parser library ----
+# Header‑only library providing ordered JSON, conversion helpers,
+# and a monotonic partial parser.
+add_library(json_parser INTERFACE)
+target_include_directories(json_parser INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/common/json)
+
 #
 # utils, programs, examples and tests
 #
@@ -236,6 +242,9 @@ set_target_properties(llama
         PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
 
 install(TARGETS llama LIBRARY PUBLIC_HEADER)
+
+# Ensure json_parser is available to consumers of the project
+install(TARGETS json_parser EXPORT json_parserTargets)
 
 configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in

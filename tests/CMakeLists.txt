@@ -182,6 +182,10 @@ endif()
 llama_build_and_test(test-chat-parser.cpp)
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
+
+# JSON parser unit test
+llama_build_and_test(test-json-parser.cpp)
+target_link_libraries(test-json-parser PRIVATE json_parser)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-regex-partial.cpp)
 
