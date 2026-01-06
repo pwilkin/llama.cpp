@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <memory>
+#include <stdexcept>
 #include <unordered_set>
 #include <filesystem>
 
@@ -2685,7 +2686,15 @@ private:
 
                 slot.i_batch = -1;
 
-                common_sampler_accept(slot.smpl.get(), id, true);
+                try {
+                    common_sampler_accept(slot.smpl.get(), id, true);
+                } catch (std::runtime_error & e) {
+                    SLT_ERR(slot, "Error when accepting token for sampler: %s\n", e.what());
+                    send_error(slot, std::string("Error when accepting token for sampler: ") + e.what(), ERROR_TYPE_SERVER);
+                    slot.release();
+                    slot.i_batch = -1;
+                    continue; // continue loop of slots
+                }
 
                 slot.n_decoded += 1;
 
