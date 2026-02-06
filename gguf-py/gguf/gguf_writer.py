@@ -983,6 +983,9 @@ class GGUFWriter:
     def add_ssm_dt_b_c_rms(self, value: bool) -> None:
         self.add_bool(Keys.SSM.DT_B_C_RMS.format(arch=self.arch), value)
 
+    def add_kda_head_dim(self, value: int) -> None:
+        self.add_uint32(Keys.KDA.HEAD_DIM.format(arch=self.arch), value)
+
     def add_tokenizer_model(self, model: str) -> None:
         self.add_string(Keys.Tokenizer.MODEL, model)
 
@@ -1115,6 +1118,12 @@ class GGUFWriter:
 
     def add_vision_image_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.IMAGE_SIZE, value)
+
+    def add_vision_max_pixels(self, value: int) -> None:
+        self.add_uint32(Keys.ClipVision.IMAGE_MAX_PIXELS, value)
+
+    def add_vision_min_pixels(self, value: int) -> None:
+        self.add_uint32(Keys.ClipVision.IMAGE_MIN_PIXELS, value)
 
     def add_vision_preproc_image_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.PREPROC_IMAGE_SIZE, value)

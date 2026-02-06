@@ -122,7 +122,6 @@ enum llm_arch {
     LLM_ARCH_PANGU_EMBED,
     LLM_ARCH_MISTRAL3,
     LLM_ARCH_MIMO2,
-    LLM_ARCH_STEP35,
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
@@ -167,8 +166,6 @@ enum llm_kv {
     LLM_KV_EXPERT_FEED_FORWARD_LENGTH,
     LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH,
     LLM_KV_EXPERT_CHUNK_FEED_FORWARD_LENGTH,
-    LLM_KV_SWIGLU_LIMITS,
-    LLM_KV_SWIGLU_LIMITS_SHARED,
     LLM_KV_USE_PARALLEL_RESIDUAL,
     LLM_KV_TENSOR_DATA_LAYOUT,
     LLM_KV_EXPERT_COUNT,
@@ -228,7 +225,6 @@ enum llm_kv {
     LLM_KV_ATTENTION_VALUE_LENGTH_MLA,
 
     LLM_KV_ROPE_DIMENSION_COUNT,
-    LLM_KV_ROPE_DIMENSION_COUNT_PER_LAYER,
     LLM_KV_ROPE_DIMENSION_SECTIONS,
     LLM_KV_ROPE_FREQ_BASE,
     LLM_KV_ROPE_FREQ_BASE_SWA,
@@ -412,6 +408,8 @@ enum llm_tensor {
     LLM_TENSOR_SSM_F_A,             // kimi: forget gate projection A
     LLM_TENSOR_SSM_F_B,             // kimi: forget gate projection B
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient
+    LLM_TENSOR_SSM_A_LOG,           // kimi: A_log (pre-converted in GGUF)
+    LLM_TENSOR_SSM_DT_B,            // kimi: dt bias
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
     LLM_TENSOR_TIME_MIX_W0,

@@ -31,7 +31,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
-            llama-sampling.cpp
+            llama-sampler.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
@@ -84,6 +84,7 @@ add_library(llama
             models/internlm2.cpp
             models/jais.cpp
             models/jamba.cpp
+            models/kimi-linear.cpp
             models/lfm2.cpp
             models/llada-moe.cpp
             models/llada.cpp
@@ -140,6 +141,7 @@ add_library(llama
             models/xverse.cpp
             models/mistral3.cpp
             models/graph-context-mamba.cpp
+            models/graph-context-delta.cpp
             )
 
 set_target_properties(llama PROPERTIES

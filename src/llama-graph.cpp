@@ -533,6 +533,50 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+// TODO: Hybrid input classes are a bit redundant.
+// Instead of creating a hybrid input, the graph can simply create 2 separate inputs.
+// Refactoring is required in the future.
+void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+
+    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+
+    const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    if (inp_rs->s_copy) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+        int32_t * data = (int32_t *) inp_rs->s_copy->data;
+
+        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx->get_recr()->s_copy(i);
+        }
+    }
+}
+
+bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+
+    this->mctx = mctx;
+
+    bool res = true;
+
+    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+
+    res &= inp_attn->self_kq_mask->ne[0] == mctx->get_attn()->get_n_kv();
+    res &= inp_attn->self_kq_mask->ne[1] == params.ubatch.n_tokens;
+
+    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+
+    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= inp_rs->head == mctx->get_recr()->get_head();
+    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    return res;
+}
+
 void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     const auto * attn_ctx = mctx->get_attn();
 
@@ -2204,7 +2248,6 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
     ggml_build_forward_expand(gf, output_states);
 
-    // copy extra states which won't be changed further (between n_seqs and n_rs)
     ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0,
@@ -2307,6 +2350,17 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
+
+    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+
+    return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
 }
 
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {
@@ -2460,6 +2514,9 @@ void llm_graph_context::build_sampling() const {
         return;
     }
 
+    std::array<ggml_tensor *, 2> outs;
+    outs[0] = res->t_logits;
+
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     res->add_input(std::move(inp_sampling));
 
@@ -2480,14 +2537,14 @@ void llm_graph_context::build_sampling() const {
     // add a dummy row of logits
     // this trick makes the graph static, regardless of which samplers are activated
     // this is important in order to minimize graph reallocations
-    // TODO: use `ggml_build_forward_select()` when available (https://github.com/ggml-org/llama.cpp/pull/18550)
     ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     for (const auto & [seq_id, sampler] : samplers) {
         const auto it = seq_to_logit_row.find(seq_id);
 
         // inactive samplers always work on the first row
-        const auto row_idx = seq_to_logit_row.find(seq_id) != seq_to_logit_row.end() ? it->second : 0;
+        const auto row_idx = it != seq_to_logit_row.end() ? it->second : 0;
+        const int i_out    = it != seq_to_logit_row.end() ? 1          : 0;
 
         ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row_idx * logits_t->nb[1]);
         ggml_format_name(logits_seq, "logits_seq_%d", seq_id);
@@ -2504,22 +2561,26 @@ void llm_graph_context::build_sampling() const {
 
         if (data.sampled != nullptr) {
             res->t_sampled[seq_id] = data.sampled;
-            ggml_build_forward_expand(gf, data.sampled);
+            outs[1] = data.sampled;
+            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
         if (data.probs != nullptr) {
             res->t_sampled_probs[seq_id] = data.probs;
-            ggml_build_forward_expand(gf, data.probs);
+            outs[1] = data.probs;
+            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
         if (data.logits != nullptr) {
             res->t_sampled_logits[seq_id] = data.logits;
-            ggml_build_forward_expand(gf, data.logits);
+            outs[1] = data.logits;
+            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
         if (data.candidates != nullptr) {
             res->t_candidates[seq_id] = data.candidates;
-            ggml_build_forward_expand(gf, data.candidates);
+            outs[1] = data.candidates;
+            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
     }
 

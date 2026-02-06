@@ -463,12 +463,14 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_state_ngram_simple : public common_speculative_state {
-    common_ngram_simple_state state;
+    common_ngram_simple_config config;
+
+    uint16_t check_id = 0; // used to control the frequency of generating drafts
 
     common_speculative_state_ngram_simple(
             enum common_speculative_type type,
-            common_ngram_simple_state state)
-        : common_speculative_state(type), state(state) {}
+            common_ngram_simple_config config)
+        : common_speculative_state(type), config(config) {}
 
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
@@ -479,7 +481,13 @@ struct common_speculative_state_ngram_simple : public common_speculative_state {
             const llama_tokens & prompt_tgt,
             llama_token id_last,
             llama_tokens & result) override {
-        result = common_ngram_simple_draft(state, prompt_tgt, id_last);
+        ++check_id;
+        if (check_id < config.check_rate) {
+            return;
+        }
+        check_id = 0;
+
+        result = common_ngram_simple_draft(config, prompt_tgt, id_last);
         GGML_UNUSED(params);
     }
 
@@ -889,14 +897,14 @@ common_speculative * common_speculative_init(
                 uint16_t mgram_size_value = ngram_map.size_value;
                 uint16_t check_rate       = ngram_map.check_rate;
 
-                auto config_simple = common_ngram_simple_config{
+                auto config_simple = common_ngram_simple_config {
                     /* .size_ngram      = */ ngram_size_key,
                     /* .size_mgram      = */ mgram_size_value,
                     /* .check_rate      = */ check_rate
                 };
                 auto state = std::make_unique<common_speculative_state_ngram_simple>(
                     /* .type            = */ config.type,
-                    /* .state           = */ common_ngram_simple_state(config_simple)
+                    /* .state           = */ config_simple
                 );
                 impls.push_back(std::move(state));
                 break;
@@ -951,12 +959,8 @@ void common_speculative_begin(common_speculative * spec, const llama_tokens & pr
     }
 
     for (auto & impl : spec->impls) {
-        const int64_t t_start_us = impl->gen_perf ? ggml_time_us() : 0;
-
+        common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(prompt);
-
-        const int64_t t_now_us = impl->gen_perf ? ggml_time_us() : 0;
-        impl->t_begin_us += t_now_us - t_start_us; // accumulate duration for this refresh
     }
 }
 
@@ -971,14 +975,9 @@ llama_tokens common_speculative_draft(
 
     for (auto & impl : spec->impls) {
         {
-            const int64_t t_start_us = impl->gen_perf ? ggml_time_us() : 0;
-
+            common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(params, prompt_tgt, id_last, result);
-
-            const int64_t t_now_us = impl->gen_perf ? ggml_time_us() : 0;
-
             impl->drafts_call_count++;
-            impl->t_draft_us += t_now_us - t_start_us; // accumulate duration for this implementation
         }
 
         if (!result.empty()) {
@@ -1006,15 +1005,15 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
 
     GGML_ASSERT(impl);
 
-    const int64_t t_start_us = impl->gen_perf ? ggml_time_us() : 0;
-    if (n_accepted > 0) {
-        impl->drafts_accepted_count++;
-        impl->drafts_accepted_tokens += n_accepted;
-    }
+    {
+        common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
+        if (n_accepted > 0) {
+            impl->drafts_accepted_count++;
+            impl->drafts_accepted_tokens += n_accepted;
+        }
 
-    impl->accept(n_accepted);
-    const int64_t t_now_us = impl->gen_perf ? ggml_time_us() : 0;
-    impl->t_accept_us += t_now_us - t_start_us; // accumulate duration for this acculumulation
+        impl->accept(n_accepted);
+    }
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
