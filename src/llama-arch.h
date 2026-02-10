@@ -1,9 +1,9 @@
 #pragma once
 
-#include "ggml.h" // ggml_op
+#include "ggml.h"  // ggml_op
 
-#include <string>
 #include <set>
+#include <string>
 
 //
 // gguf constants (sync with gguf.py)
@@ -335,7 +335,7 @@ enum llm_tensor {
     LLM_TENSOR_DENSE_3_OUT,
     LLM_TENSOR_OUTPUT,
     LLM_TENSOR_OUTPUT_NORM,
-    LLM_TENSOR_OUTPUT_NORM_LFM2, // fix for wrong tensor name
+    LLM_TENSOR_OUTPUT_NORM_LFM2,  // fix for wrong tensor name
     LLM_TENSOR_ROPE_FREQS,
     LLM_TENSOR_ROPE_FACTORS_LONG,
     LLM_TENSOR_ROPE_FACTORS_SHORT,
@@ -363,7 +363,7 @@ enum llm_tensor {
     LLM_TENSOR_FFN_GATE_EXP,
     LLM_TENSOR_FFN_UP_EXP,
     LLM_TENSOR_FFN_NORM_EXPS,
-    LLM_TENSOR_FFN_DOWN_EXPS, // merged experts
+    LLM_TENSOR_FFN_DOWN_EXPS,  // merged experts
     LLM_TENSOR_FFN_GATE_EXPS,
     LLM_TENSOR_FFN_UP_EXPS,
     LLM_TENSOR_FFN_DOWN_SHEXP,
@@ -378,45 +378,45 @@ enum llm_tensor {
     LLM_TENSOR_LAYER_OUT_NORM,
     LLM_TENSOR_POST_ATTN_NORM,
     LLM_TENSOR_POST_MLP_NORM,
-    LLM_TENSOR_PER_LAYER_TOKEN_EMBD, // gemma3n
-    LLM_TENSOR_PER_LAYER_MODEL_PROJ, // gemma3n
-    LLM_TENSOR_PER_LAYER_INP_GATE,   // gemma3n
-    LLM_TENSOR_PER_LAYER_PROJ,       // gemma3n
-    LLM_TENSOR_PER_LAYER_PROJ_NORM,  // gemma3n
-    LLM_TENSOR_PER_LAYER_POST_NORM,  // gemma3n
-    LLM_TENSOR_ALTUP_PROJ,           // gemma3n
-    LLM_TENSOR_ALTUP_UNEMBD_PROJ,    // gemma3n
-    LLM_TENSOR_ALTUP_CORRECT_COEF,   // gemma3n
-    LLM_TENSOR_ALTUP_CORRECT_SCALE,  // gemma3n
-    LLM_TENSOR_ALTUP_PREDICT_COEF,   // gemma3n
-    LLM_TENSOR_ALTUP_ROUTER,         // gemma3n
-    LLM_TENSOR_ALTUP_ROUTER_NORM,    // gemma3n
-    LLM_TENSOR_LAUREL_L,             // gemma3n
-    LLM_TENSOR_LAUREL_R,             // gemma3n
-    LLM_TENSOR_LAUREL_POST_NORM,     // gemma3n
+    LLM_TENSOR_PER_LAYER_TOKEN_EMBD,  // gemma3n
+    LLM_TENSOR_PER_LAYER_MODEL_PROJ,  // gemma3n
+    LLM_TENSOR_PER_LAYER_INP_GATE,    // gemma3n
+    LLM_TENSOR_PER_LAYER_PROJ,        // gemma3n
+    LLM_TENSOR_PER_LAYER_PROJ_NORM,   // gemma3n
+    LLM_TENSOR_PER_LAYER_POST_NORM,   // gemma3n
+    LLM_TENSOR_ALTUP_PROJ,            // gemma3n
+    LLM_TENSOR_ALTUP_UNEMBD_PROJ,     // gemma3n
+    LLM_TENSOR_ALTUP_CORRECT_COEF,    // gemma3n
+    LLM_TENSOR_ALTUP_CORRECT_SCALE,   // gemma3n
+    LLM_TENSOR_ALTUP_PREDICT_COEF,    // gemma3n
+    LLM_TENSOR_ALTUP_ROUTER,          // gemma3n
+    LLM_TENSOR_ALTUP_ROUTER_NORM,     // gemma3n
+    LLM_TENSOR_LAUREL_L,              // gemma3n
+    LLM_TENSOR_LAUREL_R,              // gemma3n
+    LLM_TENSOR_LAUREL_POST_NORM,      // gemma3n
     LLM_TENSOR_SSM_IN,
     LLM_TENSOR_SSM_CONV1D,
     LLM_TENSOR_SSM_X,
     LLM_TENSOR_SSM_DT,
     LLM_TENSOR_SSM_DT_NORM,
     LLM_TENSOR_SSM_A,
-    LLM_TENSOR_SSM_A_NOSCAN,        // qwen3next special case with MUL instead of SSM_SCAN
+    LLM_TENSOR_SSM_A_NOSCAN,  // qwen3next special case with MUL instead of SSM_SCAN
     LLM_TENSOR_SSM_B_NORM,
     LLM_TENSOR_SSM_C_NORM,
     LLM_TENSOR_SSM_D,
     LLM_TENSOR_SSM_NORM,
     LLM_TENSOR_SSM_OUT,
-    LLM_TENSOR_SSM_BETA_ALPHA,      // qwen3next
-    LLM_TENSOR_SSM_ALPHA,           // qwen3.5
+    LLM_TENSOR_SSM_BETA_ALPHA,  // qwen3next
+    LLM_TENSOR_SSM_ALPHA,       // qwen3.5
     // Kimi Linear KDA (using SSM_ prefix for consistency)
-    LLM_TENSOR_SSM_CONV1D_Q,        // kimi: Q conv1d weight
-    LLM_TENSOR_SSM_CONV1D_K,        // kimi: K conv1d weight
-    LLM_TENSOR_SSM_CONV1D_V,        // kimi: V conv1d weight
-    LLM_TENSOR_SSM_F_A,             // kimi: forget gate projection A
-    LLM_TENSOR_SSM_F_B,             // kimi: forget gate projection B
-    LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
-    LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
-    LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
+    LLM_TENSOR_SSM_CONV1D_Q,  // kimi: Q conv1d weight
+    LLM_TENSOR_SSM_CONV1D_K,  // kimi: K conv1d weight
+    LLM_TENSOR_SSM_CONV1D_V,  // kimi: V conv1d weight
+    LLM_TENSOR_SSM_F_A,       // kimi: forget gate projection A
+    LLM_TENSOR_SSM_F_B,       // kimi: forget gate projection B
+    LLM_TENSOR_SSM_BETA,      // kimi: beta mixing coefficient and qwen3.5
+    LLM_TENSOR_SSM_G_A,       // kimi: output gate projection A
+    LLM_TENSOR_SSM_G_B,       // kimi: output gate projection B
     LLM_TENSOR_TIME_MIX_W0,
     LLM_TENSOR_TIME_MIX_W1,
     LLM_TENSOR_TIME_MIX_W2,
@@ -461,6 +461,10 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_V_B,
     LLM_TENSOR_ATTN_Q_A_NORM,
     LLM_TENSOR_ATTN_KV_A_NORM,
+    LLM_TENSOR_ATTN_Q_IDX_A,     // DSA indexer query projection A (note: comma in enum, name is "blk.%d.attn_q_idx_a")
+    LLM_TENSOR_ATTN_Q_IDX_B,     // DSA indexer query projection B (note: comma in enum, name is "blk.%d.attn_q_idx_b")
+    LLM_TENSOR_ATTN_Q_IDX_NORM,  // DSA indexer layernorm
+    LLM_TENSOR_ATTN_DSA_IDX_WEIGHTS,  // DSA indexer head weights
     LLM_TENSOR_ATTN_SUB_NORM,
     LLM_TENSOR_FFN_SUB_NORM,
     LLM_TENSOR_DEC_ATTN_NORM,
@@ -534,7 +538,7 @@ enum llm_tensor_layer {
 struct LLM_KV {
     LLM_KV(llm_arch arch, const char * suffix = nullptr);
 
-    llm_arch arch;
+    llm_arch     arch;
     const char * suffix;
 
     std::string operator()(llm_kv kv) const;
@@ -550,11 +554,11 @@ struct LLM_KV {
 //   std::string name = tn(LLM_TENSOR_ATTN_NORM, "weight", 3);     -> "blk.3.attn_norm.weight"
 //
 struct LLM_TN_IMPL {
-    const llm_arch arch;
-    const llm_tensor tensor;
+    const llm_arch     arch;
+    const llm_tensor   tensor;
     const char * const suffix;
-    const int bid;
-    const int xid;
+    const int          bid;
+    const int          xid;
 
     const std::set<llm_tensor> model_tensors;
 
@@ -562,17 +566,11 @@ struct LLM_TN_IMPL {
 
     std::string str() const;
 
-    operator std::string() const {
-        return str();
-    }
+    operator std::string() const { return str(); }
 
-    friend bool operator==(const std::string & str, const LLM_TN_IMPL & tn) {
-        return str == tn.str();
-    }
+    friend bool operator==(const std::string & str, const LLM_TN_IMPL & tn) { return str == tn.str(); }
 
-    friend bool operator!=(const std::string & str, const LLM_TN_IMPL & tn) {
-        return str != tn.str();
-    }
+    friend bool operator!=(const std::string & str, const LLM_TN_IMPL & tn) { return str != tn.str(); }
 };
 
 struct LLM_TN {
@@ -589,10 +587,9 @@ struct LLM_TN {
     }
 };
 
-
 struct llm_tensor_info {
     llm_tensor_layer layer;
-    ggml_op op;
+    ggml_op          op;
 };
 
 const char * llm_arch_name(llm_arch arch);
@@ -602,5 +599,5 @@ llm_arch llm_arch_from_string(const std::string & name);
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor);
 
 bool llm_arch_is_recurrent(const llm_arch & arch);
-bool llm_arch_is_hybrid   (const llm_arch & arch);
+bool llm_arch_is_hybrid(const llm_arch & arch);
 bool llm_arch_is_diffusion(const llm_arch & arch);

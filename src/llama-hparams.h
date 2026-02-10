@@ -7,13 +7,13 @@
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
-#define LLAMA_MAX_EXPERTS 512 // Qwen3 Next
+#define LLAMA_MAX_EXPERTS 512  // Qwen3 Next
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
-    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3,  // applied to the router weights instead of the logits
 };
 
 enum llama_swa_type {
@@ -40,27 +40,34 @@ struct llama_hparams {
     bool use_par_res;
     bool swin_norm;
 
-    uint32_t n_ctx_train; // context size the model was trained on
+    uint32_t n_ctx_train;  // context size the model was trained on
     uint32_t n_embd;
     uint32_t n_embd_features = 0;
     uint32_t n_layer;
-    int32_t n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
+    int32_t  n_layer_kv_from_start = -1;  // if non-negative, the first n_layer_kv_from_start layers have KV cache
     uint32_t n_rot;
-    uint32_t n_embd_head_k; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
-    uint32_t n_embd_head_v; // dimension of values (d_v) aka n_embd_head
-    uint32_t n_expert = 0;
-    uint32_t n_expert_used = 0;
+    uint32_t
+        n_embd_head_k;  // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
+    uint32_t n_embd_head_v;  // dimension of values (d_v) aka n_embd_head
+    uint32_t n_expert        = 0;
+    uint32_t n_expert_used   = 0;
     uint32_t n_rel_attn_bkts = 0;
 
     // note: deepseek2 using MLA converts into MQA with larger heads, then decompresses to MHA
     uint32_t n_embd_head_k_mla_impl = 0;
     uint32_t n_embd_head_v_mla_impl = 0;
 
+    // DeepSeek Sparse Attention (DSA) - experimental
+    uint32_t n_dsa_topk             = 2048;   // Number of tokens to select (default 2048 for DeepSeek V3)
+    uint32_t n_dsa_indexer_heads    = 16;     // Number of indexer heads for DSA scoring
+    uint32_t n_dsa_indexer_head_dim = 64;     // Dimension per indexer head
+    bool     use_dsa                = false;  // Enable DeepSeek Sparse Attention
+
     // for WavTokenizer
     struct llama_hparams_posnet   posnet;
     struct llama_hparams_convnext convnext;
 
-    uint32_t n_shortconv_l_cache  = 0;
+    uint32_t n_shortconv_l_cache = 0;
 
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
@@ -104,26 +111,26 @@ struct llama_hparams {
     uint32_t n_lora_value_res_mix   = 0;
     uint32_t n_lora_gate            = 0;
 
-    float    rope_attn_factor = 1.0f;
-    float    rope_freq_base_train;
-    float    rope_freq_base_train_swa  = 10000.0f;
-    float    rope_freq_scale_train;
-    float    rope_freq_scale_train_swa = 1.0f;
+    float rope_attn_factor = 1.0f;
+    float rope_freq_base_train;
+    float rope_freq_base_train_swa = 10000.0f;
+    float rope_freq_scale_train;
+    float rope_freq_scale_train_swa = 1.0f;
 
     uint32_t n_ctx_orig_yarn;
     float    rope_yarn_log_mul = 0.0f;
 
-    float    yarn_ext_factor  = -1.0f;
-    float    yarn_attn_factor =  1.0f;
-    float    yarn_beta_fast   = 32.0f;
-    float    yarn_beta_slow   =  1.0f;
+    float yarn_ext_factor  = -1.0f;
+    float yarn_attn_factor = 1.0f;
+    float yarn_beta_fast   = 32.0f;
+    float yarn_beta_slow   = 1.0f;
 
     std::array<int, 4> rope_sections;
 
     // Sliding Window Attention (SWA)
-    llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+    llama_swa_type                         swa_type = LLAMA_SWA_TYPE_NONE;
     // the size of the sliding window (0 - no SWA)
-    uint32_t n_swa = 0;
+    uint32_t                               n_swa    = 0;
     // if swa_layers[il] == 1, then layer il is SWA
     // if swa_layers[il] == 0, then layer il is dense (i.e. non-SWA)
     // by default, all layers are dense
@@ -174,11 +181,11 @@ struct llama_hparams {
     uint32_t n_no_rope_layer_step    = 4;
     uint32_t n_attn_temp_floor_scale = 0;
     float    f_attn_temp_scale       = 0.0f;
-    float    f_attn_temp_offset      = 0.0f; // offset position index
+    float    f_attn_temp_offset      = 0.0f;  // offset position index
 
     // gemma3n altup
-    uint32_t n_altup      = 4; // altup_num_inputs
-    uint32_t i_altup_act  = 0; // altup_active_idx
+    uint32_t n_altup      = 4;  // altup_num_inputs
+    uint32_t i_altup_act  = 0;  // altup_active_idx
     uint32_t laurel_rank  = 64;
     uint32_t n_embd_altup = 256;
 
@@ -206,10 +213,9 @@ struct llama_hparams {
     enum llama_rope_type         rope_type               = LLAMA_ROPE_TYPE_NONE;
     enum llama_rope_scaling_type rope_scaling_type_train = LLAMA_ROPE_SCALING_TYPE_NONE;
 
-
     // Step35: optional per-layer clamps for (Swi)GLU
-    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_exp; // clamping for expert FFN
-    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp; // shared expert
+    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_exp;    // clamping for expert FFN
+    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp;  // shared expert
 
     // this value n_pattern means that every nth layer is dense (i.e. non-SWA)
     // dense_first means whether the pattern is start with a dense layer
@@ -298,13 +304,15 @@ struct llama_hparams {
         switch (swa_type) {
             case LLAMA_SWA_TYPE_NONE:
                 {
-                } break;
+                }
+                break;
             case LLAMA_SWA_TYPE_STANDARD:
                 {
                     if (p1 - p0 >= (int32_t) n_swa) {
                         return true;
                     }
-                } break;
+                }
+                break;
             case LLAMA_SWA_TYPE_CHUNKED:
                 {
                     const llama_pos pos_chunk_start = (p1 / n_swa) * n_swa;
@@ -312,22 +320,23 @@ struct llama_hparams {
                     if (p0 < pos_chunk_start) {
                         return true;
                     }
-                } break;
+                }
+                break;
             case LLAMA_SWA_TYPE_SYMMETRIC:
                 {
                     const int32_t half_n_swa = (int32_t) n_swa / 2;
-                    const int32_t pos_diff = p1 - p0;
+                    const int32_t pos_diff   = p1 - p0;
 
                     // Mask if outside the symmetric window
                     if (pos_diff < -half_n_swa || pos_diff > half_n_swa) {
                         return true;
                     }
-                } break;
+                }
+                break;
         }
 
         return false;
     }
-
 
     bool use_mrope() const;
 };

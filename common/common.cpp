@@ -1,21 +1,21 @@
 #if defined(_MSC_VER)
-#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
+#    define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
+
+#include "common.h"
 
 #include "ggml.h"
 #include "gguf.h"
-
-#include "common.h"
-#include "log.h"
 #include "llama.h"
+#include "log.h"
 #include "sampling.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <codecvt>
-#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -31,36 +31,39 @@
 #include <vector>
 
 #if defined(__APPLE__) && defined(__MACH__)
-#include <sys/types.h>
-#include <sys/sysctl.h>
+#    include <sys/sysctl.h>
+#    include <sys/types.h>
 #endif
 
 #if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#   define NOMINMAX
-#endif
-#include <locale>
-#include <windows.h>
-#include <string.h>
-#include <fcntl.h>
-#include <io.h>
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <fcntl.h>
+#    include <io.h>
+#    include <string.h>
+#    include <windows.h>
+
+#    include <locale>
 #else
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#    include <sys/ioctl.h>
+#    include <sys/stat.h>
+#    include <unistd.h>
 #endif
 
 #if defined(__linux__)
-#include <sys/types.h>
-#include <pwd.h>
+#    include <pwd.h>
+#    include <sys/types.h>
 #endif
 
 #if defined(_MSC_VER)
-#pragma warning(disable: 4244 4267) // possible loss of data
+#    pragma warning(disable : 4244 4267)  // possible loss of data
 #endif
 
-common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
+common_time_meas::common_time_meas(int64_t & t_acc, bool disable) :
+    t_start_us(disable ? -1 : ggml_time_us()),
+    t_acc(t_acc) {}
 
 common_time_meas::~common_time_meas() {
     if (t_start_us >= 0) {
@@ -76,11 +79,11 @@ int32_t cpu_get_num_physical_cores() {
 #ifdef __linux__
     // enumerate the set of thread siblings, num entries is num cores
     std::unordered_set<std::string> siblings;
-    for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
-        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
-            + std::to_string(cpu) + "/topology/thread_siblings");
+    for (uint32_t cpu = 0; cpu < UINT32_MAX; ++cpu) {
+        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                                      "/topology/thread_siblings");
         if (!thread_siblings.is_open()) {
-            break; // no more cpus
+            break;  // no more cpus
         }
         std::string line;
         if (std::getline(thread_siblings, line)) {
@@ -92,8 +95,8 @@ int32_t cpu_get_num_physical_cores() {
     }
 #elif defined(__APPLE__) && defined(__MACH__)
     int32_t num_physical_cores;
-    size_t len = sizeof(num_physical_cores);
-    int result = sysctlbyname("hw.perflevel0.physicalcpu", &num_physical_cores, &len, NULL, 0);
+    size_t  len    = sizeof(num_physical_cores);
+    int     result = sysctlbyname("hw.perflevel0.physicalcpu", &num_physical_cores, &len, NULL, 0);
     if (result == 0) {
         return num_physical_cores;
     }
@@ -101,9 +104,9 @@ int32_t cpu_get_num_physical_cores() {
     if (result == 0) {
         return num_physical_cores;
     }
-#elif defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__) // windows 7 and later
+#elif defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__)  // windows 7 and later
     // TODO: windows + arm64 + mingw64
-    unsigned int n_threads_win = std::thread::hardware_concurrency();
+    unsigned int n_threads_win   = std::thread::hardware_concurrency();
     unsigned int default_threads = n_threads_win > 0 ? (n_threads_win <= 4 ? n_threads_win : n_threads_win / 2) : 4;
 
     DWORD buffer_size = 0;
@@ -114,18 +117,21 @@ int32_t cpu_get_num_physical_cores() {
     }
 
     std::vector<char> buffer(buffer_size);
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &buffer_size)) {
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+                                          &buffer_size)) {
         return default_threads;
     }
 
-    int32_t num_physical_cores = 0;
-    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
+    int32_t                                  num_physical_cores = 0;
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info =
+        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
     while (buffer_size > 0) {
         if (info->Relationship == RelationProcessorCore) {
             num_physical_cores += info->Processor.GroupCount;
         }
         buffer_size -= info->Size;
-        info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(reinterpret_cast<char*>(info) + info->Size);
+        info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(reinterpret_cast<char *>(info) + info->Size);
     }
 
     return num_physical_cores > 0 ? num_physical_cores : default_threads;
@@ -135,15 +141,15 @@ int32_t cpu_get_num_physical_cores() {
 }
 
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
-#include <pthread.h>
+#    include <pthread.h>
 
-static void cpuid(unsigned leaf, unsigned subleaf,
-                  unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx) {
-    __asm__("movq\t%%rbx,%%rsi\n\t"
-            "cpuid\n\t"
-            "xchgq\t%%rbx,%%rsi"
-            : "=a"(*eax), "=S"(*ebx), "=c"(*ecx), "=d"(*edx)
-            : "0"(leaf), "2"(subleaf));
+static void cpuid(unsigned leaf, unsigned subleaf, unsigned * eax, unsigned * ebx, unsigned * ecx, unsigned * edx) {
+    __asm__(
+        "movq\t%%rbx,%%rsi\n\t"
+        "cpuid\n\t"
+        "xchgq\t%%rbx,%%rsi"
+        : "=a"(*eax), "=S"(*ebx), "=c"(*ecx), "=d"(*edx)
+        : "0"(leaf), "2"(subleaf));
 }
 
 static int pin_cpu(int cpu) {
@@ -163,7 +169,7 @@ static bool is_running_on_efficiency_core(void) {
     unsigned eax, ebx, ecx, edx;
     cpuid(0x1a, 0, &eax, &ebx, &ecx, &edx);
     int intel_atom = 0x20;
-    int core_type = (eax & 0xff000000u) >> 24;
+    int core_type  = (eax & 0xff000000u) >> 24;
     return core_type == intel_atom;
 }
 
@@ -174,15 +180,15 @@ static int cpu_count_math_cpus(int n_cpu) {
             return -1;
         }
         if (is_running_on_efficiency_core()) {
-            continue; // efficiency cores harm lockstep threading
+            continue;  // efficiency cores harm lockstep threading
         }
-        ++cpu; // hyperthreading isn't useful for linear algebra
+        ++cpu;         // hyperthreading isn't useful for linear algebra
         ++result;
     }
     return result;
 }
 
-#endif // __x86_64__ && __linux__
+#endif  // __x86_64__ && __linux__
 
 /**
  * Returns number of CPUs on system that are useful for math.
@@ -218,11 +224,21 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 
     DWORD p = NORMAL_PRIORITY_CLASS;
     switch (prio) {
-        case GGML_SCHED_PRIO_LOW:      p = BELOW_NORMAL_PRIORITY_CLASS; break;
-        case GGML_SCHED_PRIO_NORMAL:   p = NORMAL_PRIORITY_CLASS;       break;
-        case GGML_SCHED_PRIO_MEDIUM:   p = ABOVE_NORMAL_PRIORITY_CLASS; break;
-        case GGML_SCHED_PRIO_HIGH:     p = HIGH_PRIORITY_CLASS;         break;
-        case GGML_SCHED_PRIO_REALTIME: p = REALTIME_PRIORITY_CLASS;     break;
+        case GGML_SCHED_PRIO_LOW:
+            p = BELOW_NORMAL_PRIORITY_CLASS;
+            break;
+        case GGML_SCHED_PRIO_NORMAL:
+            p = NORMAL_PRIORITY_CLASS;
+            break;
+        case GGML_SCHED_PRIO_MEDIUM:
+            p = ABOVE_NORMAL_PRIORITY_CLASS;
+            break;
+        case GGML_SCHED_PRIO_HIGH:
+            p = HIGH_PRIORITY_CLASS;
+            break;
+        case GGML_SCHED_PRIO_REALTIME:
+            p = REALTIME_PRIORITY_CLASS;
+            break;
     }
 
     if (!SetPriorityClass(GetCurrentProcess(), p)) {
@@ -233,9 +249,9 @@ bool set_process_priority(enum ggml_sched_priority prio) {
     return true;
 }
 
-#else // MacOS and POSIX
-#include <sys/types.h>
-#include <sys/resource.h>
+#else  // MacOS and POSIX
+#    include <sys/resource.h>
+#    include <sys/types.h>
 
 bool set_process_priority(enum ggml_sched_priority prio) {
     if (prio == GGML_SCHED_PRIO_NORMAL) {
@@ -244,11 +260,21 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 
     int p = 0;
     switch (prio) {
-        case GGML_SCHED_PRIO_LOW:      p =  5;  break;
-        case GGML_SCHED_PRIO_NORMAL:   p =  0;  break;
-        case GGML_SCHED_PRIO_MEDIUM:   p = -5;  break;
-        case GGML_SCHED_PRIO_HIGH:     p = -10; break;
-        case GGML_SCHED_PRIO_REALTIME: p = -20; break;
+        case GGML_SCHED_PRIO_LOW:
+            p = 5;
+            break;
+        case GGML_SCHED_PRIO_NORMAL:
+            p = 0;
+            break;
+        case GGML_SCHED_PRIO_MEDIUM:
+            p = -5;
+            break;
+        case GGML_SCHED_PRIO_HIGH:
+            p = -10;
+            break;
+        case GGML_SCHED_PRIO_REALTIME:
+            p = -20;
+            break;
     }
 
     if (setpriority(PRIO_PROCESS, 0, p) != 0) {
@@ -264,8 +290,7 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 // CLI argument parsing
 //
 
-
-void postprocess_cpu_params(cpu_params& cpuparams, const cpu_params* role_model) {
+void postprocess_cpu_params(cpu_params & cpuparams, const cpu_params * role_model) {
     int32_t n_set = 0;
 
     if (cpuparams.n_threads < 0) {
@@ -285,7 +310,8 @@ void postprocess_cpu_params(cpu_params& cpuparams, const cpu_params* role_model)
 
     if (n_set && n_set < cpuparams.n_threads) {
         // Not enough set bits, may experience performance issues.
-        LOG_WRN("Not enough set bits in CPU mask (%d) to satisfy requested thread count: %d\n", n_set, cpuparams.n_threads);
+        LOG_WRN("Not enough set bits in CPU mask (%d) to satisfy requested thread count: %d\n", n_set,
+                cpuparams.n_threads);
     }
 }
 
@@ -334,12 +360,14 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
     }
 
     size_t num_digits = mask.length() - start_i;
-    if (num_digits > 128) num_digits = 128;
+    if (num_digits > 128) {
+        num_digits = 128;
+    }
 
     size_t end_i = num_digits + start_i;
 
-    for (size_t i = start_i, n = (num_digits*4 - 1); i < end_i; i++, n-=4) {
-        char c = mask.at(i);
+    for (size_t i = start_i, n = (num_digits * 4 - 1); i < end_i; i++, n -= 4) {
+        char   c  = mask.at(i);
         int8_t id = c;
 
         if ((c >= '0' && c <= '9')) {
@@ -353,7 +381,7 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
             return false;
         }
 
-        boolmask[  n  ] = boolmask[  n  ] || ((id & 8) != 0);
+        boolmask[n]     = boolmask[n] || ((id & 8) != 0);
         boolmask[n - 1] = boolmask[n - 1] || ((id & 4) != 0);
         boolmask[n - 2] = boolmask[n - 2] || ((id & 2) != 0);
         boolmask[n - 3] = boolmask[n - 3] || ((id & 1) != 0);
@@ -371,7 +399,8 @@ void common_init() {
     const char * build_type = " (debug)";
 #endif
 
-    LOG_INF("build: %d (%s) with %s for %s%s\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET, build_type);
+    LOG_INF("build: %d (%s) with %s for %s%s\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET,
+            build_type);
 }
 
 std::string common_params_get_system_info(const common_params & params) {
@@ -381,7 +410,7 @@ std::string common_params_get_system_info(const common_params & params) {
     if (params.cpuparams_batch.n_threads != -1) {
         os << " (n_threads_batch = " << params.cpuparams_batch.n_threads << ")";
     }
-#if defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__) // windows 7 and later
+#if defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__)  // windows 7 and later
     // TODO: windows + arm64 + mingw64
     DWORD logicalProcessorCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     os << " / " << logicalProcessorCount << " | " << llama_print_system_info();
@@ -402,9 +431,9 @@ std::string string_format(const char * fmt, ...) {
     va_start(ap, fmt);
     va_copy(ap2, ap);
     int size = vsnprintf(NULL, 0, fmt, ap);
-    GGML_ASSERT(size >= 0 && size < INT_MAX); // NOLINT
+    GGML_ASSERT(size >= 0 && size < INT_MAX);  // NOLINT
     std::vector<char> buf(size + 1);
-    int size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
+    int               size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
     GGML_ASSERT(size2 == size);
     va_end(ap2);
     va_end(ap);
@@ -413,7 +442,7 @@ std::string string_format(const char * fmt, ...) {
 
 std::string string_strip(const std::string & str) {
     size_t start = 0;
-    size_t end = str.size();
+    size_t end   = str.size();
     while (start < end && std::isspace(str[start])) {
         start++;
     }
@@ -427,12 +456,12 @@ std::string string_get_sortable_timestamp() {
     using clock = std::chrono::system_clock;
 
     const clock::time_point current_time = clock::now();
-    const time_t as_time_t = clock::to_time_t(current_time);
-    char timestamp_no_ns[100];
+    const time_t            as_time_t    = clock::to_time_t(current_time);
+    char                    timestamp_no_ns[100];
     std::strftime(timestamp_no_ns, 100, "%Y_%m_%d-%H_%M_%S", std::localtime(&as_time_t));
 
-    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        current_time.time_since_epoch() % 1000000000).count();
+    const int64_t ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(current_time.time_since_epoch() % 1000000000).count();
     char timestamp_ns[11];
     snprintf(timestamp_ns, 11, "%09" PRId64, ns);
 
@@ -445,7 +474,7 @@ void string_replace_all(std::string & s, const std::string & search, const std::
     }
     std::string builder;
     builder.reserve(s.length());
-    size_t pos = 0;
+    size_t pos      = 0;
     size_t last_pos = 0;
     while ((pos = s.find(search, last_pos)) != std::string::npos) {
         builder.append(s, last_pos, pos - last_pos);
@@ -457,7 +486,7 @@ void string_replace_all(std::string & s, const std::string & search, const std::
 }
 
 bool string_ends_with(const std::string_view & str, const std::string_view & suffix) {
-    return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
+    return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 bool string_remove_suffix(std::string & str, const std::string_view & suffix) {
@@ -502,13 +531,13 @@ std::string string_join(const std::vector<std::string> & values, const std::stri
 
 std::vector<std::string> string_split(const std::string & str, const std::string & delimiter) {
     std::vector<std::string> parts;
-    size_t start = 0;
-    size_t end = str.find(delimiter);
+    size_t                   start = 0;
+    size_t                   end   = str.find(delimiter);
 
     while (end != std::string::npos) {
         parts.push_back(str.substr(start, end - start));
         start = end + delimiter.length();
-        end = str.find(delimiter, start);
+        end   = str.find(delimiter, start);
     }
 
     parts.push_back(str.substr(start));
@@ -592,12 +621,10 @@ std::string string_from(const struct llama_context * ctx, const struct llama_bat
 
         auto detokenized = common_token_to_piece(ctx, batch.token[i]);
 
-        buf << "\n"          << std::to_string(i)
-            << ", token '"   << detokenized << "'"
-            << ", pos "      << std::to_string(batch.pos[i])
-            << ", n_seq_id " << std::to_string(batch.n_seq_id[i])
-            << ", seq_id "   << std::to_string(batch.seq_id[i][0])
-            << ", logits "   << std::to_string(batch.logits[i]);
+        buf << "\n"
+            << std::to_string(i) << ", token '" << detokenized << "'"
+            << ", pos " << std::to_string(batch.pos[i]) << ", n_seq_id " << std::to_string(batch.n_seq_id[i])
+            << ", seq_id " << std::to_string(batch.seq_id[i][0]) << ", logits " << std::to_string(batch.logits[i]);
     }
 
     buf << " ]";
@@ -606,24 +633,36 @@ std::string string_from(const struct llama_context * ctx, const struct llama_bat
 }
 
 void string_process_escapes(std::string & input) {
-    std::size_t input_len = input.length();
+    std::size_t input_len  = input.length();
     std::size_t output_idx = 0;
 
     for (std::size_t input_idx = 0; input_idx < input_len; ++input_idx) {
         if (input[input_idx] == '\\' && input_idx + 1 < input_len) {
             switch (input[++input_idx]) {
-                case 'n':  input[output_idx++] = '\n'; break;
-                case 'r':  input[output_idx++] = '\r'; break;
-                case 't':  input[output_idx++] = '\t'; break;
-                case '\'': input[output_idx++] = '\''; break;
-                case '\"': input[output_idx++] = '\"'; break;
-                case '\\': input[output_idx++] = '\\'; break;
+                case 'n':
+                    input[output_idx++] = '\n';
+                    break;
+                case 'r':
+                    input[output_idx++] = '\r';
+                    break;
+                case 't':
+                    input[output_idx++] = '\t';
+                    break;
+                case '\'':
+                    input[output_idx++] = '\'';
+                    break;
+                case '\"':
+                    input[output_idx++] = '\"';
+                    break;
+                case '\\':
+                    input[output_idx++] = '\\';
+                    break;
                 case 'x':
                     // Handle \x12, etc
                     if (input_idx + 2 < input_len) {
-                        const char x[3] = { input[input_idx + 1], input[input_idx + 2], 0 };
-                        char *err_p = nullptr;
-                        const long val = std::strtol(x, &err_p, 16);
+                        const char x[3]  = { input[input_idx + 1], input[input_idx + 2], 0 };
+                        char *     err_p = nullptr;
+                        const long val   = std::strtol(x, &err_p, 16);
                         if (err_p == x + 2) {
                             input_idx += 2;
                             input[output_idx++] = char(val);
@@ -631,8 +670,10 @@ void string_process_escapes(std::string & input) {
                         }
                     }
                     // fall through
-                default:   input[output_idx++] = '\\';
-                           input[output_idx++] = input[input_idx]; break;
+                default:
+                    input[output_idx++] = '\\';
+                    input[output_idx++] = input[input_idx];
+                    break;
             }
         } else {
             input[output_idx++] = input[input_idx];
@@ -654,11 +695,11 @@ bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_over
     sep++;
     if (strncmp(sep, "int:", 4) == 0) {
         sep += 4;
-        kvo.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+        kvo.tag     = LLAMA_KV_OVERRIDE_TYPE_INT;
         kvo.val_i64 = std::atol(sep);
     } else if (strncmp(sep, "float:", 6) == 0) {
         sep += 6;
-        kvo.tag = LLAMA_KV_OVERRIDE_TYPE_FLOAT;
+        kvo.tag     = LLAMA_KV_OVERRIDE_TYPE_FLOAT;
         kvo.val_f64 = std::atof(sep);
     } else if (strncmp(sep, "bool:", 5) == 0) {
         sep += 5;
@@ -745,16 +786,16 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
     // - Byte order mark (BOM)
     // - Illegal characters: / \ : * ? " < > |
     for (char32_t c : filename_utf32) {
-        if (c <= 0x1F // Control characters (C0)
-            || c == 0x7F // Control characters (DEL)
-            || (c >= 0x80 && c <= 0x9F) // Control characters (C1)
-            || c == 0xFF0E // Fullwidth Full Stop (period equivalent)
-            || c == 0x2215 // Division Slash (forward slash equivalent)
-            || c == 0x2216 // Set Minus (backslash equivalent)
-            || (c >= 0xD800 && c <= 0xDFFF) // UTF-16 surrogate pairs
-            || c == 0xFFFD // Replacement Character (UTF-8)
-            || c == 0xFEFF // Byte Order Mark (BOM)
-            || c == ':' || c == '*' // Illegal characters
+        if (c <= 0x1F                        // Control characters (C0)
+            || c == 0x7F                     // Control characters (DEL)
+            || (c >= 0x80 && c <= 0x9F)      // Control characters (C1)
+            || c == 0xFF0E                   // Fullwidth Full Stop (period equivalent)
+            || c == 0x2215                   // Division Slash (forward slash equivalent)
+            || c == 0x2216                   // Set Minus (backslash equivalent)
+            || (c >= 0xD800 && c <= 0xDFFF)  // UTF-16 surrogate pairs
+            || c == 0xFFFD                   // Replacement Character (UTF-8)
+            || c == 0xFEFF                   // Byte Order Mark (BOM)
+            || c == ':' || c == '*'          // Illegal characters
             || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
             return false;
         }
@@ -785,21 +826,20 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
 
 #include <iostream>
 
-
 #ifdef _WIN32
 static std::wstring utf8_to_wstring(const std::string & str) {
     if (str.empty()) {
         return std::wstring();
     }
 
-    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
+    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int) str.size(), NULL, 0);
 
     if (size <= 0) {
         return std::wstring();
     }
 
     std::wstring wstr(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstr[0], size);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int) str.size(), &wstr[0], size);
 
     return wstr;
 }
@@ -854,12 +894,12 @@ bool fs_create_directory_with_parents(const std::string & path) {
         return S_ISDIR(info.st_mode);
     }
 
-    size_t pos_slash = 1; // skip leading slashes for directory creation
+    size_t pos_slash = 1;  // skip leading slashes for directory creation
 
     // process path from front to back, procedurally creating directories
     while ((pos_slash = path.find('/', pos_slash)) != std::string::npos) {
         const std::string subpath = path.substr(0, pos_slash);
-        struct stat info;
+        struct stat       info;
 
         // if the path already exists, ensure that it's a directory
         if (stat(subpath.c_str(), &info) == 0) {
@@ -878,7 +918,7 @@ bool fs_create_directory_with_parents(const std::string & path) {
     }
 
     return true;
-#endif // _WIN32
+#endif  // _WIN32
 }
 
 bool fs_is_directory(const std::string & path) {
@@ -887,8 +927,8 @@ bool fs_is_directory(const std::string & path) {
 }
 
 std::string fs_get_cache_directory() {
-    std::string cache_directory = "";
-    auto ensure_trailing_slash = [](std::string p) {
+    std::string cache_directory       = "";
+    auto        ensure_trailing_slash = [](std::string p) {
         // Make sure to add trailing slash
         if (p.back() != DIRECTORY_SEPARATOR) {
             p += DIRECTORY_SEPARATOR;
@@ -904,17 +944,17 @@ std::string fs_get_cache_directory() {
         } else if (std::getenv("HOME")) {
             cache_directory = std::getenv("HOME") + std::string("/.cache/");
         } else {
-#if defined(__linux__)
+#    if defined(__linux__)
             /* no $HOME is defined, fallback to getpwuid */
-            struct passwd *pw = getpwuid(getuid());
+            struct passwd * pw = getpwuid(getuid());
             if ((!pw) || (!pw->pw_dir)) {
                 throw std::runtime_error("Failed to find $HOME directory");
             }
 
             cache_directory = std::string(pw->pw_dir) + std::string("/.cache/");
-#else /* defined(__linux__) */
+#    else  /* defined(__linux__) */
             throw std::runtime_error("Failed to find $HOME directory");
-#endif /* defined(__linux__) */
+#    endif /* defined(__linux__) */
         }
 #elif defined(__APPLE__)
         cache_directory = std::getenv("HOME") + std::string("/Library/Caches/");
@@ -923,7 +963,7 @@ std::string fs_get_cache_directory() {
 #elif defined(__EMSCRIPTEN__)
         GGML_ABORT("not implemented on this platform");
 #else
-#  error Unknown architecture
+#    error Unknown architecture
 #endif
         cache_directory = ensure_trailing_slash(cache_directory);
         cache_directory += "llama.cpp";
@@ -934,7 +974,7 @@ std::string fs_get_cache_directory() {
 std::string fs_get_cache_file(const std::string & filename) {
     GGML_ASSERT(filename.find(DIRECTORY_SEPARATOR) == std::string::npos);
     std::string cache_directory = fs_get_cache_directory();
-    const bool success = fs_create_directory_with_parents(cache_directory);
+    const bool  success         = fs_create_directory_with_parents(cache_directory);
     if (!success) {
         throw std::runtime_error("failed to create cache directory: " + cache_directory);
     }
@@ -943,7 +983,9 @@ std::string fs_get_cache_file(const std::string & filename) {
 
 std::vector<common_file_info> fs_list(const std::string & path, bool include_directories) {
     std::vector<common_file_info> files;
-    if (path.empty()) return files;
+    if (path.empty()) {
+        return files;
+    }
 
     std::filesystem::path dir(path);
     if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
@@ -969,7 +1011,7 @@ std::vector<common_file_info> fs_list(const std::string & path, bool include_dir
                 common_file_info info;
                 info.path   = p.string();
                 info.name   = p.filename().string();
-                info.size   = 0; // Directories have no size
+                info.size   = 0;  // Directories have no size
                 info.is_dir = true;
                 files.push_back(std::move(info));
             }
@@ -1014,10 +1056,7 @@ bool tty_can_use_colors() {
 //
 
 // TODO: move to common/sampling
-static void common_init_sampler_from_model(
-    const llama_model * model,
-    common_params_sampling & sparams) {
-
+static void common_init_sampler_from_model(const llama_model * model, common_params_sampling & sparams) {
     const uint64_t config = sparams.user_sampling_config;
 
     auto get_int32 = [&](const char * key, int32_t & dst, uint64_t user_config) {
@@ -1025,10 +1064,10 @@ static void common_init_sampler_from_model(
             return;
         }
 
-        char buf[64] = {0};
+        char buf[64] = { 0 };
         if (llama_model_meta_val_str(model, key, buf, sizeof(buf)) > 0) {
-            char * end = nullptr;
-            int32_t v = strtol(buf, &end, 10);
+            char *  end = nullptr;
+            int32_t v   = strtol(buf, &end, 10);
             if (end && end != buf) {
                 dst = v;
             }
@@ -1040,10 +1079,10 @@ static void common_init_sampler_from_model(
             return;
         }
 
-        char buf[128] = {0};
+        char buf[128] = { 0 };
         if (llama_model_meta_val_str(model, key, buf, sizeof(buf)) > 0) {
             char * end = nullptr;
-            float v = strtof(buf, &end);
+            float  v   = strtof(buf, &end);
             if (end && end != buf) {
                 dst = v;
             }
@@ -1052,8 +1091,9 @@ static void common_init_sampler_from_model(
 
     // Sampling sequence
     if (!(config & common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS)) {
-        char buf[512] = {0};
-        if (llama_model_meta_val_str(model, llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_SEQUENCE), buf, sizeof(buf)) > 0) {
+        char buf[512] = { 0 };
+        if (llama_model_meta_val_str(model, llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_SEQUENCE), buf,
+                                     sizeof(buf)) > 0) {
             const std::vector<std::string> sampler_names = string_split<std::string>(std::string(buf), ';');
             if (!sampler_names.empty()) {
                 sparams.samplers = common_sampler_types_from_names(sampler_names, true);
@@ -1061,21 +1101,32 @@ static void common_init_sampler_from_model(
         }
     }
 
-    get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_TOP_K),           sparams.top_k,           common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K);
-    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_TOP_P),           sparams.top_p,           common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P);
-    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIN_P),           sparams.min_p,           common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P);
-    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_XTC_PROBABILITY), sparams.xtc_probability, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY);
-    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_XTC_THRESHOLD),   sparams.xtc_threshold,   common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD);
-    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_TEMP),            sparams.temp,            common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP);
-    get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_LAST_N),  sparams.penalty_last_n,  common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N);
-    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_REPEAT),  sparams.penalty_repeat,  common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT);
-    get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT),        sparams.mirostat,        common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT);
-    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU),    sparams.mirostat_tau,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU);
-    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
+    get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_TOP_K), sparams.top_k,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K);
+    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_TOP_P), sparams.top_p,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P);
+    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIN_P), sparams.min_p,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P);
+    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_XTC_PROBABILITY), sparams.xtc_probability,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY);
+    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_XTC_THRESHOLD), sparams.xtc_threshold,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD);
+    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_TEMP), sparams.temp,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP);
+    get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_LAST_N), sparams.penalty_last_n,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N);
+    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_REPEAT), sparams.penalty_repeat,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT);
+    get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT), sparams.mirostat,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT);
+    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU), sparams.mirostat_tau,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU);
+    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA), sparams.mirostat_eta,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
 struct common_init_result::impl {
-    impl() = default;
+    impl()  = default;
     ~impl() = default;
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
@@ -1085,23 +1136,23 @@ struct common_init_result::impl {
 
     std::vector<llama_adapter_lora_ptr> lora;
 
-    std::vector<common_sampler_ptr> samplers;
+    std::vector<common_sampler_ptr>       samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-common_init_result::common_init_result(common_params & params) :
-    pimpl(new impl{}) {
+common_init_result::common_init_result(common_params & params) : pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
-        LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
-        llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        LOG_INF(
+            "%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or "
+            "provide --verbose logs if the bug only occurs with -fit on\n",
+            __func__);
+        llama_params_fit(params.model.path.c_str(), &mparams, &cparams, params.tensor_split,
+                         params.tensor_buft_overrides.data(), params.fit_params_target.data(),
+                         params.fit_params_min_ctx,
+                         params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1129,7 +1180,7 @@ common_init_result::common_init_result(common_params & params) :
         la.task_name = buf;
         llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
         la.prompt_prefix = buf;
-        pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
+        pimpl->lora.emplace_back(std::move(lora));  // copy to list of loaded adapters
     }
 
     // updates params.sampling
@@ -1145,15 +1196,14 @@ common_init_result::common_init_result(common_params & params) :
     for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
         if (llama_vocab_is_eog(vocab, i)) {
             LOG_INF("%s: added %s logit bias = %f\n", __func__, common_token_to_piece(vocab, i).c_str(), -INFINITY);
-            params.sampling.logit_bias_eog.push_back({i, -INFINITY});
+            params.sampling.logit_bias_eog.push_back({ i, -INFINITY });
         }
     }
 
     if (params.sampling.ignore_eos) {
         // add EOG biases to the active set of logit biases
-        params.sampling.logit_bias.insert(
-                params.sampling.logit_bias.end(),
-                params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
+        params.sampling.logit_bias.insert(params.sampling.logit_bias.end(), params.sampling.logit_bias_eog.begin(),
+                                          params.sampling.logit_bias_eog.end());
     }
 
     //if (params.sampling.penalty_last_n == -1) {
@@ -1234,21 +1284,20 @@ common_init_result_ptr common_init_from_params(common_params & params) {
     }
 
     if (!params.control_vectors.empty()) {
-        if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
-        if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);
+        if (params.control_vector_layer_start <= 0) {
+            params.control_vector_layer_start = 1;
+        }
+        if (params.control_vector_layer_end <= 0) {
+            params.control_vector_layer_end = llama_model_n_layer(model);
+        }
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
             return res;
         }
 
-        int err = llama_apply_adapter_cvec(
-                lctx,
-                cvec.data.data(),
-                cvec.data.size(),
-                cvec.n_embd,
-                params.control_vector_layer_start,
-                params.control_vector_layer_end);
+        int err = llama_apply_adapter_cvec(lctx, cvec.data.data(), cvec.data.size(), cvec.n_embd,
+                                           params.control_vector_layer_start, params.control_vector_layer_end);
         if (err) {
             return res;
         }
@@ -1262,12 +1311,14 @@ common_init_result_ptr common_init_from_params(common_params & params) {
             ok = false;
         }
 
-        bool has_eos = llama_vocab_eos(vocab) != LLAMA_TOKEN_NULL;
-        bool has_sep = llama_vocab_sep(vocab) != LLAMA_TOKEN_NULL;
+        bool has_eos           = llama_vocab_eos(vocab) != LLAMA_TOKEN_NULL;
+        bool has_sep           = llama_vocab_sep(vocab) != LLAMA_TOKEN_NULL;
         bool has_rerank_prompt = llama_model_chat_template(model, "rerank") != NULL;
 
         if (!has_eos && !has_sep && !has_rerank_prompt) {
-            LOG_WRN("%s: warning: vocab does not have an EOS token, SEP token, or rerank prompt. Reranking will not work\n", __func__);
+            LOG_WRN(
+                "%s: warning: vocab does not have an EOS token, SEP token, or rerank prompt. Reranking will not work\n",
+                __func__);
             ok = false;
         } else if (!has_eos) {
             LOG_WRN("%s: warning: vocab does not have an EOS token, using SEP token as fallback\n", __func__);
@@ -1288,8 +1339,8 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         llama_set_warmup(lctx, true);
 
         std::vector<llama_token> tmp;
-        llama_token bos = llama_vocab_bos(vocab);
-        llama_token eos = llama_vocab_eos(vocab);
+        llama_token              bos = llama_vocab_bos(vocab);
+        llama_token              eos = llama_vocab_eos(vocab);
 
         // some models (e.g. T5) don't have a BOS token
         if (bos != LLAMA_TOKEN_NULL) {
@@ -1331,9 +1382,9 @@ common_init_result::~common_init_result() = default;
 std::string get_model_endpoint() {
     const char * model_endpoint_env = getenv("MODEL_ENDPOINT");
     // We still respect the use of environment-variable "HF_ENDPOINT" for backward-compatibility.
-    const char * hf_endpoint_env = getenv("HF_ENDPOINT");
-    const char * endpoint_env = model_endpoint_env ? model_endpoint_env : hf_endpoint_env;
-    std::string model_endpoint = "https://huggingface.co/";
+    const char * hf_endpoint_env    = getenv("HF_ENDPOINT");
+    const char * endpoint_env       = model_endpoint_env ? model_endpoint_env : hf_endpoint_env;
+    std::string  model_endpoint     = "https://huggingface.co/";
     if (endpoint_env) {
         model_endpoint = endpoint_env;
         if (model_endpoint.back() != '/') {
@@ -1380,7 +1431,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     if (params.tensor_buft_overrides.empty()) {
         mparams.tensor_buft_overrides = NULL;
     } else {
-        GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr && "Tensor buffer overrides not terminated with empty pattern");
+        GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr &&
+                    "Tensor buffer overrides not terminated with empty pattern");
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
@@ -1393,13 +1445,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
-    cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
-    cparams.n_batch           = params.n_batch;
-    cparams.n_ubatch          = params.n_ubatch;
-    cparams.n_threads         = params.cpuparams.n_threads;
-    cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
-                                params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
+    cparams.n_ctx     = params.n_ctx;
+    cparams.n_seq_max = params.n_parallel;
+    cparams.n_batch   = params.n_batch;
+    cparams.n_ubatch  = params.n_ubatch;
+    cparams.n_threads = params.cpuparams.n_threads;
+    cparams.n_threads_batch =
+        params.cpuparams_batch.n_threads == -1 ? params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
     cparams.embeddings        = params.embedding;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.rope_freq_base    = params.rope_freq_base;
@@ -1412,6 +1464,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.pooling_type      = params.pooling_type;
     cparams.attention_type    = params.attention_type;
     cparams.flash_attn_type   = params.flash_attn_type;
+    cparams.use_dsa           = params.use_dsa;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
@@ -1429,7 +1482,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_params & params) {
     struct ggml_threadpool_params tpp;
 
-    ggml_threadpool_params_init(&tpp, params.n_threads); // setup the defaults
+    ggml_threadpool_params_init(&tpp, params.n_threads);  // setup the defaults
 
     if (params.mask_valid) {
         std::memcpy(&tpp.cpumask, &params.cpumask, GGML_MAX_N_THREADS);
@@ -1450,21 +1503,20 @@ void common_batch_clear(struct llama_batch & batch) {
     batch.n_tokens = 0;
 }
 
-void common_batch_add(
-                 struct llama_batch & batch,
-                        llama_token   id,
-                          llama_pos   pos,
-    const std::vector<llama_seq_id> & seq_ids,
-                               bool   logits) {
+void common_batch_add(struct llama_batch &              batch,
+                      llama_token                       id,
+                      llama_pos                         pos,
+                      const std::vector<llama_seq_id> & seq_ids,
+                      bool                              logits) {
     GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
 
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
+    batch.token[batch.n_tokens]    = id;
+    batch.pos[batch.n_tokens]      = pos;
     batch.n_seq_id[batch.n_tokens] = seq_ids.size();
     for (size_t i = 0; i < seq_ids.size(); ++i) {
         batch.seq_id[batch.n_tokens][i] = seq_ids[i];
     }
-    batch.logits  [batch.n_tokens] = logits;
+    batch.logits[batch.n_tokens] = logits;
 
     batch.n_tokens++;
 }
@@ -1475,7 +1527,8 @@ void common_batch_add(
 
 size_t common_lcp(const llama_tokens & a, const llama_tokens & b) {
     size_t i;
-    for (i = 0; i < a.size() && i < b.size() && a[i] == b[i]; i++) {}
+    for (i = 0; i < a.size() && i < b.size() && a[i] == b[i]; i++) {
+    }
 
     return i;
 }
@@ -1533,31 +1586,32 @@ size_t common_lcs(const llama_tokens & a, const llama_tokens & b) {
 // Vocab utils
 //
 
-std::vector<llama_token> common_tokenize(
-  const struct llama_context * ctx,
-           const std::string & text,
-                        bool   add_special,
-                        bool   parse_special) {
+std::vector<llama_token> common_tokenize(const struct llama_context * ctx,
+                                         const std::string &          text,
+                                         bool                         add_special,
+                                         bool                         parse_special) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     return common_tokenize(vocab, text, add_special, parse_special);
 }
 
-std::vector<llama_token> common_tokenize(
-    const struct llama_vocab * vocab,
-           const std::string & text,
-                        bool   add_special,
-                        bool   parse_special) {
+std::vector<llama_token> common_tokenize(const struct llama_vocab * vocab,
+                                         const std::string &        text,
+                                         bool                       add_special,
+                                         bool                       parse_special) {
     // upper limit for the number of tokens
-    int n_tokens = text.length() + 2 * add_special;
+    int                      n_tokens = text.length() + 2 * add_special;
     std::vector<llama_token> result(n_tokens);
-    n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+    n_tokens =
+        llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
     if (n_tokens == std::numeric_limits<int32_t>::min()) {
-        throw std::runtime_error("Tokenization failed: input text too large, tokenization result exceeds int32_t limit");
+        throw std::runtime_error(
+            "Tokenization failed: input text too large, tokenization result exceeds int32_t limit");
     }
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+        int check =
+            llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
         GGML_ASSERT(check == -n_tokens);
     } else {
         result.resize(n_tokens);
@@ -1579,8 +1633,7 @@ std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token 
         piece.resize(-n_chars);
         int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
         GGML_ASSERT(check == -n_chars);
-    }
-    else {
+    } else {
         piece.resize(n_chars);
     }
 
@@ -1596,11 +1649,14 @@ std::string common_detokenize(const struct llama_context * ctx, const std::vecto
 std::string common_detokenize(const struct llama_vocab * vocab, const std::vector<llama_token> & tokens, bool special) {
     std::string text;
     text.resize(std::max(text.capacity(), tokens.size()));
-    int32_t n_chars = llama_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(), false, special);
+    int32_t n_chars = llama_detokenize(vocab, tokens.data(), (int32_t) tokens.size(), &text[0], (int32_t) text.size(),
+                                       false, special);
     if (n_chars < 0) {
         text.resize(-n_chars);
-        n_chars = llama_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(), false, special);
-        GGML_ASSERT(n_chars <= (int32_t)text.size());  // whitespace trimming is performed after per-token detokenization
+        n_chars = llama_detokenize(vocab, tokens.data(), (int32_t) tokens.size(), &text[0], (int32_t) text.size(),
+                                   false, special);
+        GGML_ASSERT(n_chars <=
+                    (int32_t) text.size());  // whitespace trimming is performed after per-token detokenization
     }
 
     text.resize(n_chars);
@@ -1617,24 +1673,24 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
     double sum = 0.0;
 
     switch (embd_norm) {
-        case -1: // no normalisation
+        case -1:  // no normalisation
             sum = 1.0;
             break;
-        case 0: // max absolute
+        case 0:  // max absolute
             for (int i = 0; i < n; i++) {
                 if (sum < std::abs(inp[i])) {
                     sum = std::abs(inp[i]);
                 }
             }
-            sum /= 32760.0; // make an int16 range
+            sum /= 32760.0;  // make an int16 range
             break;
-        case 2: // euclidean
+        case 2:              // euclidean
             for (int i = 0; i < n; i++) {
                 sum += inp[i] * inp[i];
             }
             sum = std::sqrt(sum);
             break;
-        default: // p-norm (euclidean is p-norm p=2)
+        default:  // p-norm (euclidean is p-norm p=2)
             for (int i = 0; i < n; i++) {
                 sum += std::pow(std::abs(inp[i]), embd_norm);
             }
@@ -1649,13 +1705,13 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
     }
 }
 
-float common_embd_similarity_cos(const float * embd1, const float * embd2, int n){
+float common_embd_similarity_cos(const float * embd1, const float * embd2, int n) {
     double sum  = 0.0;
     double sum1 = 0.0;
     double sum2 = 0.0;
 
     for (int i = 0; i < n; i++) {
-        sum  += embd1[i] * embd2[i];
+        sum += embd1[i] * embd2[i];
         sum1 += embd1[i] * embd1[i];
         sum2 += embd2[i] * embd2[i];
     }
@@ -1663,7 +1719,7 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
     // Handle the case where one or both vectors are zero vectors
     if (sum1 == 0.0 || sum2 == 0.0) {
         if (sum1 == 0.0 && sum2 == 0.0) {
-            return 1.0f; // two zero vectors are similar
+            return 1.0f;  // two zero vectors are similar
         }
         return 0.0f;
     }
@@ -1678,7 +1734,7 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
 static common_control_vector_data common_control_vector_load_one(const common_control_vector_load_info & load_info) {
     common_control_vector_data result = { -1, {} };
 
-    ggml_context * ctx = nullptr;
+    ggml_context *          ctx              = nullptr;
     struct gguf_init_params meta_gguf_params = {
         /* .no_alloc = */ false,
         /* .ctx      = */ &ctx,
@@ -1733,7 +1789,8 @@ static common_control_vector_data common_control_vector_load_one(const common_co
         if (result.n_embd == -1) {
             result.n_embd = ggml_nelements(tensor);
         } else if (ggml_nelements(tensor) != result.n_embd) {
-            LOG_ERR("%s: direction tensor in %s does not match previous dimensions\n", __func__, load_info.fname.c_str());
+            LOG_ERR("%s: direction tensor in %s does not match previous dimensions\n", __func__,
+                    load_info.fname.c_str());
             result.n_embd = -1;
             break;
         }
@@ -1742,11 +1799,10 @@ static common_control_vector_data common_control_vector_load_one(const common_co
         result.data.resize(std::max(result.data.size(), static_cast<size_t>(result.n_embd * layer_idx)), 0.0f);
 
         const float * src = (const float *) tensor->data;
-        float * dst = result.data.data() + result.n_embd * (layer_idx - 1);  // layer 1 at [0]
+        float *       dst = result.data.data() + result.n_embd * (layer_idx - 1);  // layer 1 at [0]
         for (int j = 0; j < result.n_embd; j++) {
             dst[j] += src[j] * load_info.strength;  // allows multiple directions for same layer in same file
         }
-
     }
 
     if (result.n_embd == -1) {
@@ -1794,18 +1850,20 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
     return result;
 }
 
-ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std::vector<llama_token> & tokens, int64_t stride) {
-    const int64_t ne_datapoint = llama_n_ctx(ctx);
-    const int64_t ndata        = (tokens.size() - ne_datapoint - 1) / stride;
-    ggml_opt_dataset_t result = ggml_opt_dataset_init(
-        GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/ 1);
+ggml_opt_dataset_t common_opt_dataset_init(struct llama_context *           ctx,
+                                           const std::vector<llama_token> & tokens,
+                                           int64_t                          stride) {
+    const int64_t      ne_datapoint = llama_n_ctx(ctx);
+    const int64_t      ndata        = (tokens.size() - ne_datapoint - 1) / stride;
+    ggml_opt_dataset_t result =
+        ggml_opt_dataset_init(GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/1);
 
     llama_token * data   = (llama_token *) ggml_opt_dataset_data(result)->data;
     llama_token * labels = (llama_token *) ggml_opt_dataset_labels(result)->data;
 
     for (int64_t idata = 0; idata < ndata; ++idata) {
-        memcpy(data   + idata*ne_datapoint, tokens.data() + idata*stride + 0, ne_datapoint*sizeof(llama_token));
-        memcpy(labels + idata*ne_datapoint, tokens.data() + idata*stride + 1, ne_datapoint*sizeof(llama_token));
+        memcpy(data + idata * ne_datapoint, tokens.data() + idata * stride + 0, ne_datapoint * sizeof(llama_token));
+        memcpy(labels + idata * ne_datapoint, tokens.data() + idata * stride + 1, ne_datapoint * sizeof(llama_token));
     }
 
     return result;
@@ -1820,13 +1878,13 @@ ggml_opt_optimizer_params common_opt_lr_pars(void * userdata) {
 }
 
 // TODO make all command line args case-insensitive
-static inline bool eq_case_insensitive(char const* a, char const* b) {
+static inline bool eq_case_insensitive(const char * a, const char * b) {
     return !
 #if defined(_MSC_VER)
         _stricmp
 #else
         strcasecmp
-#endif // defined(_MSC_VER)
+#endif  // defined(_MSC_VER)
         (a, b);
 }
 
@@ -1841,7 +1899,7 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char * n) {
 }
 
 // TODO simplify to use just log and exp
-static float const k_log_2 = std::log(2.f);
+static const float k_log_2 = std::log(2.f);
 
 void lr_opt::init() {
     if (lr_min > 0 && lr_min < lr0) {
@@ -1857,9 +1915,7 @@ void lr_opt::init() {
 }
 
 float lr_opt::get_lr(float epoch) const {
-    float r = lr_min <= 0 ? lr0 :
-        epoch >= decay_epochs ? lr_min :
-        lr0 * std::pow(0.5f, epoch * scale_epoch);
+    float r = lr_min <= 0 ? lr0 : epoch >= decay_epochs ? lr_min : lr0 * std::pow(0.5f, epoch * scale_epoch);
     LOG_INF("epoch %.2g lr=%.2g\n", epoch, r);
     return r;
 }

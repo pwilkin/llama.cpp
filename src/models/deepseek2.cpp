@@ -41,7 +41,7 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn_kv = !is_mla ? build_attn_inp_kv() : nullptr;
-    auto * inp_attn_k  =  is_mla ? build_attn_inp_k()  : nullptr;
+    auto * inp_attn_k  = is_mla ? build_attn_inp_k() : nullptr;
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -145,10 +145,118 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                     cb(Qcur, "Qcur_attn_temp_scaled", il);
                 }
 
-                // note: MLA with the absorption optimzation converts into MQA (ie: GQA with 1 group)
-                cur = build_attn(inp_attn_k,
-                        model.layers[il].wo, NULL,
-                        Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, kq_scale, il);
+                // DeepSeek Sparse Attention (DSA) - experimental
+                // When DSA is enabled, use sparse attention with top-k token selection
+                if (params.cparams.use_dsa && model.layers[il].wq_idx_a) {
+                    // ========================================
+                    // Step 1: Compute Indexer Queries
+                    // ========================================
+                    // compressed_q = wq_idx_a @ cur (hidden states)
+                    ggml_tensor * compressed_q = ggml_mul_mat(ctx0, model.layers[il].wq_idx_a, cur);
+                    cb(compressed_q, "compressed_q", il);
+
+                    // Apply layer norm
+                    compressed_q = build_norm(compressed_q, model.layers[il].dsa_idx_norm, nullptr, LLM_NORM_RMS, il);
+                    cb(compressed_q, "compressed_q_norm", il);
+
+                    // Project to indexer heads
+                    ggml_tensor * q_idx                  = ggml_mul_mat(ctx0, model.layers[il].wq_idx_b, compressed_q);
+                    // Shape: [n_tokens, n_dsa_indexer_heads * n_dsa_indexer_head_dim]
+                    const int64_t n_dsa_indexer_heads    = hparams.n_dsa_indexer_heads;
+                    const int64_t n_dsa_indexer_head_dim = hparams.n_dsa_indexer_head_dim;
+                    q_idx = ggml_reshape_3d(ctx0, q_idx, n_dsa_indexer_head_dim, n_dsa_indexer_heads, n_tokens);
+                    cb(q_idx, "q_idx", il);
+
+                    // ========================================
+                    // Step 2: Compute Attention Scores (using existing KV cache)
+                    // ========================================
+                    // NOTE: For proper DSA, the indexer should access a FULL KV cache
+                    // with all past tokens in context, not just current batch tokens.
+                    // This prototype uses the existing K_cur from inp_attn_k for simplicity.
+                    // To implement full DSA, you would need a separate KV cache that persists
+                    // across batches and is accessible to the indexer.
+
+                    // Use K_cur from inp_attn_k (contains current batch KV)
+                    // For demonstration, we treat this as the indexer cache
+                    ggml_tensor * kv_indexer = Kcur;
+                    cb(kv_indexer, "kv_indexer", il);
+
+                    // Reshape for matmul: [kv_lora_rank, n_tokens]
+                    ggml_tensor * kv_indexer_2d = ggml_reshape_2d(ctx0, kv_indexer, kv_lora_rank, n_tokens);
+                    cb(kv_indexer_2d, "kv_indexer_2d", il);
+
+                    // Transpose q_idx for matmul: [n_tokens, n_dsa_indexer_heads * n_dsa_indexer_head_dim]
+                    ggml_tensor * q_idx_perm = ggml_permute(ctx0, q_idx, 0, 2, 1, 3);
+                    cb(q_idx_perm, "q_idx_perm", il);
+
+                    // Compute logits: [n_dsa_indexer_heads, n_tokens, n_tokens]
+                    ggml_tensor * logits = ggml_mul_mat(ctx0, kv_indexer_2d, q_idx_perm);
+                    cb(logits, "idx_logits", il);
+
+                    // Apply ReLU activation
+                    logits = ggml_relu(ctx0, logits);
+                    cb(logits, "idx_logits_relu", il);
+
+                    // ========================================
+                    // Step 3: Apply Head Weights and Sum
+                    // ========================================
+                    ggml_tensor * idx_weights_expanded =
+                        ggml_reshape_3d(ctx0, model.layers[il].dsa_idx_weights, 1, 1, n_dsa_indexer_heads);
+                    ggml_tensor * idx_weights_perm = ggml_permute(ctx0, idx_weights_expanded, 2, 0, 1, 3);
+                    cb(idx_weights_perm, "idx_weights_expanded", il);
+
+                    logits = ggml_mul(ctx0, logits, idx_weights_perm);
+                    cb(logits, "idx_logits_weighted", il);
+
+                    // Sum over indexer heads
+                    logits = ggml_sum_rows(ctx0, logits);
+                    // Result is [1, n_tokens, n_tokens], need to squeeze
+                    logits = ggml_reshape_2d(ctx0, logits, n_tokens, n_tokens);
+                    cb(logits, "idx_logits_sum", il);
+
+                    // ========================================
+                    // Step 4: Top-K Selection
+                    // ========================================
+                    const int top_k        = hparams.n_dsa_topk;
+                    const int actual_top_k = std::min(top_k, (int) n_tokens);
+
+                    ggml_tensor * topk_indices = ggml_top_k(ctx0, logits, actual_top_k);
+                    cb(topk_indices, "topk_indices", il);
+                    // topk_indices shape: [actual_top_k, n_tokens] (int32)
+
+                    // ========================================
+                    // Step 5: Gather Selected KV
+                    // ========================================
+                    // Use V_cur from inp_attn_k for values
+                    // K_cur shape: [n_embd_head_qk_rope + kv_lora_rank, 1, n_tokens]
+                    // We need to reshape to [n_embd_head, n_tokens] for get_rows
+                    ggml_tensor * k_cache_2d = ggml_reshape_2d(ctx0, Kcur, Kcur->ne[0], n_tokens);
+                    cb(k_cache_2d, "k_cache_2d", il);
+
+                    ggml_tensor * v_cache_2d = ggml_reshape_2d(ctx0, Vcur, Vcur->ne[0], n_tokens);
+                    cb(v_cache_2d, "v_cache_2d", il);
+
+                    ggml_tensor * k_selected = ggml_get_rows(ctx0, k_cache_2d, topk_indices);
+                    cb(k_selected, "k_selected", il);
+                    // k_selected shape: [head_dim, actual_top_k, n_tokens]
+
+                    ggml_tensor * v_selected = ggml_get_rows(ctx0, v_cache_2d, topk_indices);
+                    cb(v_selected, "v_selected", il);
+                    // v_selected shape: [kv_lora_rank, actual_top_k, n_tokens]
+
+                    // ========================================
+                    // Step 6: Sparse Attention
+                    // ========================================
+                    // Use build_attn_sparse to compute attention with selected tokens
+                    cur = build_attn_sparse(inp_attn_k, model.layers[il].wo, NULL, Qcur, k_selected, v_selected,
+                                            nullptr, model.layers[il].wv_b, kq_scale, il, actual_top_k);
+
+                } else {
+                    // Standard MLA attention (no DSA)
+                    // note: MLA with the absorption optimzation converts into MQA (ie: GQA with 1 group)
+                    cur = build_attn(inp_attn_k, model.layers[il].wo, NULL, Qcur, Kcur, Vcur, nullptr, nullptr,
+                                     model.layers[il].wv_b, kq_scale, il);
+                }
             } else {
                 ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_cmpr);
                 cb(kv, "kv", il);
@@ -183,9 +291,8 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                 }
 
                 // note: MLA without the absorption optimization converts into MHA (ie: GQA with full n_head groups)
-                cur = build_attn(inp_attn_kv,
-                            model.layers[il].wo, NULL,
-                            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                cur = build_attn(inp_attn_kv, model.layers[il].wo, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+                                 kq_scale, il);
             }
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -199,35 +306,23 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
         cb(cur, "ffn_norm", il);
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
-            cur = build_ffn(cur,
-                model.layers[il].ffn_up, NULL, NULL,
-                model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
-                NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cur = build_ffn(cur, model.layers[il].ffn_up, NULL, NULL, model.layers[il].ffn_gate, NULL, NULL,
+                            model.layers[il].ffn_down, NULL, NULL, NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
-                model.layers[il].ffn_exp_probs_b,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, hparams.expert_weights_norm,
-                hparams.expert_weights_scale, hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+            ggml_tensor * moe_out = build_moe_ffn(
+                cur, model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps, model.layers[il].ffn_gate_exps,
+                model.layers[il].ffn_down_exps, model.layers[il].ffn_exp_probs_b, n_expert, n_expert_used, LLM_FFN_SILU,
+                hparams.expert_weights_norm, hparams.expert_weights_scale, hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) hparams.expert_gating_func, il);
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert
             {
                 ggml_tensor * ffn_shexp =
-                    build_ffn(cur,
-                        model.layers[il].ffn_up_shexp, NULL, NULL,
-                        model.layers[il].ffn_gate_shexp, NULL, NULL,
-                        model.layers[il].ffn_down_shexp, NULL, NULL,
-                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    build_ffn(cur, model.layers[il].ffn_up_shexp, NULL, NULL, model.layers[il].ffn_gate_shexp, NULL,
+                              NULL, model.layers[il].ffn_down_shexp, NULL, NULL, NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
                 cb(ffn_shexp, "ffn_shexp", il);
 
                 cur = ggml_add(ctx0, moe_out, ffn_shexp);
