@@ -631,6 +631,19 @@ struct common_params {
     // return false from callback to abort model loading or true to continue
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
+
+    // Tool registry (server only)
+    bool        enable_server_tools         = false;
+    bool        execute_tools_automatically = false;
+    bool        enable_builtin_tools        = true;
+    int64_t     tool_execution_timeout_ms   = 30000;
+    std::string tools_config_file;
+    std::string mcp_servers_config;
+    std::string plugin_directory;
+    bool        enable_plugins              = false;
+    int64_t     tool_session_timeout_ms     = 300000;
+    size_t      max_tool_sessions           = 100;
+    std::string skills_directory;           // path to a directory of Agent Skills to auto-register
 };
 
 // call once at the start of a program if it uses libcommon

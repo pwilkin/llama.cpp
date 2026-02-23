@@ -115,6 +115,13 @@ struct server_routes {
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+
+    // Tool registry endpoints (non-standard, at /tools/*)
+    server_http_context::handler_t get_tools;
+    server_http_context::handler_t post_tools_call;
+    server_http_context::handler_t post_tools_sessions;
+    server_http_context::handler_t post_tools_sessions_close;
+    server_http_context::handler_t get_tools_health;
 private:
     std::unique_ptr<server_res_generator> handle_completions_impl(
             const server_http_req & req,
@@ -127,11 +134,26 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
 
+    // Tool registry helpers
+
+    // Appends registered tool schemas to body["tools"] (OAI format).
+    // Client-provided tools take priority; registry tools with duplicate names are skipped.
+    // No-op unless --jinja and tool registry are both enabled.
+    void inject_registry_tools(json & body) const;
+
+    // Runs the non-streaming auto-execute loop for chat completions:
+    // executes tool calls via the registry, injects results as tool messages,
+    // and re-runs inference until the model stops generating tool_calls.
+    std::unique_ptr<server_res_generator> handle_chat_auto_execute(
+            const server_http_req & req,
+            json body, // working copy, modified between rounds
+            task_response_type res_type);
+
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
-    const server_context_impl & ctx_server;
+    server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
     server_response & queue_results;

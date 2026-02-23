@@ -3859,6 +3859,45 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    // Tool registry
+    add_opt(common_arg(
+        {"--enable-server-tools"},
+        string_format("enable the server-side tool registry (default: %s)", params.enable_server_tools ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.enable_server_tools = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--auto-execute-tools"},
+        string_format("automatically execute tool calls and re-run inference instead of returning tool_calls to the client (default: %s)", params.execute_tools_automatically ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.enable_server_tools      = true; // implies --enable-server-tools
+            params.execute_tools_automatically = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--no-builtin-tools"},
+        string_format("disable built-in tools (datetime, calculator) when tool registry is enabled (default: builtin tools enabled)"),
+        [](common_params & params) {
+            params.enable_builtin_tools = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--skills-dir"}, "DIR",
+        "load Agent Skills (https://agentskills.io) from this directory and register them with the tool registry; implies --enable-server-tools",
+        [](common_params & params, const std::string & value) {
+            params.enable_server_tools = true;
+            params.skills_directory    = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tool-call-timeout"}, "MS",
+        string_format("timeout in milliseconds for a single tool call execution (default: %" PRId64 ")", params.tool_execution_timeout_ms),
+        [](common_params & params, int value) {
+            params.tool_execution_timeout_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
     return ctx_arg;
 }
 

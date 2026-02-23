@@ -13,10 +13,16 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
-#include <cstddef>
+#include <chrono>
 #include <cinttypes>
-#include <memory>
+#include <cstddef>
 #include <filesystem>
+#include <memory>
+#include <set>
+
+#include "tool/tool-registry.h"
+#include "tool/builtin-executor.h"
+#include "tool/skill-executor.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -519,6 +525,16 @@ struct server_metrics {
 
 
 //
+// Tool registry integration
+//
+
+struct server_tooling {
+    std::unique_ptr<tool_registry> registry;
+    bool enabled      = false;
+    bool auto_execute = false;
+};
+
+//
 // server_context_impl (private implementation)
 //
 
@@ -538,6 +554,9 @@ public:
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
+
+    // Tool registry (optional, enabled by --enable-server-tools)
+    server_tooling tooling;
 
     ~server_context_impl() {
         if (!sleeping) {
@@ -626,6 +645,38 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+
+        // Initialize tool registry on first load (not on resume from sleep)
+        if (!is_resume && params.enable_server_tools && !tooling.enabled) {
+            tooling.enabled      = true;
+            tooling.auto_execute = params.execute_tools_automatically;
+            tooling.registry     = std::make_unique<tool_registry>();
+            tooling.registry->initialize(json::object());
+            if (params.enable_builtin_tools) {
+                tooling.registry->register_executor(std::make_unique<builtin_executor>());
+            }
+            if (!params.skills_directory.empty()) {
+                namespace fs = std::filesystem;
+                try {
+                    for (const auto & entry : fs::directory_iterator(params.skills_directory)) {
+                        if (!entry.is_directory()) {
+                            continue;
+                        }
+                        if (!fs::exists(entry.path() / "SKILL.md")) {
+                            continue;
+                        }
+                        auto exec = std::make_unique<skill_executor>(
+                            skill_executor::config{entry.path().string()});
+                        tooling.registry->register_executor(std::move(exec));
+                    }
+                } catch (const std::exception & e) {
+                    SRV_WRN("skills: failed to scan '%s': %s\n",
+                            params.skills_directory.c_str(), e.what());
+                }
+            }
+            SRV_INF("tool registry enabled with %zu tools\n",
+                    tooling.registry->list_tools().size());
+        }
 
         llama_init = common_init_from_params(params_base);
 
@@ -3255,6 +3306,199 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
 
+void server_routes::inject_registry_tools(json & body) const {
+    // Only inject when Jinja is enabled (tools require it) and the registry is up
+    if (!params.use_jinja || !ctx_server.tooling.enabled || !ctx_server.tooling.registry) {
+        return;
+    }
+    // Respect explicit opt-out
+    if (body.value("tool_choice", std::string()) == "none") {
+        return;
+    }
+
+    auto registry_tools = ctx_server.tooling.registry->list_tools();
+    if (registry_tools.empty()) {
+        return;
+    }
+
+    // Collect names already provided by the client so we don't duplicate
+    std::set<std::string> client_names;
+    if (body.contains("tools") && body["tools"].is_array()) {
+        for (const auto & t : body["tools"]) {
+            if (t.is_object()) {
+                // OAI format: {"type":"function","function":{"name":...}}
+                if (t.contains("function") && t["function"].is_object() && t["function"].contains("name")) {
+                    client_names.insert(t["function"]["name"].get<std::string>());
+                } else if (t.contains("name")) {
+                    client_names.insert(t["name"].get<std::string>());
+                }
+            }
+        }
+    } else {
+        body["tools"] = json::array();
+    }
+
+    for (const auto & tdef : registry_tools) {
+        if (client_names.count(tdef.name)) {
+            continue; // client definition wins
+        }
+        json schema = tdef.schema.is_null() || tdef.schema.empty()
+            ? json{{"type", "object"}, {"properties", json::object()}}
+            : tdef.schema;
+        body["tools"].push_back({
+            {"type", "function"},
+            {"function", {
+                {"name",        tdef.name},
+                {"description", tdef.description},
+                {"parameters",  std::move(schema)}
+            }}
+        });
+    }
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_chat_auto_execute(
+        const server_http_req & req,
+        json body,
+        task_response_type res_type) {
+    static constexpr int MAX_ROUNDS = 10;
+
+    auto res = create_response();
+    auto & rd = res->rd;
+
+    for (int round = 0; round < MAX_ROUNDS; ++round) {
+        // (Re-)parse body into a completion data blob
+        std::vector<raw_buffer> files;
+        json data;
+        try {
+            data = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // Submit completion task(s) — mirrors the core of handle_completions_impl
+        auto completion_id = gen_chatcmplid();
+        try {
+            const auto & prompt = data.at("prompt");
+            std::vector<server_tokens> inputs;
+            if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+                inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+            } else {
+                inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+            }
+
+            std::vector<server_task> tasks;
+            for (auto & inp : inputs) {
+                server_task task(SERVER_TASK_TYPE_COMPLETION);
+                task.id                          = rd.get_new_id();
+                task.tokens                      = std::move(inp);
+                task.params                      = server_task::params_from_json_cmpl(
+                    ctx_server.vocab, params, meta->slot_n_ctx, data);
+                task.id_slot                     = json_value(data, "id_slot", -1);
+                task.params.res_type             = res_type;
+                task.params.oaicompat_cmpl_id    = completion_id;
+                task.params.oaicompat_model      = meta->model_name;
+                tasks.push_back(std::move(task));
+            }
+            rd.post_tasks(std::move(tasks));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // Wait for results
+        auto all_results = rd.wait_for_all(req.should_stop);
+        if (all_results.is_terminated) {
+            return res;
+        }
+        if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(!all_results.results.empty());
+        auto * final_result = dynamic_cast<server_task_result_cmpl_final *>(all_results.results[0].get());
+        GGML_ASSERT(final_result != nullptr);
+
+        // No tool calls — return final answer to the client
+        if (final_result->oaicompat_msg.tool_calls.empty()) {
+            res->ok(all_results.results[0]->to_json());
+            return res;
+        }
+
+        // Reached iteration cap — return last response as-is (contains tool_calls)
+        if (round == MAX_ROUNDS - 1) {
+            SRV_WRN("auto_execute: reached max rounds (%d), returning last result\n", MAX_ROUNDS);
+            res->ok(all_results.results[0]->to_json());
+            return res;
+        }
+
+        // Assign stable call IDs (use model-generated id if present, otherwise generate)
+        std::vector<std::string> call_ids;
+        call_ids.reserve(final_result->oaicompat_msg.tool_calls.size());
+        for (const auto & tc : final_result->oaicompat_msg.tool_calls) {
+            call_ids.push_back(tc.id.empty() ? gen_tool_call_id() : tc.id);
+        }
+
+        // Inject assistant turn (with tool_calls) into the conversation
+        json tc_arr = json::array();
+        for (size_t i = 0; i < final_result->oaicompat_msg.tool_calls.size(); ++i) {
+            const auto & tc = final_result->oaicompat_msg.tool_calls[i];
+            tc_arr.push_back({
+                {"id",   call_ids[i]},
+                {"type", "function"},
+                {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}
+            });
+        }
+        json assistant_msg = {
+            {"role",       "assistant"},
+            {"content",    final_result->oaicompat_msg.content.empty()
+                               ? json(nullptr)
+                               : json(final_result->oaicompat_msg.content)},
+            {"tool_calls", std::move(tc_arr)}
+        };
+        body["messages"].push_back(std::move(assistant_msg));
+
+        // Execute each tool call and inject its result
+        for (size_t i = 0; i < final_result->oaicompat_msg.tool_calls.size(); ++i) {
+            const auto & tc       = final_result->oaicompat_msg.tool_calls[i];
+            const std::string cid = call_ids[i];
+
+            tool_call_request treq;
+            treq.call_id    = cid;
+            treq.tool_name  = tc.name;
+            treq.created_at = std::chrono::steady_clock::now();
+            try {
+                treq.arguments = tc.arguments.empty() ? json::object() : json::parse(tc.arguments);
+            } catch (...) {
+                treq.arguments = json::object();
+            }
+
+            tool_call_result tres = ctx_server.tooling.registry->execute_tool(treq);
+
+            std::string content_str;
+            if (!tres.success) {
+                content_str = tres.error_message.empty() ? "tool call failed" : tres.error_message;
+            } else if (tres.output.is_string()) {
+                content_str = tres.output.get<std::string>();
+            } else {
+                content_str = tres.output.dump();
+            }
+
+            body["messages"].push_back({
+                {"role",         "tool"},
+                {"tool_call_id", cid},
+                {"content",      content_str}
+            });
+        }
+        // Continue loop with updated conversation
+    }
+
+    // Should never reach here due to the guard above
+    res->error(format_error_response("auto_execute: unexpected loop exit", ERROR_TYPE_SERVER));
+    return res;
+}
+
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
         : params(params),
           ctx_server(*ctx_server.impl),
@@ -3655,16 +3899,13 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        inject_registry_tools(body);
+        if (ctx_server.tooling.auto_execute && !body.value("stream", false)) {
+            return handle_chat_auto_execute(req, std::move(body), TASK_RESPONSE_TYPE_OAI_CHAT);
+        }
+        json body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
         return handle_completions_impl(
-            req,
-            SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
-            files,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+            req, SERVER_TASK_TYPE_COMPLETION, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT);
     };
 
     this->post_responses_oai = [this](const server_http_req & req) {
@@ -3673,16 +3914,13 @@ void server_routes::init_routes() {
         json body = convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        inject_registry_tools(body);
+        if (ctx_server.tooling.auto_execute && !body.value("stream", false)) {
+            return handle_chat_auto_execute(req, std::move(body), TASK_RESPONSE_TYPE_OAI_RESP);
+        }
+        json body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
         return handle_completions_impl(
-            req,
-            SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
-            files,
-            TASK_RESPONSE_TYPE_OAI_RESP);
+            req, SERVER_TASK_TYPE_COMPLETION, body_parsed, files, TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
@@ -3691,16 +3929,13 @@ void server_routes::init_routes() {
         json body = convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        inject_registry_tools(body);
+        if (ctx_server.tooling.auto_execute && !body.value("stream", false)) {
+            return handle_chat_auto_execute(req, std::move(body), TASK_RESPONSE_TYPE_ANTHROPIC);
+        }
+        json body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
         return handle_completions_impl(
-            req,
-            SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
-            files,
-            TASK_RESPONSE_TYPE_ANTHROPIC);
+            req, SERVER_TASK_TYPE_COMPLETION, body_parsed, files, TASK_RESPONSE_TYPE_ANTHROPIC);
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
@@ -3991,6 +4226,114 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    // Tool registry endpoints
+
+    this->get_tools = [this](const server_http_req &) {
+        auto res = create_response(true);
+        if (!ctx_server.tooling.enabled) {
+            res->error(format_error_response("Tool registry not enabled. Start with --enable-server-tools", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        auto tools = ctx_server.tooling.registry->list_tools();
+        json tool_list = json::array();
+        for (const auto & t : tools) {
+            json entry = {{"name", t.name}, {"description", t.description}};
+            if (!t.schema.is_null()) {
+                entry["schema"] = t.schema;
+            }
+            tool_list.push_back(std::move(entry));
+        }
+        res->ok({{"tools", tool_list}});
+        return res;
+    };
+
+    this->post_tools_call = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!ctx_server.tooling.enabled) {
+            res->error(format_error_response("Tool registry not enabled. Start with --enable-server-tools", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        std::string tool_name = body.value("tool", "");
+        if (tool_name.empty()) {
+            res->error(format_error_response("Missing required field 'tool'", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        tool_call_request request;
+        request.call_id   = gen_tool_call_id();
+        request.tool_name = tool_name;
+        request.arguments = body.value("arguments", json::object());
+        request.created_at = std::chrono::steady_clock::now();
+
+        std::string session_id = body.value("session_id", "");
+        tool_call_result result;
+        if (!session_id.empty()) {
+            result = ctx_server.tooling.registry->execute_tool_in_session(session_id, request);
+        } else {
+            result = ctx_server.tooling.registry->execute_tool(request);
+        }
+
+        if (!result.success) {
+            res->error(json{{"error", {{"message", result.error_message}, {"code", result.error_code}}}, {"call_id", result.call_id}});
+            return res;
+        }
+        res->ok({{"call_id", result.call_id}, {"output", result.output}});
+        return res;
+    };
+
+    this->post_tools_sessions = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!ctx_server.tooling.enabled) {
+            res->error(format_error_response("Tool registry not enabled. Start with --enable-server-tools", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        json context = json::object();
+        if (!req.body.empty()) {
+            try {
+                const json body = json::parse(req.body);
+                if (body.contains("context")) {
+                    context = body["context"];
+                }
+            } catch (...) {}
+        }
+        std::string session_id = ctx_server.tooling.registry->create_session(context);
+        res->ok({{"session_id", session_id}});
+        return res;
+    };
+
+    this->post_tools_sessions_close = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!ctx_server.tooling.enabled) {
+            res->error(format_error_response("Tool registry not enabled. Start with --enable-server-tools", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        std::string session_id = body.value("session_id", "");
+        if (session_id.empty()) {
+            res->error(format_error_response("Missing required field 'session_id'", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        bool closed = ctx_server.tooling.registry->close_session(session_id);
+        if (!closed) {
+            res->error(format_error_response("Session not found", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res->ok({{"session_id", session_id}, {"closed", true}});
+        return res;
+    };
+
+    this->get_tools_health = [this](const server_http_req &) {
+        auto res = create_response(true);
+        if (!ctx_server.tooling.enabled) {
+            res->ok({{"enabled", false}, {"healthy", false}});
+            return res;
+        }
+        auto health = ctx_server.tooling.registry->get_health();
+        res->ok({{"enabled", true}, {"healthy", health.healthy}, {"tool_count", (int)health.registered_tools}, {"active_sessions", (int)health.active_sessions}});
         return res;
     };
 }

@@ -202,6 +202,12 @@ int main(int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",               ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",      ex_wrapper(routes.post_slots));
+    // Tool registry (non-standard endpoints, only meaningful when --enable-server-tools is set)
+    ctx_http.get ("/tools",                ex_wrapper(routes.get_tools));
+    ctx_http.post("/tools/call",           ex_wrapper(routes.post_tools_call));
+    ctx_http.post("/tools/sessions",       ex_wrapper(routes.post_tools_sessions));
+    ctx_http.post("/tools/sessions/close", ex_wrapper(routes.post_tools_sessions_close));
+    ctx_http.get ("/tools/health",         ex_wrapper(routes.get_tools_health));
     // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
     if (params.webui_mcp_proxy) {
         SRV_WRN("%s", "-----------------\n");

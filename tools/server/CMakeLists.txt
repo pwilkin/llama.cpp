@@ -13,6 +13,13 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    tool/tool-executor.cpp
+    tool/tool-registry.cpp
+    tool/builtin-executor.cpp
+    tool/subprocess-manager.cpp
+    tool/plugin-executor.cpp
+    tool/mcp-executor.cpp
+    tool/skill-executor.cpp
 )
 
 if (BUILD_SHARED_LIBS)
