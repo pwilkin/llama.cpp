@@ -1,7 +1,9 @@
 #include "llama-quant.h"
+#include "ggml.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
+#include "llama.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,6 +14,15 @@
 #include <regex>
 #include <thread>
 #include <unordered_map>
+
+// IQ3_KL codebook functions (defined in ggml-quants.c)
+extern "C" {
+    void   iq3kl_generate_codebook(const float * data, int64_t nrow, int64_t n_per_row,
+                                    const float * imatrix, uint8_t * codebook_out);
+    void   iq3kl_set_codebook(const uint8_t * codebook);
+    const uint8_t * iq3kl_get_codebook(void);
+    void   iq3kl_free_codebook(void);
+}
 
 // Quantization types. Changes to this struct must be replicated in quantize.cpp
 struct tensor_quantization {
@@ -219,7 +230,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_S  || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M   ||
-                     ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
+                     ftype == LLAMA_FTYPE_MOSTLY_IQ3_KL  || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
             else if (new_type != GGML_TYPE_Q8_0) {
@@ -247,6 +258,9 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
                 new_type = GGML_TYPE_IQ3_S;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_KL) {
+                new_type = GGML_TYPE_Q4_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0) {
                 new_type = GGML_TYPE_Q4_K;
@@ -285,6 +299,9 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
             new_type = qs.model.hparams.n_gqa() >= 4 ? GGML_TYPE_Q4_K : !qs.has_imatrix ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ3_XXS;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_KL) {
+            new_type = GGML_TYPE_IQ3_KL;
         }
         else if ((ftype == LLAMA_FTYPE_MOSTLY_IQ3_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_S) && qs.model.hparams.n_gqa() >= 4) {
             new_type = GGML_TYPE_Q4_K;
@@ -484,6 +501,7 @@ static bool tensor_type_requires_imatrix(const ggml_tensor * t, const ggml_type 
         dst_type == GGML_TYPE_IQ2_XXS || dst_type == GGML_TYPE_IQ2_XS ||
         dst_type == GGML_TYPE_IQ3_XXS || dst_type == GGML_TYPE_IQ1_S  ||
         dst_type == GGML_TYPE_IQ2_S   || dst_type == GGML_TYPE_IQ1_M  ||
+        dst_type == GGML_TYPE_IQ3_KL  ||
         (   // Q2_K_S is the worst k-quant type - only allow it without imatrix for token embeddings
             dst_type == GGML_TYPE_Q2_K && ftype == LLAMA_FTYPE_MOSTLY_Q2_K_S && strcmp(t->name, "token_embd.weight") != 0
         )
@@ -531,6 +549,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  default_type = GGML_TYPE_IQ4_XS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:   default_type = GGML_TYPE_IQ3_S;   break;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   default_type = GGML_TYPE_IQ3_S;   break;
+        case LLAMA_FTYPE_MOSTLY_IQ3_KL:  default_type = GGML_TYPE_IQ3_KL;  break;
 
         default: throw std::runtime_error(format("invalid output file type %d\n", ftype));
     }
@@ -747,6 +766,83 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     const auto tn = LLM_TN(model.arch);
 
+    // IQ3_KL two-pass approach: generate all per-tensor codebooks BEFORE opening the output
+    // file, so the codebook KV entry is already populated at the time of the metadata placeholder.
+    static const size_t IQ3KL_CB_BYTES = 512 * 4;  // IQ3KL_CODEBOOK_SIZE * IQ3KL_GROUP_SIZE
+    std::vector<uint8_t> iq3kl_all_codebooks;  // indexed by position in tensors[]
+    if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_KL && !params->dry_run) {
+        LLAMA_LOG_INFO("%s: IQ3_KL pass 1: generating per-tensor codebooks...\n", __func__);
+        iq3kl_all_codebooks.assign(tensors.size() * IQ3KL_CB_BYTES, 0);
+
+        // Temporary dequant buffer for pass 1 (reuse f32_conv_buf / read_data declared below)
+        std::vector<no_init<uint8_t>> p1_read_data;
+        std::vector<no_init<float>>   p1_f32_buf;
+        std::vector<std::thread>      p1_workers;
+        p1_workers.reserve(nthread);
+
+        for (size_t ti = 0; ti < tensors.size(); ++ti) {
+            ggml_tensor * tensor = tensors[ti]->tensor;
+            const std::string tname = ggml_get_name(tensor);
+
+            // Determine whether this tensor will be IQ3_KL (mirror the pass-2 logic)
+            bool quantize = tname.rfind("weight") == tname.size() - 6;
+            quantize &= (ggml_n_dims(tensor) >= 2);
+            quantize &= tname.find("_norm.weight")        == std::string::npos;
+            quantize &= tname.find("ffn_gate_inp.weight") == std::string::npos;
+            if (!quantize) { continue; }
+
+            ggml_type new_type = default_type;
+            if (!params->pure) {
+                new_type = llama_tensor_get_type(qs, new_type, tensor, ftype);
+            }
+            if (new_type != GGML_TYPE_IQ3_KL) { continue; }
+
+            // Load tensor data
+            const size_t tsz = ggml_nbytes(tensor);
+            if (!ml.use_mmap) {
+                if (p1_read_data.size() < tsz) { p1_read_data.resize(tsz); }
+                tensor->data = p1_read_data.data();
+            }
+            ml.load_data_for(tensor);
+
+            // Dequantize to f32 if needed
+            const int64_t nelements = ggml_nelements(tensor);
+            float * f32_data;
+            if (tensor->type == GGML_TYPE_F32) {
+                f32_data = (float *) tensor->data;
+            } else {
+                llama_tensor_dequantize_impl(tensor, p1_f32_buf, p1_workers, nelements, nthread);
+                f32_data = (float *) p1_f32_buf.data();
+            }
+
+            // Resolve imatrix
+            const float * imatrix = nullptr;
+            if (imatrix_data) {
+                auto it2 = imatrix_data->find(remap_imatrix(tensor->name, mapped));
+                if (it2 != imatrix_data->end() &&
+                    it2->second.size() == (size_t)tensor->ne[0] * tensor->ne[2]) {
+                    imatrix = it2->second.data();
+                }
+            }
+
+            const int64_t n_per_row = tensor->ne[0];
+            const int64_t nrows     = tensor->ne[1];
+
+            LLAMA_LOG_INFO("%s: IQ3_KL codebook for [%zu/%zu] %s\n", __func__, ti+1, tensors.size(), tensor->name);
+            iq3kl_generate_codebook(f32_data, nrows, n_per_row, imatrix,
+                                    iq3kl_all_codebooks.data() + ti * IQ3KL_CB_BYTES);
+        }
+
+        // All codebooks ready — store in GGUF metadata before the file is opened
+        for (auto & ctx : ctx_outs) {
+            if (ctx) {
+                gguf_set_arr_data(ctx.get(), "iq3_kl.codebooks", GGUF_TYPE_UINT8,
+                                  iq3kl_all_codebooks.data(), iq3kl_all_codebooks.size());
+            }
+        }
+        LLAMA_LOG_INFO("%s: IQ3_KL pass 1 complete.\n", __func__);
+    }
+
     // no output file for --dry-run
     if (!params->dry_run) {
         new_ofstream(0);
@@ -755,6 +851,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // flag for `--dry-run`, to let the user know if imatrix will be required for a real
     // quantization, as a courtesy
     bool will_require_imatrix = false;
+    size_t tensor_pass2_idx = 0;  // index into tensors[], used for IQ3_KL codebook lookup
 
     for (const auto * it : tensors) {
         const auto & weight = *it;
@@ -1012,6 +1109,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
+                // IQ3_KL: set the per-tensor codebook (generated in pass 1) as global for quantization
+                if (new_type == GGML_TYPE_IQ3_KL) {
+                    iq3kl_set_codebook(iq3kl_all_codebooks.data() + tensor_pass2_idx * IQ3KL_CB_BYTES);
+                }
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
@@ -1058,6 +1160,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             fout.write((const char *) new_data, new_size);
             zeros(fout, GGML_PAD(new_size, align) - new_size);
         } // no --dry-run
+
+        tensor_pass2_idx++;
     } // iterate over tensors
 
     if (!params->dry_run) {

@@ -427,6 +427,22 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// 3.25 bpw - learned VQ with model-specific codebook
+// 256 elements = 8 sub-blocks of 32 = 64 groups of 4
+// Codebook: 512 entries x 4 uint8 values, stored in GGUF metadata
+// Layout: 2 (d) + 6 (scales: 8x6-bit) + 24 (signs: 64x3-bit) + 72 (qs: 64x9-bit) = 104 bytes
+typedef struct {
+    ggml_half d;                  //  2 bytes: super-block scale (scale-only, no min offset)
+    uint8_t scales[6];            //  6 bytes: 8 sub-blocks x 6-bit scale, sequentially bit-packed
+    uint8_t signs[QK_K/8 - 8];   // 24 bytes: 64 groups x 3-bit sign patterns (parity trick)
+    uint8_t qs[72];               // 72 bytes: 64 groups x 9-bit codebook index (512-entry codebook)
+} block_iq3_kl;
+static_assert(sizeof(block_iq3_kl) == 2 + 6 + QK_K/8 - 8 + 72, "wrong iq3_kl block size/padding");
+
+#define IQ3KL_CODEBOOK_SIZE 512
+#define IQ3KL_GROUP_SIZE 4
+#define IQ3KL_NUM_GROUPS (QK_K / IQ3KL_GROUP_SIZE)
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 

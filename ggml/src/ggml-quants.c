@@ -709,6 +709,15 @@ static inline void get_scale_min_k4(int j, const uint8_t * GGML_RESTRICT q, uint
     }
 }
 
+// Extract only the scale (not min) from Q4_K-style packed scales
+static inline void get_scale_k4_only(int j, const uint8_t * GGML_RESTRICT q, uint8_t * GGML_RESTRICT d) {
+    if (j < 4) {
+        *d = q[j] & 63;
+    } else {
+        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+    }
+}
+
 //========================- 2-bit (de)-quantization
 
 void quantize_row_q2_K_ref(const float * GGML_RESTRICT x, block_q2_K * GGML_RESTRICT y, int64_t k) {
@@ -4062,6 +4071,655 @@ void quantize_row_iq3_s_ref(const float * GGML_RESTRICT x, block_iq3_s * GGML_RE
     quantize_iq3_s(x, y, 1, k, NULL);
 }
 
+// ========================= IQ3_KL: 3.25 bpw learned VQ =========================
+
+// Global codebook (used during quantization for the current tensor)
+static uint8_t iq3kl_codebook[IQ3KL_CODEBOOK_SIZE * IQ3KL_GROUP_SIZE];
+static bool    iq3kl_codebook_set = false;
+
+void iq3kl_set_codebook(const uint8_t * codebook) {
+    memcpy(iq3kl_codebook, codebook, IQ3KL_CODEBOOK_SIZE * IQ3KL_GROUP_SIZE);
+    iq3kl_codebook_set = true;
+}
+
+const uint8_t * iq3kl_get_codebook(void) {
+    return iq3kl_codebook_set ? iq3kl_codebook : NULL;
+}
+
+void iq3kl_free_codebook(void) {
+    iq3kl_codebook_set = false;
+}
+
+// Per-tensor codebook registry for inference (binary search by data address)
+#define IQ3KL_MAX_TENSORS 1024
+#define IQ3KL_CB_BYTES    (IQ3KL_CODEBOOK_SIZE * IQ3KL_GROUP_SIZE)
+#define IQ3KL_MAX_SAMPLES  65536
+#define IQ3KL_KMEANS_ITERS 100
+#define IQ3KL_JOINT_OPT_ITERS 3
+#define IQ3KL_CB_REFINE_ITERS 1
+#define IQ3KL_N_ATTEMPTS      4
+
+void iq3kl_generate_codebook(const float * data, int64_t nrow, int64_t n_per_row,
+                              const float * imatrix, uint8_t * codebook_out) {
+
+    // Heap-allocate working memory
+     float (* samples)[4] = (float (*)[4])malloc(IQ3KL_MAX_SAMPLES * 4 * sizeof(float));
+     float * sample_w     = (float *)malloc(IQ3KL_MAX_SAMPLES * sizeof(float));
+     int * sample_sb_idx  = (int *)malloc(IQ3KL_MAX_SAMPLES * sizeof(int));
+     GGML_ASSERT(samples && sample_w && sample_sb_idx);
+
+     // Compute total number of sub-blocks and allocate per-sub-block scales
+     int64_t groups_per_row = n_per_row / QK_K;
+     int64_t subblocks_per_block = QK_K / 32;
+     int total_subblocks = (int)(nrow * groups_per_row * subblocks_per_block);
+     float * subblock_scales = (float *)malloc(total_subblocks * sizeof(float));
+     GGML_ASSERT(subblock_scales);
+     memset(subblock_scales, 0, total_subblocks * sizeof(float));
+
+    int n_samples = 0;
+    int64_t total_groups = 0;
+
+   // Phase 1: collect original absolute values and sub-block scales
+     for (int64_t row = 0; row < nrow; ++row) {
+         const float * xrow = data + row * n_per_row;
+         for (int64_t sb = 0; sb < n_per_row / QK_K; ++sb) {
+             const float * xsb = xrow + sb * QK_K;
+             for (int ib = 0; ib < QK_K/32; ++ib) {
+                 const float * xb = xsb + ib * 32;
+
+                 // Sub-block statistics (mirrors quantization)
+                 float max_abs = 0, min_abs = FLT_MAX;
+                 for (int j = 0; j < 32; ++j) {
+                     float a = fabsf(xb[j]);
+                     if (a > max_abs) max_abs = a;
+                     if (a < min_abs) min_abs = a;
+                 }
+                 if (max_abs < GROUP_MAX_EPS_IQ3_XXS) continue; // skip near-zero blocks
+
+                 // Compute sub-block index and store its initial scale (max_abs)
+                 int subblock_idx = (int)((row * groups_per_row + sb) * subblocks_per_block + ib);
+                 subblock_scales[subblock_idx] = max_abs;
+
+                 for (int ig = 0; ig < 8; ++ig) {
+                     const float * xg = xb + ig * 4;
+
+                     // Importance weight from imatrix
+                     float w = 1.0f;
+                     if (imatrix) {
+                         int base = (int)(sb * QK_K + ib * 32 + ig * 4);
+                         w = 0.25f * (imatrix[base] + imatrix[base+1] + imatrix[base+2] + imatrix[base+3]);
+                         if (w < 1e-10f) w = 1e-10f;
+                     }
+
+                     // Store original absolute values (no normalization)
+                     float orig[4];
+                     for (int j = 0; j < 4; ++j) {
+                         orig[j] = fabsf(xg[j]);
+                     }
+
+                     // Stride-based sampling: keep every N-th or fill reservoir
+                     if (n_samples < IQ3KL_MAX_SAMPLES) {
+                         memcpy(samples[n_samples], orig, sizeof(orig));
+                         sample_sb_idx[n_samples] = subblock_idx;
+                         sample_w[n_samples] = w;
+                         n_samples++;
+                     } else {
+                         // Deterministic strided replacement to keep representative spread
+                         int slot = (int)(total_groups % IQ3KL_MAX_SAMPLES);
+                         memcpy(samples[slot], orig, sizeof(orig));
+                         sample_sb_idx[slot] = subblock_idx;
+                         sample_w[slot] = w;
+                     }
+                     total_groups++;
+                 }
+             }
+         }
+     }
+
+    if (n_samples < IQ3KL_CODEBOOK_SIZE) {
+        // Too few samples — generate a uniform grid codebook
+        for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+            for (int j = 0; j < 4; ++j) {
+                codebook_out[c * 4 + j] = (uint8_t)(c);  // simple ramp
+            }
+        }
+        iq3kl_set_codebook(codebook_out);
+        free(samples);
+        free(sample_w);
+        return;
+    }
+
+    // Phase 2: multiple k-means restarts with varied initializations.
+    //
+    // subblock_scales[] = max_abs per sub-block (set in Phase 1).
+    // Dividing by max_abs puts samples in [0, 1].
+    // Each restart uses a different stride through the sample array so
+    // centroids start from a different region of the distribution.
+    // We evaluate reconstruction error in original space and keep the best.
+
+    // Prime strides — coprime with any power-of-2 sample count, giving
+    // well-spread but distinct starting points across the dataset.
+    static const int attempt_strides[IQ3KL_N_ATTEMPTS] = {251, 257, 263, 269};
+
+    float   centroids[IQ3KL_CODEBOOK_SIZE][4];
+    float   best_centroids[IQ3KL_CODEBOOK_SIZE][4];
+    float   best_error = FLT_MAX;
+    int   * assignments = (int *)malloc(n_samples * sizeof(int));
+    float * normalized_samples = (float *)malloc(n_samples * 4 * sizeof(float));
+    // Save Phase 1 max_abs so each attempt starts from the same normalization
+    float * orig_subblock_scales = (float *)malloc(total_subblocks * sizeof(float));
+    GGML_ASSERT(assignments && normalized_samples && orig_subblock_scales);
+    memcpy(orig_subblock_scales, subblock_scales, total_subblocks * sizeof(float));
+
+    for (int attempt = 0; attempt < IQ3KL_N_ATTEMPTS; ++attempt) {
+
+        // Restore normalization to original max_abs for this attempt
+        memcpy(subblock_scales, orig_subblock_scales, total_subblocks * sizeof(float));
+        for (int s = 0; s < n_samples; ++s) {
+            float inv = subblock_scales[sample_sb_idx[s]] > 1e-20f
+                        ? 1.0f / subblock_scales[sample_sb_idx[s]] : 0.0f;
+            for (int j = 0; j < 4; ++j)
+                normalized_samples[s*4 + j] = samples[s][j] * inv;
+        }
+
+        // Initialize centroids using a prime stride so each attempt
+        // draws from a different, well-spread region of the samples
+        int stride = attempt_strides[attempt];
+        for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+            int idx = (c * stride) % n_samples;
+            memcpy(centroids[c], normalized_samples + idx*4, 4 * sizeof(float));
+        }
+
+        // K-means on normalized samples
+        for (int iter = 0; iter < IQ3KL_KMEANS_ITERS; ++iter) {
+            // Assignment
+            for (int s = 0; s < n_samples; ++s) {
+                float best_d = FLT_MAX;
+                int best_c = 0;
+                for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+                    float d = 0;
+                    for (int j = 0; j < 4; ++j) {
+                        float diff = normalized_samples[s*4 + j] - centroids[c][j];
+                        d += diff * diff;
+                    }
+                    if (d < best_d) { best_d = d; best_c = c; }
+                }
+                assignments[s] = best_c;
+            }
+            // Update
+            float new_c[IQ3KL_CODEBOOK_SIZE][4];
+            float cw[IQ3KL_CODEBOOK_SIZE];
+            memset(new_c, 0, sizeof(new_c));
+            memset(cw,    0, sizeof(cw));
+            for (int s = 0; s < n_samples; ++s) {
+                int c = assignments[s];
+                float w = sample_w[s];
+                for (int j = 0; j < 4; ++j) new_c[c][j] += w * normalized_samples[s*4 + j];
+                cw[c] += w;
+            }
+            for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+                if (cw[c] > 0) {
+                    for (int j = 0; j < 4; ++j) centroids[c][j] = new_c[c][j] / cw[c];
+                } else {
+                    int idx = (c * stride + iter * 13) % n_samples;
+                    memcpy(centroids[c], normalized_samples + idx*4, 4 * sizeof(float));
+                }
+            }
+        }
+
+        // Joint optimization: alternate between updating centroids and
+        // sub-block scales so both converge together
+        for (int joint_iter = 0; joint_iter < IQ3KL_JOINT_OPT_ITERS; ++joint_iter) {
+            // Step A: assign
+            for (int s = 0; s < n_samples; ++s) {
+                float best_d = FLT_MAX;
+                int best_c = 0;
+                for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+                    float d = 0;
+                    for (int j = 0; j < 4; ++j) {
+                        float diff = normalized_samples[s*4 + j] - centroids[c][j];
+                        d += diff * diff;
+                    }
+                    if (d < best_d) { best_d = d; best_c = c; }
+                }
+                assignments[s] = best_c;
+            }
+            // Step B: update centroids
+            {
+                float new_c[IQ3KL_CODEBOOK_SIZE][4];
+                float cw[IQ3KL_CODEBOOK_SIZE];
+                memset(new_c, 0, sizeof(new_c));
+                memset(cw,    0, sizeof(cw));
+                for (int s = 0; s < n_samples; ++s) {
+                    int c = assignments[s];
+                    float w = sample_w[s];
+                    for (int j = 0; j < 4; ++j) new_c[c][j] += w * normalized_samples[s*4 + j];
+                    cw[c] += w;
+                }
+                for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+                    if (cw[c] > 0) {
+                        for (int j = 0; j < 4; ++j) centroids[c][j] = new_c[c][j] / cw[c];
+                    } else {
+                        int idx = (c * stride + joint_iter * 13) % n_samples;
+                        memcpy(centroids[c], normalized_samples + idx*4, 4 * sizeof(float));
+                    }
+                }
+            }
+            // Step C: optimal per-subblock scale from regression
+            {
+                double * sv2 = (double *)calloc(total_subblocks, sizeof(double));
+                double * svx = (double *)calloc(total_subblocks, sizeof(double));
+                float  * new_scales = (float *)malloc(total_subblocks * sizeof(float));
+                GGML_ASSERT(sv2 && svx && new_scales);
+                for (int s = 0; s < n_samples; ++s) {
+                    int sb_idx = sample_sb_idx[s];
+                    const float * cv = centroids[assignments[s]];
+                    float w = sample_w[s];
+                    for (int j = 0; j < 4; ++j) {
+                        sv2[sb_idx] += (double)w * (double)cv[j] * (double)cv[j];
+                        svx[sb_idx] += (double)w * (double)samples[s][j] * (double)cv[j];
+                    }
+                }
+                for (int sb = 0; sb < total_subblocks; ++sb) {
+                    float s2 = sv2[sb] > 1e-20 ? (float)(svx[sb] / sv2[sb]) : 0.f;
+                    new_scales[sb] = s2 > 0.f ? s2 : 0.f;
+                }
+                free(sv2); free(svx);
+                // Step D: re-normalize
+                for (int s = 0; s < n_samples; ++s) {
+                    float inv = new_scales[sample_sb_idx[s]] > 1e-20f
+                                ? 1.0f / new_scales[sample_sb_idx[s]] : 0.0f;
+                    for (int j = 0; j < 4; ++j)
+                        normalized_samples[s*4 + j] = samples[s][j] * inv;
+                }
+                memcpy(subblock_scales, new_scales, total_subblocks * sizeof(float));
+                free(new_scales);
+            }
+        }
+
+        // Final extra k-means pass to polish centroids after scale update
+        for (int iter = 0; iter < IQ3KL_CB_REFINE_ITERS; ++iter) {
+            for (int s = 0; s < n_samples; ++s) {
+                float best_d = FLT_MAX;
+                int best_c = 0;
+                for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+                    float d = 0;
+                    for (int j = 0; j < 4; ++j) {
+                        float diff = normalized_samples[s*4 + j] - centroids[c][j];
+                        d += diff * diff;
+                    }
+                    if (d < best_d) { best_d = d; best_c = c; }
+                }
+                assignments[s] = best_c;
+            }
+            float new_c[IQ3KL_CODEBOOK_SIZE][4];
+            float cw[IQ3KL_CODEBOOK_SIZE];
+            memset(new_c, 0, sizeof(new_c));
+            memset(cw,    0, sizeof(cw));
+            for (int s = 0; s < n_samples; ++s) {
+                int c = assignments[s];
+                float w = sample_w[s];
+                for (int j = 0; j < 4; ++j) new_c[c][j] += w * normalized_samples[s*4 + j];
+                cw[c] += w;
+            }
+            for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+                if (cw[c] > 0) {
+                    for (int j = 0; j < 4; ++j) centroids[c][j] = new_c[c][j] / cw[c];
+                } else {
+                    int idx = (c * stride + (iter + 100) * 13) % n_samples;
+                    memcpy(centroids[c], normalized_samples + idx*4, 4 * sizeof(float));
+                }
+            }
+        }
+
+        // Evaluate reconstruction error in original (absolute) space for fair comparison.
+        // Uses the final assignments from the last pass above.
+        float attempt_error = 0.0f;
+        for (int s = 0; s < n_samples; ++s) {
+            int c = assignments[s];
+            float scale = subblock_scales[sample_sb_idx[s]];
+            float w = sample_w[s];
+            for (int j = 0; j < 4; ++j) {
+                float recon = scale * centroids[c][j];
+                float diff  = samples[s][j] - recon;
+                attempt_error += w * diff * diff;
+            }
+        }
+
+        if (attempt_error < best_error) {
+            best_error = attempt_error;
+            memcpy(best_centroids, centroids, sizeof(centroids));
+        }
+    }
+
+    free(orig_subblock_scales);
+    free(normalized_samples);
+    free(assignments);
+
+    // Phase 3: quantize best centroids to uint8
+    for (int c = 0; c < IQ3KL_CODEBOOK_SIZE; ++c) {
+        for (int j = 0; j < 4; ++j) {
+            float v = best_centroids[c][j];
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            codebook_out[c * 4 + j] = (uint8_t)(v * 255.0f + 0.5f);
+        }
+    }
+
+    iq3kl_set_codebook(codebook_out);
+    free(sample_sb_idx);
+    free(subblock_scales);
+    free(samples);
+    free(sample_w);
+}
+
+// Sign encoding: 3 bits per 4-element group (parity trick - 4th sign inferred)
+// Pack 64 groups x 3 bits = 192 bits = 24 bytes
+// --- IQ3_KL bit-packing helpers ---
+
+// 6-bit scale packing: 8 sub-block scales × 6 bits each = 48 bits = 6 bytes, packed sequentially.
+static inline uint8_t iq3kl_unpack_scale(const uint8_t * GGML_RESTRICT buf, int j) {
+    const int bit  = j * 6;
+    const int byte = bit / 8;
+    const int off  = bit % 8;
+    uint8_t val = (buf[byte] >> off) & 0x3F;
+    if (off > 2) {
+        val |= (uint8_t)((buf[byte + 1] << (8 - off)) & 0x3F);
+    }
+    return val;
+}
+
+static inline void iq3kl_pack_scale(uint8_t * GGML_RESTRICT buf, int j, uint8_t val) {
+    const int bit  = j * 6;
+    const int byte = bit / 8;
+    const int off  = bit % 8;
+    buf[byte]     |= (uint8_t)((val & 0x3F) << off);
+    if (off > 2) {
+        buf[byte + 1] |= (uint8_t)(val >> (8 - off));
+    }
+}
+
+// 9-bit index packing: 64 groups × 9 bits each = 576 bits = 72 bytes, packed sequentially.
+static inline uint16_t iq3kl_unpack_idx(const uint8_t * GGML_RESTRICT buf, int j) {
+    const int bit  = j * 9;
+    const int byte = bit / 8;
+    const int off  = bit % 8;
+    uint16_t val = ((uint16_t)buf[byte] | ((uint16_t)buf[byte + 1] << 8)) >> off;
+    return val & 0x1FF;
+}
+
+static inline void iq3kl_pack_idx(uint8_t * GGML_RESTRICT buf, int j, uint16_t val) {
+    const int bit  = j * 9;
+    const int byte = bit / 8;
+    const int off  = bit % 8;
+    buf[byte]     |= (uint8_t)(val << off);
+    buf[byte + 1] |= (uint8_t)(val >> (8 - off));
+}
+
+static void iq3kl_pack_signs(uint8_t * GGML_RESTRICT signs_out, const uint8_t * GGML_RESTRICT sign_patterns, int ngroups) {
+    // sign_patterns[g] contains 4 bits (one per element), we store only lower 3
+    memset(signs_out, 0, 24);
+    for (int g = 0; g < ngroups; ++g) {
+        int bit_offset = g * 3;
+        int byte_idx = bit_offset / 8;
+        int bit_idx  = bit_offset % 8;
+        uint8_t val = sign_patterns[g] & 0x7; // lower 3 bits
+        signs_out[byte_idx] |= (val << bit_idx);
+        if (bit_idx > 5) { // crosses byte boundary
+            signs_out[byte_idx + 1] |= (val >> (8 - bit_idx));
+        }
+    }
+}
+
+// Unpack 3-bit sign pattern for a group, reconstruct 4th sign from parity
+static inline uint8_t iq3kl_unpack_sign(const uint8_t * GGML_RESTRICT signs, int group_idx) {
+    int bit_offset = group_idx * 3;
+    int byte_idx = bit_offset / 8;
+    int bit_idx  = bit_offset % 8;
+    uint8_t val = (signs[byte_idx] >> bit_idx);
+    if (bit_idx > 5) {
+        val |= (signs[byte_idx + 1] << (8 - bit_idx));
+    }
+    val &= 0x7;
+    // reconstruct 4th sign from even parity: sign3 = sign0 ^ sign1 ^ sign2
+    uint8_t sign3 = (val & 1) ^ ((val >> 1) & 1) ^ ((val >> 2) & 1);
+    return val | (sign3 << 3);
+}
+
+void dequantize_row_iq3_kl(const block_iq3_kl * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    const uint8_t * cb = iq3kl_get_tensor_codebook(x);
+    GGML_ASSERT(cb != NULL && "IQ3_KL codebook not set for tensor");
+
+    for (int i = 0; i < nb; i++) {
+        const float d   = GGML_FP16_TO_FP32(x[i].d);
+        const uint8_t * qs = x[i].qs;
+        const uint8_t * signs = x[i].signs;
+
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            // Unpack scale for this sub-block
+            const uint8_t sc = iq3kl_unpack_scale(x[i].scales, ib);
+            const float sub_scale = d * sc;
+
+            // Each sub-block has 8 groups of 4 elements
+            for (int ig = 0; ig < 8; ++ig) {
+                const int group_idx = ib * 8 + ig;
+                const uint16_t cb_idx = iq3kl_unpack_idx(qs, group_idx);
+                const uint8_t * entry = cb + cb_idx * 4;
+                const uint8_t sign_bits = iq3kl_unpack_sign(signs, group_idx);
+
+                for (int j = 0; j < 4; ++j) {
+                    float magnitude = sub_scale * (entry[j] / 255.0f);
+                    float sign = (sign_bits & (1 << j)) ? -1.0f : 1.0f;
+                    y[ib * 32 + ig * 4 + j] = sign * magnitude;
+                }
+            }
+        }
+        y += QK_K;
+    }
+}
+
+// Find nearest codebook entry for a group of 4 non-negative values
+static int iq3kl_find_nearest(const uint8_t * GGML_RESTRICT codebook, const float * GGML_RESTRICT vals,
+                               const float * GGML_RESTRICT weights, float scale, int n_entries) {
+    float best_dist = FLT_MAX;
+    int best_idx = 0;
+
+    for (int c = 0; c < n_entries; ++c) {
+        const uint8_t * entry = codebook + c * 4;
+        float dist = 0;
+        for (int j = 0; j < 4; ++j) {
+            float recon = scale * (entry[j] / 255.0f);
+            float diff = vals[j] - recon;
+            dist += weights[j] * diff * diff;
+        }
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = c;
+        }
+    }
+    return best_idx;
+}
+
+// Pack sub_scales into block_iq3_kl scales[] (6-byte, 8×6-bit format) and update d.
+// Scale-only quantization: reconstruction = d * sc * (entry/255).
+static void iq3kl_pack_scales_only(block_iq3_kl * blk,
+                                    const float * sub_scales,
+                                    float * out_d) {
+    float max_scale = 0;
+    for (int ib = 0; ib < QK_K/32; ++ib) {
+        if (sub_scales[ib] > max_scale) { max_scale = sub_scales[ib]; }
+    }
+    const float inv_scale = max_scale > 0 ? 63.f / max_scale : 0.f;
+    memset(blk->scales, 0, sizeof(blk->scales));
+    for (int j = 0; j < QK_K/32; ++j) {
+        uint8_t ls = MIN(63, nearest_int(inv_scale * sub_scales[j]));
+        iq3kl_pack_scale(blk->scales, j, ls);
+    }
+    blk->d = GGML_FP32_TO_FP16(max_scale / 63.f);
+    *out_d = GGML_FP16_TO_FP32(blk->d);
+}
+
+#define IQ3KL_REFINE_ITERS 3
+// #define IQ3KL_DEBUG 1
+
+static void quantize_row_iq3_kl_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n,
+        const float * GGML_RESTRICT quant_weights) {
+
+    GGML_ASSERT(iq3kl_codebook_set && "IQ3_KL codebook not set - call iq3kl_set_codebook() first");
+    GGML_ASSERT(n % QK_K == 0);
+
+    const int64_t nbl = n / QK_K;
+    block_iq3_kl * y = (block_iq3_kl *)vy;
+
+    const uint8_t * cb = iq3kl_codebook;
+
+    float group_abs[4];
+    float group_weights[4];
+    uint8_t sign_patterns[IQ3KL_NUM_GROUPS];
+
+    for (int ibl = 0; ibl < nbl; ++ibl) {
+        const float * xbl = x + QK_K * ibl;
+
+        // Compute per-element weights (sigma2 for imatrix-weighted quantization)
+        float sumx2 = 0;
+        for (int i = 0; i < QK_K; ++i) sumx2 += xbl[i] * xbl[i];
+        float sigma2 = 2 * sumx2 / QK_K;
+
+        // Phase 1: sign-fold all groups; commit parity-corrected signs once
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            for (int ig = 0; ig < 8; ++ig) {
+                const int group_idx = ib * 8 + ig;
+                const float * xg = xbl + ib * 32 + ig * 4;
+                uint8_t signs = 0;
+                int nflip = 0;
+                for (int j = 0; j < 4; ++j) {
+                    if (xg[j] < 0) { signs |= (1 << j); nflip++; }
+                }
+                if (nflip % 2 != 0) {
+                    // Flip the least-important sign to enforce even-parity constraint
+                    float min_imp = FLT_MAX;
+                    int imin = 0;
+                    for (int j = 0; j < 4; ++j) {
+                        float w = quant_weights
+                            ? quant_weights[QK_K * ibl + ib * 32 + ig * 4 + j]
+                            : xg[j] * xg[j];
+                        float imp = w * xg[j] * xg[j];
+                        if (imp < min_imp) { min_imp = imp; imin = j; }
+                    }
+                    signs ^= (1 << imin);
+                }
+                sign_patterns[group_idx] = signs;
+            }
+        }
+
+        // Phase 2: initial per-sub-block scale/min from value range
+        float sub_scales[QK_K/32];
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            const float * xb = xbl + 32 * ib;
+            float max_abs = 0;
+            for (int j = 0; j < 32; ++j) {
+                float a = fabsf(xb[j]);
+                if (a > max_abs) { max_abs = a; }
+            }
+            sub_scales[ib] = max_abs;
+            if (sub_scales[ib] < GROUP_MAX_EPS_IQ3_XXS) {
+                sub_scales[ib] = 0;
+            }
+        }
+
+        float d_val;
+        iq3kl_pack_scales_only(&y[ibl], sub_scales, &d_val);
+
+        // Phase 3: initial codebook assignment
+        memset(y[ibl].qs, 0, sizeof(y[ibl].qs));
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            const float eff_scale = d_val * iq3kl_unpack_scale(y[ibl].scales, ib);
+            for (int ig = 0; ig < 8; ++ig) {
+                const int group_idx = ib * 8 + ig;
+                const float * xg = xbl + ib * 32 + ig * 4;
+                for (int j = 0; j < 4; ++j) {
+                     group_abs[j] = fabsf(xg[j]);
+                     group_weights[j] = quant_weights
+                         ? quant_weights[QK_K * ibl + ib * 32 + ig * 4 + j] * sqrtf(sigma2 + xg[j] * xg[j])
+                         : 1.0f;
+                 }
+                iq3kl_pack_idx(y[ibl].qs, group_idx,
+                    iq3kl_find_nearest(cb, group_abs, group_weights, eff_scale, IQ3KL_CODEBOOK_SIZE));
+            }
+        }
+
+        // Phase 4: iterative scale/codebook refinement
+        // Given current codebook assignments, compute the analytically optimal per-sub-block
+        // scale via weighted regression (sumxv/svv), then re-pack and re-assign.
+        for (int iter = 0; iter < IQ3KL_REFINE_ITERS; ++iter) {
+            // Step A: optimal scale per sub-block (sumxv/svv like IQ3_XXS)
+            for (int ib = 0; ib < QK_K/32; ++ib) {
+                double sv2 = 0, svx = 0;
+                for (int ig = 0; ig < 8; ++ig) {
+                    const int group_idx = ib * 8 + ig;
+                    const uint8_t * entry = cb + iq3kl_unpack_idx(y[ibl].qs, group_idx) * 4;
+                    for (int j = 0; j < 4; ++j) {
+                        const float x_j   = xbl[ib * 32 + ig * 4 + j];
+                        const float x_abs = fabsf(x_j);
+                        const float v     = entry[j] / 255.0f;
+                        const float w = quant_weights
+                            ? quant_weights[QK_K * ibl + ib * 32 + ig * 4 + j] * sqrtf(sigma2 + x_j * x_j)
+                            : 1.0f;
+                        sv2 += (double)w * (double)v * (double)v;
+                        svx += (double)w * (double)x_abs * (double)v;
+                    }
+                }
+                if (sv2 > 1e-20) {
+                    float new_s = (float)(svx / sv2);
+                    sub_scales[ib] = new_s > 0.f ? new_s : 0.f;
+                }
+            }
+
+            // Step B: re-pack scales
+            iq3kl_pack_scales_only(&y[ibl], sub_scales, &d_val);
+
+            // Step C: re-assign codebook entries with refined scales
+            memset(y[ibl].qs, 0, sizeof(y[ibl].qs));
+            for (int ib = 0; ib < QK_K/32; ++ib) {
+                const float eff_scale = d_val * iq3kl_unpack_scale(y[ibl].scales, ib);
+                for (int ig = 0; ig < 8; ++ig) {
+                    const int group_idx = ib * 8 + ig;
+                    const float * xg = xbl + ib * 32 + ig * 4;
+                    for (int j = 0; j < 4; ++j) {
+                        group_abs[j] = fabsf(xg[j]);
+                        group_weights[j] = quant_weights
+                            ? quant_weights[QK_K * ibl + ib * 32 + ig * 4 + j] * sqrtf(sigma2 + xg[j] * xg[j])
+                            : 1.0f;
+                    }
+                    iq3kl_pack_idx(y[ibl].qs, group_idx,
+                        iq3kl_find_nearest(cb, group_abs, group_weights, eff_scale, IQ3KL_CODEBOOK_SIZE));
+                }
+            }
+        }
+
+        // Pack sign patterns (computed once in Phase 1, unchanged during refinement)
+        iq3kl_pack_signs(y[ibl].signs, sign_patterns, IQ3KL_NUM_GROUPS);
+    }
+}
+
+size_t quantize_iq3_kl(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_ASSERT(n_per_row % QK_K == 0);
+    int64_t nblock = n_per_row / QK_K;
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_iq3_kl_impl(src, qrow, n_per_row, quant_weights);
+        src += n_per_row;
+        qrow += nblock * sizeof(block_iq3_kl);
+    }
+    return nrow * nblock * sizeof(block_iq3_kl);
+}
+
+void quantize_row_iq3_kl_ref(const float * GGML_RESTRICT x, block_iq3_kl * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    quantize_iq3_kl(x, y, 1, k, NULL);
+}
 
 // =================================== 1.5 bpw ===================================================
 
@@ -5307,6 +5965,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
+        case GGML_TYPE_IQ3_KL:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_iq3_kl, data, nb);
+            } break;
 
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
@@ -5322,4 +5984,49 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     }
 
     return true;
+}
+
+// Per-tensor codebook registry for inference
+#define IQ3KL_MAX_TENSORS 1024
+
+typedef struct {
+    const void * data;
+    size_t nbytes;
+    const uint8_t * codebook;
+} iq3kl_tensor_entry;
+
+static iq3kl_tensor_entry iq3kl_tensor_registry[IQ3KL_MAX_TENSORS];
+static int iq3kl_tensor_registry_count = 0;
+
+GGML_API void iq3kl_register_tensor_codebook(const void * data, size_t nbytes, const uint8_t * codebook) {
+    if (iq3kl_tensor_registry_count >= IQ3KL_MAX_TENSORS) {
+        // Registry full; could replace oldest or ignore. For now, ignore.
+        return;
+    }
+    // Check for duplicate and update
+    for (int i = 0; i < iq3kl_tensor_registry_count; ++i) {
+        if (iq3kl_tensor_registry[i].data == data) {
+            iq3kl_tensor_registry[i].nbytes = nbytes;
+            iq3kl_tensor_registry[i].codebook = codebook;
+            return;
+        }
+    }
+    iq3kl_tensor_registry[iq3kl_tensor_registry_count].data = data;
+    iq3kl_tensor_registry[iq3kl_tensor_registry_count].nbytes = nbytes;
+    iq3kl_tensor_registry[iq3kl_tensor_registry_count].codebook = codebook;
+    iq3kl_tensor_registry_count++;
+}
+
+GGML_API void iq3kl_clear_tensor_codebooks(void) {
+    iq3kl_tensor_registry_count = 0;
+}
+
+GGML_API const uint8_t * iq3kl_get_tensor_codebook(const void * data_ptr) {
+    for (int i = 0; i < iq3kl_tensor_registry_count; ++i) {
+        if (iq3kl_tensor_registry[i].data == data_ptr) {
+            return iq3kl_tensor_registry[i].codebook;
+        }
+    }
+    // Fallback to global codebook
+    return iq3kl_get_codebook();
 }

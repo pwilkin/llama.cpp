@@ -1001,6 +1001,73 @@ void ggml_vec_dot_iq3_s_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+void ggml_vec_dot_iq3_kl_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_iq3_kl * GGML_RESTRICT x = vx;
+    const block_q8_K   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+    const uint8_t * cb = iq3kl_get_tensor_codebook(vx);
+    GGML_ASSERT(cb != NULL && "IQ3_KL codebook not set for tensor");
+
+    float sumf = 0.f;
+    for (int i = 0; i < nb; ++i) {
+        const float d     = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        const uint8_t * scales = x[i].scales;
+        const uint8_t * qs     = x[i].qs;
+        const uint8_t * signs  = x[i].signs;
+        const int8_t  * q8     = y[i].qs;
+
+        float sumb = 0.f;
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            // 6-bit scale unpack: 8×6-bit sequentially packed into 6 bytes
+            const int sbit  = ib * 6;
+            const int sbyte = sbit / 8;
+            const int soff  = sbit % 8;
+            uint8_t sc = (scales[sbyte] >> soff) & 0x3F;
+            if (soff > 2) { sc |= (uint8_t)((scales[sbyte + 1] << (8 - soff)) & 0x3F); }
+            const float eff_d = d * sc;
+
+            for (int ig = 0; ig < 8; ++ig) {
+                const int group_idx = ib * 8 + ig;
+
+                // 9-bit index unpack: 64×9-bit sequentially packed into 72 bytes
+                const int qbit  = group_idx * 9;
+                const int qbyte = qbit / 8;
+                const int qoff  = qbit % 8;
+                const uint16_t cb_idx = (((uint16_t)qs[qbyte] | ((uint16_t)qs[qbyte + 1] << 8)) >> qoff) & 0x1FF;
+                const uint8_t * entry = cb + cb_idx * 4;
+
+                // Inline sign unpacking (3 bits per group, parity trick)
+                int bit_offset = group_idx * 3;
+                int byte_idx = bit_offset / 8;
+                int bit_idx  = bit_offset % 8;
+                uint8_t sv = (signs[byte_idx] >> bit_idx);
+                if (bit_idx > 5) {
+                    sv |= (signs[byte_idx + 1] << (8 - bit_idx));
+                }
+                sv &= 0x7;
+                uint8_t sign4 = sv | (((sv & 1) ^ ((sv >> 1) & 1) ^ ((sv >> 2) & 1)) << 3);
+
+                for (int j = 0; j < 4; ++j) {
+                    float val = eff_d * (entry[j] / 255.0f);
+                    if (sign4 & (1 << j)) { val = -val; }
+                    sumb += val * q8[ib * 32 + ig * 4 + j];
+                }
+            }
+        }
+        sumf += sumb;
+    }
+    *s = sumf;
+}
+
 void ggml_vec_dot_iq1_s_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);

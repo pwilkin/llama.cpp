@@ -15,6 +15,13 @@
 
 #include "models/models.h"
 
+// IQ3_KL codebook functions (defined in ggml-quants.c)
+extern "C" {
+    void            iq3kl_set_codebook(const uint8_t * codebook);
+    void            iq3kl_register_tensor_codebook(const void * data, size_t nbytes, const uint8_t * codebook);
+    void            iq3kl_clear_tensor_codebooks(void);
+}
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -7803,6 +7810,53 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    // IQ3_KL: load per-tensor codebooks from GGUF metadata and register them
+    // Must happen AFTER load_all_data so tensor data pointers are valid.
+    // IQ3_KL: load per-tensor codebooks and register them against the model tensors'
+    // actual data pointers (set by load_all_data above).
+    // NOTE: weights_map[name].tensor->data is the GGUF meta-tensor pointer (NULL before
+    // load_all_data). The real data pointers are on the duplicated tensors in ctx_buf_maps.
+    {
+        static const size_t IQ3KL_CB_BYTES = 512 * 4;
+        int64_t cb_idx = gguf_find_key(ml.meta.get(), "iq3_kl.codebooks");
+        if (cb_idx >= 0) {
+            const uint8_t * cb_data = (const uint8_t *)gguf_get_arr_data(ml.meta.get(), cb_idx);
+            const size_t    cb_len  = gguf_get_arr_n(ml.meta.get(), cb_idx);
+
+            // Build tensor-name → codebook-slot index map (GGUF file order = quantizer order)
+            std::unordered_map<std::string, size_t> name_to_slot;
+            {
+                const int64_t n_tensors = gguf_get_n_tensors(ml.meta.get());
+                for (int64_t ti = 0; ti < n_tensors; ++ti) {
+                    name_to_slot[gguf_get_tensor_name(ml.meta.get(), ti)] = (size_t)ti;
+                }
+            }
+
+            iq3kl_clear_tensor_codebooks();
+            int n_registered = 0;
+
+            // Iterate the MODEL's ggml contexts — these tensors have valid data pointers
+            // after load_all_data (mmap address or host buffer).
+            for (auto & [ctx, buf_map] : ctx_buf_maps) {
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->type != GGML_TYPE_IQ3_KL || t->data == nullptr) { continue; }
+                    auto it = name_to_slot.find(ggml_get_name(t));
+                    if (it == name_to_slot.end()) { continue; }
+                    const size_t cb_offset = it->second * IQ3KL_CB_BYTES;
+                    if (cb_offset + IQ3KL_CB_BYTES > cb_len) { continue; }
+                    iq3kl_register_tensor_codebook(t->data, ggml_nbytes(t), cb_data + cb_offset);
+                    if (n_registered == 0) {
+                        iq3kl_set_codebook(cb_data + cb_offset);  // global fallback
+                    }
+                    n_registered++;
+                }
+            }
+            if (n_registered > 0) {
+                LLAMA_LOG_INFO("%s: registered %d IQ3_KL per-tensor codebooks\n", __func__, n_registered);
+            }
         }
     }
 
