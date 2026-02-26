@@ -100,21 +100,21 @@ GGML_API void quantize_row_iq3_kl_ref(const float * GGML_RESTRICT x, block_iq3_k
 GGML_API void dequantize_row_iq3_kl(const block_iq3_kl * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_iq3_kl(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
-// IQ3_KL codebook management
-GGML_API void   iq3kl_set_codebook(const uint8_t * codebook);  // set global codebook (quantization)
-GGML_API const uint8_t * iq3kl_get_codebook(void);
-GGML_API void   iq3kl_free_codebook(void);
+// IQ3_KL levels management (per-tensor Lloyd-Max levels in [0,1])
+GGML_API void          iq3kl_set_levels(const float * levels);   // set global levels (quantization)
+GGML_API const float * iq3kl_get_levels(void);
+GGML_API void          iq3kl_free_levels(void);
 
-// Per-tensor codebook registry (inference)
-GGML_API void   iq3kl_register_tensor_codebook(const void * data, size_t nbytes, const uint8_t * codebook);
-GGML_API void   iq3kl_clear_tensor_codebooks(void);
-GGML_API const uint8_t * iq3kl_get_tensor_codebook(const void * data_ptr); // binary search, fallback global
+// Per-tensor levels registry (inference — range-based lookup by data address)
+GGML_API void          iq3kl_register_tensor_levels(const void * data, size_t nbytes, const float * levels);
+GGML_API void          iq3kl_clear_tensor_levels(void);
+GGML_API const float * iq3kl_get_tensor_levels(const void * data_ptr);
 
-// Generate a 256-entry codebook from tensor data using weighted k-means.
+// Train 8 Lloyd-Max levels from tensor data via weighted k-means on affine-normalized
+// 16-element sub-block values. Also sets the global levels via iq3kl_set_levels().
 // data: float array [nrow * n_per_row], imatrix: importance weights [n_per_row] or NULL.
-// codebook_out: output array [256 * 4] uint8 values. Also sets the global codebook.
-GGML_API void   iq3kl_generate_codebook(const float * data, int64_t nrow, int64_t n_per_row,
-                                         const float * imatrix, uint8_t * codebook_out);
+GGML_API void          iq3kl_train_levels(const float * data, int64_t nrow, int64_t n_per_row,
+                                          const float * imatrix, float levels_out[8]);
 
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);

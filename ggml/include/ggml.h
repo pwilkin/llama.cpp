@@ -427,7 +427,7 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_IQ3_KL  = 40, // 3.25 bpw learned VQ
+        GGML_TYPE_IQ3_KL  = 40, // 3.875 bpw per-tensor Lloyd-Max, 16-elem affine sub-blocks
         GGML_TYPE_COUNT   = 41,
     };
 

@@ -7518,7 +7518,7 @@ void ggml_quantize_init(enum ggml_type type) {
         case GGML_TYPE_IQ1_M:   iq2xs_init_impl(type); break;
         case GGML_TYPE_IQ3_XXS: iq3xs_init_impl(256); break;
         case GGML_TYPE_IQ3_S:   iq3xs_init_impl(512); break;
-        case GGML_TYPE_IQ3_KL:  break; // codebook set externally via iq3kl_set_codebook()
+        case GGML_TYPE_IQ3_KL:  break; // levels set externally via iq3kl_set_levels()
         default: // nothing
             break;
     }

@@ -427,21 +427,18 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
-// 3.25 bpw - learned VQ with model-specific codebook
-// 256 elements = 8 sub-blocks of 32 = 64 groups of 4
-// Codebook: 512 entries x 4 uint8 values, stored in GGUF metadata
-// Layout: 2 (d) + 6 (scales: 8x6-bit) + 24 (signs: 64x3-bit) + 72 (qs: 64x9-bit) = 104 bytes
+// 3.875 bpw - per-tensor Lloyd-Max scalar quantization
+// 256 elements = 16 sub-blocks of 16, 8-entry level table trained per tensor
+// Layout: 2 (d) + 2 (dmin) + 24 (scales: 32x6-bit) + 96 (qs: 256x3-bit) = 124 bytes
 typedef struct {
-    ggml_half d;                  //  2 bytes: super-block scale (scale-only, no min offset)
-    uint8_t scales[6];            //  6 bytes: 8 sub-blocks x 6-bit scale, sequentially bit-packed
-    uint8_t signs[QK_K/8 - 8];   // 24 bytes: 64 groups x 3-bit sign patterns (parity trick)
-    uint8_t qs[72];               // 72 bytes: 64 groups x 9-bit codebook index (512-entry codebook)
+    ggml_half d;                  //  2 bytes: global scale for 16-elem sub-block ranges
+    ggml_half dmin;               //  2 bytes: global scale for sub-block neg_mins
+    uint8_t scales[3*QK_K/32];   // 24 bytes: 32 x 6-bit (indices 0..15 = ranges, 16..31 = neg_mins)
+    uint8_t qs[3*QK_K/8];        // 96 bytes: 256 x 3-bit Lloyd-Max level index, sequential
 } block_iq3_kl;
-static_assert(sizeof(block_iq3_kl) == 2 + 6 + QK_K/8 - 8 + 72, "wrong iq3_kl block size/padding");
+static_assert(sizeof(block_iq3_kl) == 124, "wrong iq3_kl block size");
 
-#define IQ3KL_CODEBOOK_SIZE 512
-#define IQ3KL_GROUP_SIZE 4
-#define IQ3KL_NUM_GROUPS (QK_K / IQ3KL_GROUP_SIZE)
+#define IQ3KL_N_LEVELS 8
 
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
