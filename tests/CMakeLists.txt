@@ -253,8 +253,9 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
 endif()
 
-# IQ3_KL quantization accuracy test (runs without dynamic backend constraint)
+# New quant tests
 llama_build_and_test(test-quant-iq3kl.cpp)
+llama_build_and_test(test-quant-q3kpt.cpp)
 
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
