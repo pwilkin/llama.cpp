@@ -425,6 +425,14 @@ static common_chat_tool special_function_tool_with_optional_param{
         "required": ["arg1"]
     })",
 };
+static common_chat_tool empty_args_tool{
+    /* .name = */ "empty_args",
+    /* .description = */ "A tool that takes no arguments",
+    /* .parameters = */ R"({
+        "type": "object",
+        "properties": {}
+    })",
+};
 static common_chat_tool python_tool{
     /* .name = */ "python",
     /* .description = */ "an ipython interpreter",
@@ -2057,33 +2065,166 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_call_thoughts)
             .run();
 
-        // String argument starting with '[' - should NOT be treated as JSON array
-        // This tests the fix for Godot scene files and similar content
         tst.test(
-               "<tool_call>html"
-               "<arg_key>markup</arg_key><arg_value>[gd_scene load_steps=3 format=3]</arg_value>"
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>"
+               "<tool_call>special_function_with_opt"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "<arg_key>arg2</arg_key><arg_value>2</arg_value>"
                "</tool_call>")
-            .enable_thinking(false)
-            .tools({ html_tool })
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
             .expect_tool_calls({
-                { "html", "{\"markup\": \"[gd_scene load_steps=3 format=3]\"}", {} },
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
             })
             .run();
-
-        // Multiple tool calls
-        // Note: Parallel tool calls streaming test skipped - the KEY_VALUE_TAGS format has
-        // partial parsing edge cases when function names share common prefixes (special_function vs special_function_with_opt)
-        // The grammar and full parsing work correctly, but incremental streaming detection needs more work.
     }
 
-    // Kimi-K2-Thinking tests - FUNC_PREFIXED_INDEXED format
+    // Kimi-K2-Thinking tests - custom parser
+    // Unique feature: tool call ID embeds function name as functions.<name>:<counter>
     {
         auto tst = peg_tester("models/templates/Kimi-K2-Thinking.jinja", detailed_debug);
+
+        // Basic content only
+        tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
+
+        // Single tool call
         tst.test(
                "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
                "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
             .tools({ special_function_tool })
-            .expect(message_assist_call)
+            .expect(simple_assist_msg("", "", "special_function", "{\"arg1\": 1}", "functions.special_function:0"))
+            .run();
+
+        // Single tool call with reasoning
+        tst.test(
+               "<think>I'm thinking about this</think>"
+               "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
+               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("", "I'm thinking about this", "special_function", "{\"arg1\": 1}", "functions.special_function:0"))
+            .run();
+
+        // Tool call with content
+        tst.test(
+               "Hello, world!\nWhat's up?"
+               "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
+               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?", "", "special_function", "{\"arg1\": 1}", "functions.special_function:0"))
+            .run();
+
+        // Multiple tool calls (parallel) - tests the indexing behavior
+        tst.test(
+               "<|tool_calls_section_begin|>"
+               "<|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>{\"arg1\": 1}<|tool_call_end|>"
+               "<|tool_call_begin|>functions.special_function_with_opt:1<|tool_call_argument_begin|>{\"arg1\": 1, \"arg2\": 2}<|tool_call_end|>"
+               "<|tool_calls_section_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", "functions.special_function:0" },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", "functions.special_function_with_opt:1" },
+            })
+            .run();
+
+        // Multiple tool calls with reasoning
+        tst.test(
+               "<think>I need to call two functions</think>"
+               "<|tool_calls_section_begin|>"
+               "<|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>{\"arg1\": 1}<|tool_call_end|>"
+               "<|tool_call_begin|>functions.python:1<|tool_call_argument_begin|>{\"code\": \"print('hey')\"}<|tool_call_end|>"
+               "<|tool_calls_section_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, python_tool
+        })
+            .expect_reasoning("I need to call two functions")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", "functions.special_function:0" },
+                { "python", "{\"code\": \"print('hey')\"}", "functions.python:1" },
+            })
+            .run();
+
+        // Python tool with multiline code
+        tst.test(
+               "<|tool_calls_section_begin|><|tool_call_begin|>functions.python:0<|tool_call_argument_begin|>"
+               "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}<|tool_call_end|><|tool_calls_section_end|>")
+            .tools({ python_tool })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", "functions.python:0" },
+            })
+            .run();
+
+        // Tool call with empty arguments
+        tst.test(
+               "<|tool_calls_section_begin|><|tool_call_begin|>functions.empty_args:0<|tool_call_argument_begin|>"
+               "{}<|tool_call_end|><|tool_calls_section_end|>")
+            .tools({ empty_args_tool })
+            .expect(simple_assist_msg("", "", "empty_args", "{}", "functions.empty_args:0"))
+            .run();
+
+        // Partial tool call (streaming)
+        tst.test(
+               "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
+               "{\"arg1\": ")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .is_partial(true)
+            .expect(simple_assist_msg("", "", "special_function", "{\"arg1\": ", "functions.special_function:0"))
+            .run();
+
+        // Three tool calls to verify counter continues incrementing
+        tst.test(
+               "<|tool_calls_section_begin|>"
+               "<|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>{\"arg1\": 1}<|tool_call_end|>"
+               "<|tool_call_begin|>functions.python:1<|tool_call_argument_begin|>{\"code\": \"print(1)\"}<|tool_call_end|>"
+               "<|tool_call_begin|>functions.html:2<|tool_call_argument_begin|>{\"markup\": \"<p>test</p>\"}<|tool_call_end|>"
+               "<|tool_calls_section_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, python_tool, html_tool
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", "functions.special_function:0" },
+                { "python", "{\"code\": \"print(1)\"}", "functions.python:1" },
+                { "html", "{\"markup\": \"<p>test</p>\"}", "functions.html:2" },
+            })
+            .run();
+    }
+
+    {
+        auto kimi_id_special_func_tool_call =
+            simple_assist_msg("", "", "special_function", "{\"arg1\": 1}", "functions.special_function:0");
+
+        // Kimi-K2 old template
+        auto tst = peg_tester("models/templates/moonshotai-Kimi-K2.jinja", detailed_debug);
+        tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
+        tst.test(
+               "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
+               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
+            .tools({ special_function_tool })
+            .expect(kimi_id_special_func_tool_call)
+            .run();
+
+        // Kimi-K2-Instruct
+        auto tst2 = peg_tester("models/templates/Kimi-K2-Instruct.jinja", detailed_debug);
+        tst2.test("Hello, world!\nWhat's up?").expect(message_assist).run();
+        tst2.test(
+               "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
+               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
+            .tools({ special_function_tool })
+            .expect(kimi_id_special_func_tool_call)
             .run();
     }
 
@@ -2231,28 +2372,6 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_call)
             .run();
     }
-    // Kimi-K2 (moonshotai) - FUNC_PREFIXED_INDEXED format
-    {
-        auto tst = peg_tester("models/templates/moonshotai-Kimi-K2.jinja", detailed_debug);
-        tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
-        tst.test(
-               "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
-               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
-            .tools({ special_function_tool })
-            .expect(message_assist_call)
-            .run();
-    }
-    // Kimi-K2-Instruct - FUNC_PREFIXED_INDEXED format
-    {
-        auto tst = peg_tester("models/templates/Kimi-K2-Instruct.jinja", detailed_debug);
-        tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
-        tst.test(
-               "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
-               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
-            .tools({ special_function_tool })
-            .expect(message_assist_call)
-            .run();
-    }
 
     // MiMo-VL / Hermes 3 / Qwen 2.5 (Common <tool_call> JSON format)
     for (const auto & path :
@@ -2306,7 +2425,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_call_id)
             .run();
     }
-    // Devstral - FUNC_BRACKET_TAG format (no ID marker): [TOOL_CALLS]func_name[ARGS]{...}
+    // Devstral
     {
         auto tst = peg_tester("models/templates/unsloth-mistral-Devstral-Small-2507.jinja", detailed_debug);
         tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
