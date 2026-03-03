@@ -239,6 +239,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
         if (!function.close.empty()) {
             func_parser = func_parser + function.close;
         }
+        func_parser = p.atomic(func_parser);
 
         tool_choice |= p.rule("tool-" + name, func_parser);
     });
@@ -366,6 +367,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
                 func_parser + p.tool_close(p.space());  // force this to process tool closing callbacks in mapper
         }
 
+        func_parser = p.atomic(func_parser);
         tool_choice |= p.rule("tool-" + name, func_parser);
     });
 

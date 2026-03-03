@@ -1159,6 +1159,125 @@ static common_chat_params common_chat_params_init_functionary_v3_2(const common_
     return data;
 }
 
+// Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
+// The ID contains both the function name and an incrementing counter
+static common_chat_params common_chat_params_init_kimi_k2(const common_chat_template &    tmpl,
+                                                          const autoparser::templates_params & inputs) {
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+    data.preserved_tokens  = {
+        "<|im_end|>",
+        "<|tool_calls_section_begin|>",
+        "<|tool_calls_section_end|>",
+        "<|tool_call_begin|>",
+        "<|tool_call_argument_begin|>",
+        "<|tool_call_end|>",
+        "<think>",
+        "</think>",
+    };
+
+    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        // Kimi K2 Thinking format:
+        // - Reasoning: <think>{reasoning}</think>
+        // - Content: text after reasoning
+        // - Tool calls section:
+        //   <|tool_calls_section_begin|>
+        //   <|tool_call_begin|>functions.<name>:<index><|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+        //   ...
+        //   <|tool_calls_section_end|>
+        // The ID format is: functions.<function_name>:<counter> where counter is 0, 1, 2, ...
+
+        auto reasoning = extract_reasoning ? p.optional("<think>" + p.reasoning(p.until("</think>")) + "</think>") : p.eps();
+
+        // Tool call markers
+        const std::string SECTION_BEGIN = "<|tool_calls_section_begin|>";
+        const std::string SECTION_END   = "<|tool_calls_section_end|>";
+        const std::string CALL_BEGIN    = "<|tool_call_begin|>";
+        const std::string ARGS_BEGIN    = "<|tool_call_argument_begin|>";
+        const std::string CALL_END      = "<|tool_call_end|>";
+
+        // Content only parser (no tools)
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            return reasoning + p.content(p.rest()) + p.end();
+        }
+
+        // Build tool call parsers for each available function
+        // The ID format is: functions.<name>:<index>
+        // We need to match: functions.<name>:<digits>
+        auto tool_choice = p.choice();
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function = tool.at("function");
+            std::string  name     = function.at("name");
+            const auto & schema   = function.at("parameters");
+
+            // Match: functions.<name>:<digits>
+            // Capture the full call id (functions.<name>:<digits>) using tool_id tag
+            auto tool_id = p.tool_id(p.literal("functions.") + p.tool_name(p.literal(name)) + p.literal(":") + p.chars("[0-9]", 1, -1));
+            auto tool_parser = p.tool(
+                p.tool_open(tool_id + p.literal(ARGS_BEGIN)) +
+                p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema)) +
+                p.optional(p.tool_close(p.literal(CALL_END)))
+            );
+
+            tool_choice |= p.rule("tool-" + name, tool_parser);
+        });
+
+        // Tool calls section: <|tool_calls_section_begin|> tool_calls <|tool_calls_section_end|>
+        auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+        auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+        // Use trigger_rule so grammar generator knows where to start generating rules
+        auto tool_calls = p.trigger_rule("tool-calls",
+            p.literal(SECTION_BEGIN) +
+            p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) +
+            p.optional(p.literal(SECTION_END))
+        );
+
+        // Content can appear before tool calls
+        auto content_before_tools = p.content(p.until(SECTION_BEGIN));
+        auto content_only         = p.content(p.rest());
+
+        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+            return reasoning + p.choice({
+                content_before_tools + tool_calls,
+                tool_calls
+            }) + p.end();
+        }
+
+        return reasoning + p.choice({
+            content_before_tools + tool_calls,
+            content_only,
+            tool_calls
+        }) + p.end();
+    });
+
+    data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                auto         schema   = function.at("parameters");
+                builder.resolve_refs(schema);
+            });
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        data.grammar_triggers = {
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_calls_section_begin|>" }
+        };
+    }
+
+    return data;
+}
+
 namespace workaround {
 
 // if first message is system and template does not support it, merge it with next message
@@ -1295,6 +1414,14 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     if (src.find(">>>all") != std::string::npos && src.find(">>>${recipient}") != std::string::npos) {
         LOG_DBG("Using specialized template: Functionary v3.2\n");
         return common_chat_params_init_functionary_v3_2(tmpl, params);
+    }
+
+    // Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
+    // Detection: template has "<|tool_calls_section_begin|>" and "functions." prefix in tool call IDs
+    if (src.find("<|tool_calls_section_begin|>") != std::string::npos &&
+        src.find("functions.") != std::string::npos) {
+        LOG_DBG("Using specialized template: Kimi K2 Thinking\n");
+        return common_chat_params_init_kimi_k2(tmpl, params);
     }
 
     try {
