@@ -1169,7 +1169,6 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
     data.preserved_tokens  = {
-        "<|im_end|>",
         "<|tool_calls_section_begin|>",
         "<|tool_calls_section_end|>",
         "<|tool_call_begin|>",
@@ -1201,12 +1200,10 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
         const std::string ARGS_BEGIN    = "<|tool_call_argument_begin|>";
         const std::string CALL_END      = "<|tool_call_end|>";
 
-        const std::string IM_END        = "<|im_end|>";
-
         const std::string THINK_START   = "<think>";
         const std::string THINK_END     = "</think>";
 
-        auto end = p.end() | IM_END;
+        auto end = p.end();
 
         // Note: this model is CRAZY. It can diverge from its supposed tool calling pattern in so many ways it's not funny.
         // For example, it can call tools at the end of reasoning without closing reasoning...
