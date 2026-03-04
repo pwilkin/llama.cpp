@@ -1201,8 +1201,12 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
         const std::string ARGS_BEGIN    = "<|tool_call_argument_begin|>";
         const std::string CALL_END      = "<|tool_call_end|>";
 
+        const std::string IM_END        = "<|im_end|>";
+
         const std::string THINK_START   = "<think>";
         const std::string THINK_END     = "</think>";
+
+        auto end = p.end() | IM_END;
 
         // Note: this model is CRAZY. It can diverge from its supposed tool calling pattern in so many ways it's not funny.
         // For example, it can call tools at the end of reasoning without closing reasoning...
@@ -1213,7 +1217,7 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
 
         // Content only parser (no tools)
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
-            return reasoning + p.content(p.rest()) + p.end();
+            return reasoning + p.content(p.rest()) + end;
         }
 
         // Build tool call parsers for each available function
@@ -1249,7 +1253,7 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
 
         auto content_before_tools = p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN }));
 
-        return reasoning + content_before_tools + tool_calls + p.end();
+        return reasoning + content_before_tools + tool_calls + end;
     });
 
     data.parser = parser.save();
