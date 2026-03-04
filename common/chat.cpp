@@ -1194,14 +1194,22 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
         //   <|tool_calls_section_end|>
         // The ID format is: functions.<function_name>:<counter> where counter is 0, 1, 2, ...
 
-        auto reasoning = extract_reasoning ? p.optional("<think>" + p.reasoning(p.until("</think>")) + "</think>") : p.eps();
-
-        // Tool call markers
+                // Tool call markers
         const std::string SECTION_BEGIN = "<|tool_calls_section_begin|>";
         const std::string SECTION_END   = "<|tool_calls_section_end|>";
         const std::string CALL_BEGIN    = "<|tool_call_begin|>";
         const std::string ARGS_BEGIN    = "<|tool_call_argument_begin|>";
         const std::string CALL_END      = "<|tool_call_end|>";
+
+        const std::string THINK_START   = "<think>";
+        const std::string THINK_END     = "</think>";
+
+        // Note: this model is CRAZY. It can diverge from its supposed tool calling pattern in so many ways it's not funny.
+        // For example, it can call tools at the end of reasoning without closing reasoning...
+        auto reasoning = extract_reasoning ? p.optional(THINK_START + p.reasoning(
+            p.until_one_of({ THINK_END, "<|tool_calls_section_begin|>", "<|tool_call_begin|>" })) +
+            p.optional(p.literal(THINK_END))) : p.eps();
+
 
         // Content only parser (no tools)
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -1223,7 +1231,7 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
             auto tool_parser = p.tool(
                 p.tool_open(tool_id + p.literal(ARGS_BEGIN)) +
                 p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema)) +
-                p.optional(p.tool_close(p.literal(CALL_END)))
+                p.tool_close(p.optional((p.literal(CALL_END))))
             );
 
             tool_choice |= p.rule("tool-" + name, tool_parser);
@@ -1233,14 +1241,14 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
         auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
         auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
         // Use trigger_rule so grammar generator knows where to start generating rules
-        auto tool_calls = p.trigger_rule("tool-calls",
-            p.literal(SECTION_BEGIN) +
-            p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) +
-            p.optional(p.literal(SECTION_END))
+        auto tool_calls = p.rule("tool-calls",
+            p.optional(p.literal(SECTION_BEGIN)) +
+            p.trigger_rule("tool-call", p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) +
+                p.optional(p.literal(SECTION_END)))
         );
 
         // Content can appear before tool calls
-        auto content_before_tools = p.content(p.until(SECTION_BEGIN));
+        auto content_before_tools = p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN }));
         auto content_only         = p.content(p.rest());
 
         if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
@@ -1271,7 +1279,7 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
         });
 
         data.grammar_triggers = {
-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_calls_section_begin|>" }
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_call_begin|>" }
         };
     }
 

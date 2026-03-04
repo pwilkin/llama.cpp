@@ -2201,6 +2201,43 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 { "html", "{\"markup\": \"<p>test</p>\"}", "functions.html:2" },
             })
             .run();
+
+        // Multiple tool calls with reasoning, call *inside thinking block*
+        tst.test(
+               "<think>I need to call two functions"
+               "<|tool_calls_section_begin|>"
+               "<|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>{\"arg1\": 1}<|tool_call_end|>"
+               "<|tool_call_begin|>functions.python:1<|tool_call_argument_begin|>{\"code\": \"print('hey')\"}<|tool_call_end|>"
+               "<|tool_calls_section_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, python_tool
+        })
+            .expect_reasoning("I need to call two functions")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", "functions.special_function:0" },
+                { "python", "{\"code\": \"print('hey')\"}", "functions.python:1" },
+            })
+            .run();
+
+        // Multiple tool calls with reasoning, call *inside thinking block* and *without section markers or end markers
+        tst.test(
+               "<think>I need to call two functions"
+               "<|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>{\"arg1\": 1}"
+               "<|tool_call_begin|>functions.python:1<|tool_call_argument_begin|>{\"code\": \"print('hey')\"}")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, python_tool
+        })
+            .expect_reasoning("I need to call two functions")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", "functions.special_function:0" },
+                { "python", "{\"code\": \"print('hey')\"}", "functions.python:1" },
+            })
+            .run();
+
     }
 
     {
