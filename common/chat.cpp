@@ -1247,22 +1247,9 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
                 p.optional(p.literal(SECTION_END)))
         );
 
-        // Content can appear before tool calls
         auto content_before_tools = p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN }));
-        auto content_only         = p.content(p.rest());
 
-        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
-            return reasoning + p.choice({
-                content_before_tools + tool_calls,
-                tool_calls
-            }) + p.end();
-        }
-
-        return reasoning + p.choice({
-            content_before_tools + tool_calls,
-            content_only,
-            tool_calls
-        }) + p.end();
+        return reasoning + content_before_tools + tool_calls + p.end();
     });
 
     data.parser = parser.save();
@@ -1427,7 +1414,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     // Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
     // Detection: template has "<|tool_calls_section_begin|>" and "functions." prefix in tool call IDs
     if (src.find("<|tool_calls_section_begin|>") != std::string::npos &&
-        src.find("functions.") != std::string::npos) {
+        src.find("<|tool_call_begin|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Kimi K2 Thinking\n");
         return common_chat_params_init_kimi_k2(tmpl, params);
     }
