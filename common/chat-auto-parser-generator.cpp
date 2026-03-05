@@ -302,8 +302,13 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             params.at("required").get_to(required);
         }
 
-        // Build parser for each argument
-        std::vector<common_peg_parser> arg_parsers;
+        // Build parser for each argument (without optional wrapper - ordering handles optionality)
+        struct param_info {
+            common_peg_parser parser;
+            bool required;
+        };
+        std::vector<param_info> all_params;
+
         for (const auto & [param_name, param_schema] : properties.items()) {
             bool        is_required = required.find(param_name) != required.end();
             std::string type        = "object";
@@ -328,20 +333,69 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
                                         p.space()) +
                 p.tool_arg_close(p.literal(arguments.value_suffix)));
 
-            if (is_required) {
-                arg_parsers.push_back(p.rule("tool-" + name + "-arg-" + param_name, arg));
-            } else {
-                arg_parsers.push_back(p.optional(p.rule("tool-" + name + "-arg-" + param_name, arg)));
-            }
+            all_params.push_back({p.rule("tool-" + name + "-arg-" + param_name, arg), is_required});
         }
 
-        // Build arg sequence with space() between consecutive args
+        // Build args grammar - use any-order for up to 8 params, sequential fallback above that
         common_peg_parser args_seq = p.eps();
-        for (size_t i = 0; i < arg_parsers.size(); i++) {
-            if (i > 0) {
-                args_seq = args_seq + p.space();
+
+        if (all_params.size() <= 8 && !all_params.empty()) {
+            // Build any-order grammar: allows parameters in any permutation.
+            // Required params must appear; optional params may be omitted.
+            // Uses memoized bitmask recursion - O(2^N) subsets, capped at N=8 (256 rules).
+            std::unordered_map<uint32_t, common_peg_parser> memo;
+
+            std::function<common_peg_parser(uint32_t)> build_any_order;
+            build_any_order = [&](uint32_t remaining) -> common_peg_parser {
+                if (remaining == 0) {
+                    return p.eps();
+                }
+
+                auto it = memo.find(remaining);
+                if (it != memo.end()) {
+                    return it->second;
+                }
+
+                // Check if any remaining param is required
+                bool has_required = false;
+                for (size_t i = 0; i < all_params.size(); i++) {
+                    if ((remaining & (1u << i)) && all_params[i].required) {
+                        has_required = true;
+                        break;
+                    }
+                }
+
+                // Build choice: pick any remaining param, then recurse with the rest
+                auto choice = p.choice();
+                for (size_t i = 0; i < all_params.size(); i++) {
+                    if (!(remaining & (1u << i))) {
+                        continue;
+                    }
+                    uint32_t next = remaining & ~(1u << i);
+                    choice |= all_params[i].parser + p.space() + build_any_order(next);
+                }
+
+                // If any remaining param is required, the choice is mandatory;
+                // otherwise the entire group is optional (all remaining are optional)
+                auto result = has_required ? choice : p.optional(choice);
+                auto named = p.rule("tool-" + name + "-anyorder-" + std::to_string(remaining), result);
+                memo.emplace(remaining, named);
+                return named;
+            };
+
+            args_seq = build_any_order((1u << all_params.size()) - 1);
+        } else {
+            // Sequential fallback for tools with > 8 parameters
+            for (size_t i = 0; i < all_params.size(); i++) {
+                if (i > 0) {
+                    args_seq = args_seq + p.space();
+                }
+                if (all_params[i].required) {
+                    args_seq = args_seq + all_params[i].parser;
+                } else {
+                    args_seq = args_seq + p.optional(all_params[i].parser);
+                }
             }
-            args_seq = args_seq + arg_parsers[i];
         }
 
         // Build call_id parser based on position (if supported)
