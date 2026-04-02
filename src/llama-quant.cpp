@@ -37,6 +37,24 @@ enum class tensor_category {
     OTHER
 };
 
+static const char * tensor_category_name(tensor_category cat) {
+    switch (cat) {
+        case tensor_category::TOKEN_EMBD:      return "TOKEN_EMBD";
+        case tensor_category::ATTENTION_Q:     return "ATTENTION_Q";
+        case tensor_category::ATTENTION_V:     return "ATTENTION_V";
+        case tensor_category::ATTENTION_K:     return "ATTENTION_K";
+        case tensor_category::ATTENTION_QKV:   return "ATTENTION_QKV";
+        case tensor_category::ATTENTION_KV_B:  return "ATTENTION_KV_B";
+        case tensor_category::ATTENTION_OUTPUT:return "ATTENTION_OUTPUT";
+        case tensor_category::FFN_UP:          return "FFN_UP";
+        case tensor_category::FFN_GATE:        return "FFN_GATE";
+        case tensor_category::FFN_DOWN:        return "FFN_DOWN";
+        case tensor_category::OUTPUT:          return "OUTPUT";
+        case tensor_category::OTHER:           return "OTHER";
+    }
+    return "OTHER";
+}
+
 static void zeros(std::ofstream & file, size_t n) {
     char zero = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -668,6 +686,30 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         return params->output_tensor_type;
     }
 
+    // custom resolver callback
+    if (params->tensor_type_resolver != nullptr) {
+        int layer = 0;
+        std::smatch m;
+        std::string tname(tensor->name);
+        if (std::regex_search(tname, m, std::regex(R"(blk\.(\d+)\.)"))) {
+            layer = std::stoi(m[1].str());
+        }
+        ggml_type resolved = params->tensor_type_resolver(
+            tensor->name,
+            ggml_n_dims(tensor),
+            tensor->ne,
+            layer,
+            tensor_category_name(tm.category),
+            const_cast<void *>(params->tensor_type_resolver_ud));
+        if (resolved < GGML_TYPE_COUNT) {
+            LLAMA_LOG_DEBUG("%s: tensor_type_resolver resolved tensor '%s' to type %s\n", __func__, tensor->name,
+                            ggml_type_name(resolved));
+            return tensor_type_fallback(qs, tensor, resolved);
+        }
+        LLAMA_LOG_DEBUG("%s: tensor_type_resolver returned GGML_TYPE_COUNT for tensor '%s', falling back to standard logic\n",
+                        __func__, tensor->name);
+    }
+
     ggml_type new_type = default_type;
 
     // get more optimal quantization type based on the tensor shape, layer, etc.
@@ -1286,7 +1328,9 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.tensor_type_resolver        =*/ nullptr,
+        /*.tensor_type_resolver_ud    =*/ nullptr
     };
 
     return result;

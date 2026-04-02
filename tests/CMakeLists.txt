@@ -162,6 +162,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
+        llama_build_and_test(test-tensor-type-resolver.cpp)
     endif()
 
     llama_build(test-gbnf-validator.cpp)

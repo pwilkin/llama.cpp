@@ -1,6 +1,10 @@
 #include "common.h"
 #include "llama.h"
 #include "gguf.h"
+#include "jinja/lexer.h"
+#include "jinja/parser.h"
+#include "jinja/runtime.h"
+#include "jinja/value.h"
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +18,7 @@
 #include <map>
 #include <fstream>
 #include <filesystem>
+#include <sstream>
 
 // result of parsing --tensor-type option
 // changes to this struct must also be reflected in src/llama-quant.cpp
@@ -21,6 +26,106 @@ struct tensor_type_option {
     std::string name;
     ggml_type type = GGML_TYPE_COUNT;
 };
+
+struct jinja_tensor_type_ud {
+    jinja::program              prog;
+    std::string                 src;
+    std::map<std::string, int>  type_names;
+    const struct gguf_context * gguf_ctx;
+    std::string                 arch_name;
+};
+
+static ggml_type jinja_tensor_type_resolver(const char *    tensor_name,
+                                            int             n_dims,
+                                            const int64_t * ne,
+                                            int             layer,
+                                            const char *    category,
+                                            void *          user_data) {
+    auto * ud = static_cast<jinja_tensor_type_ud *>(user_data);
+    if (!ud || ud->prog.body.empty() || ud->type_names.empty()) {
+        return GGML_TYPE_COUNT;
+    }
+
+    try {
+        jinja::context ctx(ud->src);
+
+        for (const auto & [k, v] : ud->type_names) {
+            ctx.set_val(k, jinja::mk_val<jinja::value_int>(v));
+        }
+
+        ctx.set_val("name", jinja::mk_val<jinja::value_string>(tensor_name));
+        ctx.set_val("layer", jinja::mk_val<jinja::value_int>(layer));
+        ctx.set_val("category", jinja::mk_val<jinja::value_string>(category));
+
+        auto ne_arr = jinja::mk_val<jinja::value_array>();
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            ne_arr->push_back(jinja::mk_val<jinja::value_int>(ne[d]));
+        }
+        ctx.set_val("ne", ne_arr);
+        ctx.set_val("n_dims", jinja::mk_val<jinja::value_int>(n_dims));
+
+        ctx.set_val("arch", jinja::mk_val<jinja::value_string>(ud->arch_name));
+
+        if (ud->gguf_ctx) {
+            auto meta          = jinja::mk_val<jinja::value_object>();
+            meta->has_builtins = false;
+            const int n_kv     = gguf_get_n_kv(ud->gguf_ctx);
+            for (int i = 0; i < n_kv; i++) {
+                const char * key = gguf_get_key(ud->gguf_ctx, i);
+                if (!key) {
+                    continue;
+                }
+                const gguf_type val_type = gguf_get_kv_type(ud->gguf_ctx, i);
+                switch (val_type) {
+                    case GGUF_TYPE_STRING:
+                        meta->insert(key, jinja::mk_val<jinja::value_string>(gguf_get_val_str(ud->gguf_ctx, i)));
+                        break;
+                    case GGUF_TYPE_INT32:
+                        meta->insert(key, jinja::mk_val<jinja::value_int>(gguf_get_val_i32(ud->gguf_ctx, i)));
+                        break;
+                    case GGUF_TYPE_INT64:
+                        meta->insert(key, jinja::mk_val<jinja::value_int>(gguf_get_val_i64(ud->gguf_ctx, i)));
+                        break;
+                    case GGUF_TYPE_FLOAT32:
+                        meta->insert(key, jinja::mk_val<jinja::value_float>(gguf_get_val_f32(ud->gguf_ctx, i)));
+                        break;
+                    case GGUF_TYPE_BOOL:
+                        meta->insert(key, jinja::mk_val<jinja::value_bool>(gguf_get_val_bool(ud->gguf_ctx, i)));
+                        break;
+                    default:
+                        break;
+                }
+            }
+            ctx.set_val("meta", meta);
+        }
+
+        jinja::runtime     runtime(ctx);
+        const jinja::value results = runtime.execute(ud->prog);
+        auto               parts   = jinja::runtime::gather_string_parts(results);
+        std::string        output  = parts->as_string().str();
+
+        while (!output.empty() &&
+               (output.front() == ' ' || output.front() == '\t' || output.front() == '\n' || output.front() == '\r')) {
+            output.erase(output.begin());
+        }
+        while (!output.empty() &&
+               (output.back() == ' ' || output.back() == '\t' || output.back() == '\n' || output.back() == '\r')) {
+            output.pop_back();
+        }
+
+        int type_val = std::stoi(output);
+        if (type_val < 0 || type_val >= GGML_TYPE_COUNT) {
+            fprintf(stderr, "%s: Jinja template returned invalid type value %d for tensor '%s' (output: '%s')\n", __func__, type_val,
+                    tensor_name, output.c_str());
+            return GGML_TYPE_COUNT;
+        }
+
+        return (ggml_type) type_val;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "%s: Jinja template evaluation failed for tensor '%s': %s\n", __func__, tensor_name, e.what());
+        return GGML_TYPE_COUNT;
+    }
+}
 
 struct quant_option {
     std::string name;
@@ -122,7 +227,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
+    printf("       [--tensor-type-jinja] [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -151,6 +256,11 @@ static void usage(const char * executable) {
     printf("                                      list of tensors to quantize to a specific ggml_type\n");
     printf("                                      this is an advanced option to selectively quantize a long list of tensors.\n");
     printf("                                      the file should use the same format as above, separated by spaces or newlines.\n");
+    printf("  --tensor-type-jinja template_file\n");
+    printf("                                      Jinja2 template file for per-tensor quantization type selection.\n");
+    printf("                                      the template has access to: name, layer, category, ne, n_dims, arch, meta,\n");
+    printf("                                      and all ggml_type names as constants (e.g. Q4_0, Q5_K, F16).\n");
+    printf("                                      example: --tensor-type-jinja my_template.jinja\n");
     printf("  --prune-layers L0,L1,L2...\n");
     printf("                                      comma-separated list of layer numbers to prune from the model\n");
     printf("                                      WARNING: this is an advanced option, use with care.\n");
@@ -499,6 +609,7 @@ int main(int argc, char ** argv) {
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
+    std::string                          tensor_type_jinja;
     std::vector<int> prune_layers;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
@@ -528,6 +639,24 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--tensor-type-file") == 0) {
             if (arg_idx == argc-1 || !parse_tensor_type_file(argv[++arg_idx], tensor_type_opts)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--tensor-type-jinja") == 0) {
+            if (arg_idx < argc - 1) {
+                const char * tpl_path = argv[++arg_idx];
+                std::ifstream ifs(tpl_path);
+                if (!ifs.is_open()) {
+                    fprintf(stderr, "error: cannot open Jinja template file '%s'\n", tpl_path);
+                    return 1;
+                }
+                std::ostringstream ss;
+                ss << ifs.rdbuf();
+                tensor_type_jinja = ss.str();
+                if (tensor_type_jinja.empty()) {
+                    fprintf(stderr, "error: Jinja template file '%s' is empty\n", tpl_path);
+                    return 1;
+                }
+            } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--prune-layers") == 0) {
@@ -724,6 +853,51 @@ int main(int argc, char ** argv) {
     const int64_t t_main_start_us = llama_time_us();
 
     int64_t t_quantize_us = 0;
+
+    // set up jinja tensor type resolver callback if --tensor-type-jinja was used
+    static jinja_tensor_type_ud jinja_ud = {};
+    if (!tensor_type_jinja.empty()) {
+        jinja_ud.src = tensor_type_jinja;
+        try {
+            jinja::lexer lexer;
+            auto         lexer_res = lexer.tokenize(jinja_ud.src);
+            jinja_ud.prog          = jinja::parse_from_tokens(lexer_res);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "%s: failed to parse Jinja template: %s\n", __func__, e.what());
+            return 1;
+        }
+
+        for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+            const auto   gt   = (ggml_type) i;
+            const char * name = ggml_type_name(gt);
+            if (name && name[0] != '\0') {
+                std::string upper_name(name);
+                for (auto & c : upper_name) {
+                    c = std::toupper(c);
+                }
+                jinja_ud.type_names[name] = i;
+                if (upper_name != name) {
+                    jinja_ud.type_names[upper_name] = i;
+                }
+            }
+        }
+
+        struct gguf_init_params meta_gguf_params = {
+            /* .no_alloc = */ true,
+            /* .ctx      = */ nullptr,
+        };
+        struct gguf_context * input_gguf = gguf_init_from_file(fname_inp.c_str(), meta_gguf_params);
+        if (input_gguf) {
+            jinja_ud.gguf_ctx  = input_gguf;
+            const int arch_key = gguf_find_key(input_gguf, "general.architecture");
+            if (arch_key >= 0) {
+                jinja_ud.arch_name = gguf_get_val_str(input_gguf, arch_key);
+            }
+        }
+
+        params.tensor_type_resolver     = jinja_tensor_type_resolver;
+        params.tensor_type_resolver_ud = &jinja_ud;
+    }
 
     // load the model
     {

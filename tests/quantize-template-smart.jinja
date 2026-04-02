@@ -1,0 +1,54 @@
+{#
+  Smart quantization template mimicking llama.cpp llama_tensor_get_type_impl logic.
+
+  Available variables:
+    name     - tensor name (string)
+    layer    - layer index (int, 0-based)
+    category - tensor category string (OUTPUT, TOKEN_EMBD, ATTENTION_V, FFN_DOWN, etc.)
+    ne       - tensor shape array [ne0, ne1, ne2, ne3]
+    n_dims   - number of dimensions
+    arch     - architecture name (e.g. "llama")
+    meta     - GGUF metadata object
+
+  Type constants (ggml_type enum values):
+    F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+    IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M,
+    BF16, TQ1_0, TQ2_0, MXFP4
+
+  This template reproduces the key per-category type upgrade rules for Q4_K_M
+  quantization, including:
+    - Category-based upgrades (OUTPUT -> Q8_0, ATTENTION_V -> Q5_K, etc.)
+    - Layer-dependent heuristics (use_more_bits for first/last layers)
+    - Name-based exceptions (norms, embeddings kept as-is)
+#}
+{%- set _n_layer = meta.get("llama.block_count", 0) -%}
+{%- set _n_head_kv = meta.get("llama.attention.head_count_kv", 1) -%}
+
+{# use_more_bits: first 12.5%, last 12.5%, and every 3rd layer in between #}
+{%- set _first_q = (_n_layer / 8) | int -%}
+{%- set _last_q = (7 * _n_layer / 8) | int -%}
+{%- set _use_more = (layer < _first_q) or (layer >= _last_q) or ((layer - _first_q) % 3 == 2) -%}
+
+{%- if n_dims < 2 or "_norm.weight" in name or "ffn_gate_inp" in name or name == "output.weight" or name == "token_embd.weight" -%}{{ F16 }}
+{%- elif category == "OUTPUT" -%}{{ Q8_0 }}
+{%- elif category == "TOKEN_EMBD" -%}{{ Q8_0 }}
+{%- elif category == "ATTENTION_QKV" -%}{{ Q5_K }}
+{%- elif category == "ATTENTION_KV_B" -%}{{ Q8_0 }}
+{%- elif _n_head_kv >= 4 and (category == "ATTENTION_V" or category == "ATTENTION_QKV") -%}{{ Q5_K }}
+{%- elif category == "ATTENTION_V" -%}
+  {%- if _use_more -%}{{ Q5_K }}
+  {%- else -%}{{ Q4_K }}
+{%- endif -%}
+{%- elif category == "ATTENTION_Q" -%}{{ Q4_K }}
+{%- elif category == "ATTENTION_K" -%}{{ Q4_K }}
+{%- elif category == "ATTENTION_OUTPUT" -%}{{ Q5_K }}
+{%- elif category == "FFN_DOWN" -%}
+  {%- if _use_more -%}{{ Q6_K }}
+  {%- else -%}{{ Q5_K }}
+{%- endif -%}
+{%- elif category == "FFN_GATE" or category == "FFN_UP" -%}
+  {%- if _use_more -%}{{ Q5_K }}
+  {%- else -%}{{ Q4_K }}
+{%- endif -%}
+{%- else -%}{{ Q4_K }}
+{%- endif -%}

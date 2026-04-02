@@ -392,6 +392,18 @@ extern "C" {
     };
 
     // model quantization parameters
+
+    // Callback type for custom per-tensor quantization type selection.
+    // The callback receives tensor properties and should return the desired ggml_type.
+    // Return GGML_TYPE_COUNT to fall through to the standard quantization logic.
+    typedef enum ggml_type (*llama_tensor_type_resolver)(
+            const char *    tensor_name,
+            int             n_dims,
+            const int64_t * ne,
+            int             layer,
+            const char *    category,
+            void *          user_data);
+
     typedef struct llama_model_quantize_params {
         int32_t nthread;                                            // number of threads to use for quantizing, if <=0 will use std::thread::hardware_concurrency()
         enum llama_ftype ftype;                                     // quantize to this llama_ftype
@@ -407,6 +419,8 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        llama_tensor_type_resolver tensor_type_resolver;           // callback for custom tensor type selection (NULL = disabled)
+        void *                     tensor_type_resolver_ud;        // user data for tensor_type_resolver
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
