@@ -1458,30 +1458,27 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     const ggml_vec_dot_t vec_dot      = type_traits_cpu[type].vec_dot;
     const enum ggml_type vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    const int64_t num_rows_per_vec_dot = type_traits_cpu[type].nrows;
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
 
-    float tmp[16];
+    float tmp[32];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
-                const int64_t _i12 = ir1; // logical row index for this expert
+                const int64_t _i12 = ir1;
 
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
-                const int id       = row_mapping.i1; // selected expert index
+                const int id       = row_mapping.i1;
 
                 const int64_t  i11 = id % ne11;
-                const int64_t  i12 = row_mapping.i2; // row index in src1
+                const int64_t  i12 = row_mapping.i2;
 
-                const int64_t  i1 = id;  // selected expert index
-                const int64_t  i2 = i12; // row
+                const int64_t  i1 = id;
+                const int64_t  i2 = i12;
 
-                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-                //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char *) wdata +
                     (src1_cont || src1->type != vec_dot_type
                     ? (i11      + i12*ne11)*row_size
@@ -1489,11 +1486,19 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                    vec_dot(ne00, &tmp[ir0 - iir0],
+                            (num_rows_per_vec_dot > 1 ? 16 : 0),
+                            src0_cur + ir0*nb01,
+                            (num_rows_per_vec_dot > 1 ? nb01 : 0),
+                            src1_col, 0,
+                            num_rows_per_vec_dot);
                 }
 
-                memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+                for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                    memcpy(&dst_col[iir0 + cn], tmp + (cn * 16),
+                           (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                }
             }
         }
     }

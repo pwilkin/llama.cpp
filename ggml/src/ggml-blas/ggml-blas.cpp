@@ -251,7 +251,7 @@ static enum ggml_status ggml_backend_blas_graph_compute(ggml_backend_t backend, 
         }
 
         switch (node->op) {
-            case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT:
                 ggml_backend_blas_mul_mat(ctx, node);
                 break;
 
@@ -494,7 +494,7 @@ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const s
                    ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    (ne0 >= min_batch && ne1 >= min_batch && ne10 >= min_batch) &&
-                   (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
+                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
         }
 
         case GGML_OP_OUT_PROD:

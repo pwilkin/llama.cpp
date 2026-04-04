@@ -1443,6 +1443,106 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
     }
 }
 
+static inline __m256i q5_0_expand_nibbles_with_bits(const uint8_t * qs, const uint8_t * qh, __m256i signextendlut) {
+    const __m256i m4b = _mm256_set1_epi8(0x0F);
+
+    const __m128i qs_0 = _mm_loadu_si128((const __m128i *)qs);
+    const __m128i qs_1 = _mm_loadu_si128((const __m128i *)qs + 1);
+    const __m256i qs_raw = _mm256_insertf128_si256(_mm256_castsi128_si256(qs_0), qs_1, 1);
+
+    __m256i low = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(qs_raw, m4b));
+    __m256i high = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(_mm256_srli_epi16(qs_raw, 4), m4b));
+
+    const __m256i qh_shuf = _mm256_set_epi64x(
+        0x0303030303030303LL, 0x0202020202020202LL,
+        0x0101010101010101LL, 0x0000000000000000LL);
+    const __m256i qh_bit = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeLL);
+
+    uint32_t qh_lo;
+    memcpy(&qh_lo, qh, sizeof(uint32_t));
+    const __m256i qh_mask = _mm256_andnot_si256(
+        _mm256_cmpeq_epi8(_mm256_setzero_si256(),
+            _mm256_or_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(qh_lo), qh_shuf), qh_bit)),
+        _mm256_set1_epi8((char)0xF0));
+
+    low = _mm256_or_si256(low, qh_mask);
+
+    uint32_t qh_hi;
+    memcpy(&qh_hi, qh + 4, sizeof(uint32_t));
+    const __m256i qh_mask_hi = _mm256_andnot_si256(
+        _mm256_cmpeq_epi8(_mm256_setzero_si256(),
+            _mm256_or_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(qh_hi), qh_shuf), qh_bit)),
+        _mm256_set1_epi8((char)0xF0));
+
+    high = _mm256_or_si256(high, qh_mask_hi);
+
+    return _mm256_or_si256(_mm256_slli_epi16(low, 4), high);
+}
+
+template<typename block_t>
+static void gemv_q5_b32_4x4_q8_0_avx(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    static_assert(
+            std::is_same_v<block_t, block_q5_0x4>,
+            "Unsupported block type");
+
+    const int qk = QK8_0;
+    const int nb = n / qk;
+    const int ncols = 4;
+
+    UNUSED(bs);
+
+    const block_t    * b_ptr_start = (const block_t    *)vx;
+    const block_q8_0 * a_ptr_start = (const block_q8_0 *)vy;
+
+    __m256i signextendlut = _mm256_castsi128_si256(
+        _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
+    signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
+
+    for (int64_t y = 0; y < nr; y++) {
+        const block_q8_0 * a_ptr = a_ptr_start + (y * nb);
+
+        for (int64_t x = 0; x < nc / ncols; x++) {
+            const block_t * b_ptr = b_ptr_start + (x * nb);
+
+            __m256 acc = _mm256_setzero_ps();
+
+            for (int64_t b = 0; b < nb; b++) {
+                const __m256i rhs = q5_0_expand_nibbles_with_bits(b_ptr[b].qs, b_ptr[b].qh, signextendlut);
+
+                const __m128i changemask = _mm_set_epi8(7, 6, 3, 2, 5, 4, 1, 0, 15, 14, 11, 10, 13, 12, 9, 8);
+                const __m256 col_scale = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
+
+                const __m256 row_scale = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[b].d));
+
+                __m256i lhs = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)a_ptr[b].qs));
+                __m256i lhs_hi = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(a_ptr[b].qs + 16)));
+                lhs = _mm256_permute2f128_si256(lhs, lhs, 0);
+                lhs_hi = _mm256_permute2f128_si256(lhs_hi, lhs_hi, 0);
+
+                __m256i iacc = _mm256_setzero_si256();
+
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs, _mm256_shuffle_epi32(rhs, 177), 170), _mm256_shuffle_epi32(lhs, 0));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs, 177), rhs, 170), _mm256_shuffle_epi32(lhs, 85));
+
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs, 68), _mm256_shuffle_epi32(rhs, 221), 170), _mm256_shuffle_epi32(lhs, 170));
+
+                __m256i rhs_hi = _mm256_unpackhi_epi64(rhs, rhs);
+                __m256i lhs_hi0 = _mm256_shuffle_epi32(lhs_hi, 0);
+                __m256i lhs_hi1 = _mm256_shuffle_epi32(lhs_hi, 85);
+
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, rhs_hi, lhs_hi0);
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_shuffle_epi32(rhs_hi, 177), lhs_hi1);
+
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), _mm256_mul_ps(col_scale, row_scale), acc);
+            }
+
+            const __m256i perm = _mm256_set_epi32(3, 1, 2, 0, 7, 5, 6, 4);
+            acc = _mm256_permutevar8x32_ps(acc, perm);
+            _mm256_storeu_ps(s + (y * nr + x * ncols), acc);
+        }
+    }
+}
+
 #endif // defined(__AVX2__) || defined(__AVX512F__)
 
 void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -1459,6 +1559,131 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 
     ggml_gemv_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemv_q5_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    ggml_gemv_q5_0_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemv_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if 0 // defined(__AVX2__) || defined(__AVX512F__) — disabled: qh indexing bug, needs rewrite
+    {
+        const int qk = QK8_0;
+        const int nb = n / qk;
+        int64_t b_nb = n / 32;
+
+        const block_q5_0x8 * b_ptr_start = (const block_q5_0x8 *)vx;
+        const block_q8_0  * a_ptr_start = (const block_q8_0  *)vy;
+
+        const __m256i xor88 = _mm256_set1_epi8((char)0x88);
+        const __m256i m4b = _mm256_set1_epi8(0x0F);
+        const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
+        const __m256i finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+
+        const __m256i shuf_mask = _mm256_set_epi64x(
+            0x0303030303030303LL, 0x0202020202020202LL,
+            0x0101010101010101LL, 0x0000000000000000LL);
+        const __m256i bit_mask = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeLL);
+        const __m256i f0 = _mm256_set1_epi8((char)0xF0);
+
+        for (int64_t y = 0; y < nr; y++) {
+            const block_q8_0 * a_ptr = a_ptr_start + (y * nb);
+
+            for (int64_t x = 0; x < nc / 8; x++) {
+                const block_q5_0x8 * b_ptr = b_ptr_start + (x * b_nb);
+                __m256 acc_row = _mm256_setzero_ps();
+
+                for (int64_t b = 0; b < nb; b++) {
+                    const __m256i rhs_raw_0 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs));
+                    const __m256i rhs_raw_1 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 1);
+                    const __m256i rhs_raw_2 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 2);
+                    const __m256i rhs_raw_3 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 3);
+
+                    const __m256i rhs_orig_0 = _mm256_xor_si256(rhs_raw_0, xor88);
+                    const __m256i rhs_orig_1 = _mm256_xor_si256(rhs_raw_1, xor88);
+                    const __m256i rhs_orig_2 = _mm256_xor_si256(rhs_raw_2, xor88);
+                    const __m256i rhs_orig_3 = _mm256_xor_si256(rhs_raw_3, xor88);
+
+                    // Low nibbles: blocks 0-3 (first half), blocks 0-3 (second half)
+                    __m256i rhs_lo_0 = _mm256_and_si256(rhs_orig_0, m4b);
+                    __m256i rhs_lo_1 = _mm256_and_si256(rhs_orig_1, m4b);
+                    // High nibbles
+                    __m256i rhs_hi_0 = _mm256_and_si256(_mm256_srli_epi16(rhs_orig_0, 4), m4b);
+                    __m256i rhs_hi_1 = _mm256_and_si256(_mm256_srli_epi16(rhs_orig_1, 4), m4b);
+                    // Low nibbles: blocks 4-7
+                    __m256i rhs_lo_2 = _mm256_and_si256(rhs_orig_2, m4b);
+                    __m256i rhs_lo_3 = _mm256_and_si256(rhs_orig_3, m4b);
+                    __m256i rhs_hi_2 = _mm256_and_si256(_mm256_srli_epi16(rhs_orig_2, 4), m4b);
+                    __m256i rhs_hi_3 = _mm256_and_si256(_mm256_srli_epi16(rhs_orig_3, 4), m4b);
+
+                    // Gather qh bytes and expand to mask
+                    // Chunk 0 (qs[0:32]): qh bytes {0,4,8,12} from qh[0:16]
+                    // Chunk 1 (qs[32:64]): qh bytes {16,20,24,28} from qh[16:32]
+                    // Chunk 2 (qs[64:96]): qh bytes {1,5,9,13} from qh[0:16]
+                    // Chunk 3 (qs[96:128]): qh bytes {17,21,25,29} from qh[16:32]
+
+                    __m256i qh_mask_0, qh_mask_1, qh_mask_2, qh_mask_3;
+                    {
+                        const uint8_t * qh_ptr = b_ptr[b].qh;
+
+                        auto expand_qh = [=](const uint8_t * qh_data, int o0, int o1, int o2, int o3) -> __m256i {
+                            uint32_t bits = ((uint32_t)qh_data[o0]) |
+                                           ((uint32_t)qh_data[o1] << 8) |
+                                           ((uint32_t)qh_data[o2] << 16) |
+                                           ((uint32_t)qh_data[o3] << 24);
+                            __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(bits), shuf_mask);
+                            bytes = _mm256_or_si256(bytes, bit_mask);
+                            __m256i expanded = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
+                            return _mm256_andnot_si256(expanded, f0);
+                        };
+
+                        qh_mask_0 = expand_qh(qh_ptr, 0, 4, 8, 12);
+                        qh_mask_1 = expand_qh(qh_ptr + 16, 0, 4, 8, 12);
+                        qh_mask_2 = expand_qh(qh_ptr, 1, 5, 9, 13);
+                        qh_mask_3 = expand_qh(qh_ptr + 16, 1, 5, 9, 13);
+                    }
+
+                    // Apply qh masks
+                    rhs_lo_0 = _mm256_or_si256(rhs_lo_0, qh_mask_0);
+                    rhs_hi_0 = _mm256_or_si256(rhs_hi_0, qh_mask_0);
+                    rhs_lo_1 = _mm256_or_si256(rhs_lo_1, qh_mask_1);
+                    rhs_hi_1 = _mm256_or_si256(rhs_hi_1, qh_mask_1);
+                    rhs_lo_2 = _mm256_or_si256(rhs_lo_2, qh_mask_2);
+                    rhs_hi_2 = _mm256_or_si256(rhs_hi_2, qh_mask_2);
+                    rhs_lo_3 = _mm256_or_si256(rhs_lo_3, qh_mask_3);
+                    rhs_hi_3 = _mm256_or_si256(rhs_hi_3, qh_mask_3);
+
+                    __m256 col_scale_f32 = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
+                    const __m256 row_scale_f32 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[b].d));
+
+                    __m256i lhs_vec_0 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)a_ptr[b].qs));
+                    __m256i lhs_vec_1 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(a_ptr[b].qs + 16)));
+                    lhs_vec_0 = _mm256_permute2f128_si256(lhs_vec_0, lhs_vec_0, 0);
+                    lhs_vec_1 = _mm256_permute2f128_si256(lhs_vec_1, lhs_vec_1, 0);
+
+                    __m256i iacc = _mm256_setzero_si256();
+
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_lo_0, _mm256_shuffle_epi32(rhs_lo_1, 177), 170), _mm256_shuffle_epi32(lhs_vec_0, 0));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_lo_0, 177), rhs_lo_1, 170), _mm256_shuffle_epi32(lhs_vec_0, 85));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_lo_2, _mm256_shuffle_epi32(rhs_lo_3, 177), 170), _mm256_shuffle_epi32(lhs_vec_0, 170));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_lo_2, 177), rhs_lo_3, 170), _mm256_shuffle_epi32(lhs_vec_0, 255));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_hi_0, _mm256_shuffle_epi32(rhs_hi_1, 177), 170), _mm256_shuffle_epi32(lhs_vec_1, 0));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_hi_0, 177), rhs_hi_1, 170), _mm256_shuffle_epi32(lhs_vec_1, 85));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_hi_2, _mm256_shuffle_epi32(rhs_hi_3, 177), 170), _mm256_shuffle_epi32(lhs_vec_1, 170));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_hi_2, 177), rhs_hi_3, 170), _mm256_shuffle_epi32(lhs_vec_1, 255));
+
+                    acc_row = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), _mm256_mul_ps(col_scale_f32, row_scale_f32), acc_row);
+                }
+
+                acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
+                _mm256_storeu_ps(s + (y * nr + x * 8), acc_row);
+            }
+        }
+        return;
+    }
+#endif
+
+    ggml_gemv_q5_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -2037,6 +2262,168 @@ void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif // defined(__AVX2__) || defined(__AVX512F__)
 
     ggml_gemm_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q5_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX2__) || defined(__AVX512F__)
+    const int qk = QK8_0;
+    const int nb = n / qk;
+
+    const block_q5_0x4 * b_ptr_start = (const block_q5_0x4 *)vx;
+    const block_q8_0   * a_ptr_start = (const block_q8_0   *)vy;
+
+    __m256i signextendlut = _mm256_castsi128_si256(
+        _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
+    signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
+
+    const __m128i changemask = _mm_set_epi8(7, 6, 3, 2, 5, 4, 1, 0, 15, 14, 11, 10, 13, 12, 9, 8);
+    const __m256i perm = _mm256_set_epi32(3, 1, 2, 0, 7, 5, 6, 4);
+
+    for (int64_t y = 0; y < nr; y++) {
+        const block_q8_0 * a_ptr = a_ptr_start + (y * nb);
+
+        for (int64_t x = 0; x < nc / 4; x++) {
+            const block_q5_0x4 * b_ptr = b_ptr_start + (x * nb);
+
+            __m256 acc = _mm256_setzero_ps();
+
+            for (int64_t b = 0; b < nb; b++) {
+                const __m256i rhs = q5_0_expand_nibbles_with_bits(b_ptr[b].qs, b_ptr[b].qh, signextendlut);
+
+                const __m256 col_scale = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
+                const __m256 row_scale = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[b].d));
+
+                __m256i lhs = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)a_ptr[b].qs));
+                __m256i lhs_hi = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(a_ptr[b].qs + 16)));
+                lhs = _mm256_permute2f128_si256(lhs, lhs, 0);
+                lhs_hi = _mm256_permute2f128_si256(lhs_hi, lhs_hi, 0);
+
+                __m256i iacc = _mm256_setzero_si256();
+
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs, _mm256_shuffle_epi32(rhs, 177), 170), _mm256_shuffle_epi32(lhs, 0));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs, 177), rhs, 170), _mm256_shuffle_epi32(lhs, 85));
+
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs, 68), _mm256_shuffle_epi32(rhs, 221), 170), _mm256_shuffle_epi32(lhs, 170));
+
+                __m256i rhs_hi = _mm256_unpackhi_epi64(rhs, rhs);
+                __m256i lhs_hi0 = _mm256_shuffle_epi32(lhs_hi, 0);
+                __m256i lhs_hi1 = _mm256_shuffle_epi32(lhs_hi, 85);
+
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, rhs_hi, lhs_hi0);
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_shuffle_epi32(rhs_hi, 177), lhs_hi1);
+
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), _mm256_mul_ps(col_scale, row_scale), acc);
+            }
+
+            acc = _mm256_permutevar8x32_ps(acc, perm);
+            _mm256_storeu_ps(s + (y * bs + x * 4), acc);
+        }
+    }
+    return;
+#endif
+    ggml_gemm_q5_0_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if 0 // defined(__AVX2__) || defined(__AVX512F__) — disabled: qh indexing bug, needs rewrite
+    {
+        const int qk = QK8_0;
+        const int nb = n / qk;
+        int64_t b_nb = n / 32;
+
+        const block_q5_0x8 * b_ptr_start = (const block_q5_0x8 *)vx;
+        const block_q8_0   * a_ptr_start = (const block_q8_0   *)vy;
+
+        const __m256i xor88 = _mm256_set1_epi8((char)0x88);
+        const __m256i m4b = _mm256_set1_epi8(0x0F);
+        const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
+
+        const __m256i shuf_mask = _mm256_set_epi64x(
+            0x0303030303030303LL, 0x0202020202020202LL,
+            0x0101010101010101LL, 0x0000000000000000LL);
+        const __m256i bit_mask = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeLL);
+        const __m256i f0 = _mm256_set1_epi8((char)0xF0);
+
+        auto expand_qh = [&](const uint8_t * qh_data, int offset0, int offset1, int offset2, int offset3) -> __m256i {
+            uint32_t bits = ((uint32_t)qh_data[offset0]) |
+                           ((uint32_t)qh_data[offset1] << 8) |
+                           ((uint32_t)qh_data[offset2] << 16) |
+                           ((uint32_t)qh_data[offset3] << 24);
+            __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(bits), shuf_mask);
+            bytes = _mm256_or_si256(bytes, bit_mask);
+            __m256i expanded = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
+            return _mm256_andnot_si256(expanded, f0);
+        };
+
+        for (int64_t y = 0; y < nr; y++) {
+            const block_q8_0 * a_ptr = a_ptr_start + (y * nb);
+            for (int64_t x = 0; x < nc / 8; x++) {
+                const block_q5_0x8 * b_ptr = b_ptr_start + (x * b_nb);
+                __m256 acc = _mm256_setzero_ps();
+
+                for (int64_t b = 0; b < nb; b++) {
+                    const __m256i rhs_raw_0 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs));
+                    const __m256i rhs_raw_1 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 1);
+                    const __m256i rhs_raw_2 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 2);
+                    const __m256i rhs_raw_3 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs) + 3);
+
+                    const __m256i rhs_orig_0 = _mm256_xor_si256(rhs_raw_0, xor88);
+                    const __m256i rhs_orig_1 = _mm256_xor_si256(rhs_raw_1, xor88);
+                    const __m256i rhs_orig_2 = _mm256_xor_si256(rhs_raw_2, xor88);
+                    const __m256i rhs_orig_3 = _mm256_xor_si256(rhs_raw_3, xor88);
+
+                    __m256i rhs_lo_0 = _mm256_and_si256(rhs_orig_0, m4b);
+                    __m256i rhs_lo_1 = _mm256_and_si256(rhs_orig_1, m4b);
+                    __m256i rhs_lo_2 = _mm256_and_si256(rhs_orig_2, m4b);
+                    __m256i rhs_lo_3 = _mm256_and_si256(rhs_orig_3, m4b);
+                    __m256i rhs_hi_0 = _mm256_and_si256(_mm256_srli_epi16(rhs_orig_0, 4), m4b);
+                    __m256i rhs_hi_1 = _mm256_and_si256(_mm256_srli_epi16(rhs_orig_1, 4), m4b);
+                    __m256i rhs_hi_2 = _mm256_and_si256(_mm256_srli_epi16(rhs_orig_2, 4), m4b);
+                    __m256i rhs_hi_3 = _mm256_and_si256(_mm256_srli_epi16(rhs_orig_3, 4), m4b);
+
+                    __m256i qh_mask_0 = expand_qh(b_ptr[b].qh, 0, 4, 8, 12);
+                    __m256i qh_mask_1 = expand_qh(b_ptr[b].qh + 16, 0, 4, 8, 12);
+                    __m256i qh_mask_2 = expand_qh(b_ptr[b].qh, 1, 5, 9, 13);
+                    __m256i qh_mask_3 = expand_qh(b_ptr[b].qh + 16, 1, 5, 9, 13);
+
+                    rhs_lo_0 = _mm256_or_si256(rhs_lo_0, qh_mask_0);
+                    rhs_hi_0 = _mm256_or_si256(rhs_hi_0, qh_mask_0);
+                    rhs_lo_1 = _mm256_or_si256(rhs_lo_1, qh_mask_1);
+                    rhs_hi_1 = _mm256_or_si256(rhs_hi_1, qh_mask_1);
+                    rhs_lo_2 = _mm256_or_si256(rhs_lo_2, qh_mask_2);
+                    rhs_hi_2 = _mm256_or_si256(rhs_hi_2, qh_mask_2);
+                    rhs_lo_3 = _mm256_or_si256(rhs_lo_3, qh_mask_3);
+                    rhs_hi_3 = _mm256_or_si256(rhs_hi_3, qh_mask_3);
+
+                    __m256 col_scale_f32 = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
+                    const __m256 row_scale_f32 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[b].d));
+
+                    __m256i lhs_vec_0 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)a_ptr[b].qs));
+                    __m256i lhs_vec_1 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(a_ptr[b].qs + 16)));
+                    lhs_vec_0 = _mm256_permute2f128_si256(lhs_vec_0, lhs_vec_0, 0);
+                    lhs_vec_1 = _mm256_permute2f128_si256(lhs_vec_1, lhs_vec_1, 0);
+
+                    __m256i iacc = _mm256_setzero_si256();
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_lo_0, _mm256_shuffle_epi32(rhs_lo_1, 177), 170), _mm256_shuffle_epi32(lhs_vec_0, 0));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_lo_0, 177), rhs_lo_1, 170), _mm256_shuffle_epi32(lhs_vec_0, 85));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_lo_2, _mm256_shuffle_epi32(rhs_lo_3, 177), 170), _mm256_shuffle_epi32(lhs_vec_0, 170));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_lo_2, 177), rhs_lo_3, 170), _mm256_shuffle_epi32(lhs_vec_0, 255));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_hi_0, _mm256_shuffle_epi32(rhs_hi_1, 177), 170), _mm256_shuffle_epi32(lhs_vec_1, 0));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_hi_0, 177), rhs_hi_1, 170), _mm256_shuffle_epi32(lhs_vec_1, 85));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(rhs_hi_2, _mm256_shuffle_epi32(rhs_hi_3, 177), 170), _mm256_shuffle_epi32(lhs_vec_1, 170));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_hi_2, 177), rhs_hi_3, 170), _mm256_shuffle_epi32(lhs_vec_1, 255));
+
+                    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), _mm256_mul_ps(col_scale_f32, row_scale_f32), acc);
+                }
+
+                _mm256_storeu_ps(s + (y * bs + x * 8), acc);
+            }
+        }
+        return;
+    }
+#endif
+
+    ggml_gemm_q5_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemm_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
