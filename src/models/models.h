@@ -1065,6 +1065,48 @@ struct llama_model_glm_dsa : public llama_model_base {
 };
 
 
+struct llama_model_deepseek4 : public llama_model_base {
+    llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        // hyper-connections (residual stream is hc_mult parallel copies: [d, hc, n_tokens])
+        // reduce hc copies -> 1 with Sinkhorn-normalized mixing; emits post/comb for the expand.
+        ggml_tensor * hc_reduce(ggml_tensor * streams, ggml_tensor * fn, ggml_tensor * base, ggml_tensor * scale,
+                                ggml_tensor ** post_out, ggml_tensor ** comb_out, int il);
+        ggml_tensor * hc_expand(ggml_tensor * sub, ggml_tensor * streams, ggml_tensor * post, ggml_tensor * comb);
+        // final head reduction (sigmoid-gated, no Sinkhorn): hc copies -> 1
+        ggml_tensor * hc_head(ggml_tensor * streams, ggml_tensor * fn, ggml_tensor * base, ggml_tensor * scale);
+
+        // rotate the trailing rope_head_dim dims (adjacent-pair complex rope); inverse de-rotates
+        ggml_tensor * rope_tail(ggml_tensor * x, ggml_tensor * cos, ggml_tensor * sin, bool inverse);
+
+        // learned gated KV compression (prefill, non-overlap): pools `ratio` consecutive
+        // tokens into one latent via softmax(wgate+ape)-weighted sum of wkv, then RMS-norm and
+        // rope at block-start positions. Returns the compressed KV latents [head_dim, n_comp].
+        ggml_tensor * build_compressor(ggml_tensor * x, ggml_tensor * w_kv, ggml_tensor * w_gate,
+                                       ggml_tensor * norm_w, ggml_tensor * ape, int64_t ratio,
+                                       ggml_tensor * comp_rcos, ggml_tensor * comp_rsin);
+
+        // sparse-attention indexer (ratio==4 layers). Scores every compressed block per query
+        // against the cached indexer-KV blocks (kvc), keeps the top-k, and returns an additive
+        // [n_win+n_comp, n_tokens] mask: 0 over the window and over selected compressed blocks,
+        // -inf over the rest. (The Hadamard rotation in the reference cancels in the q·k dot
+        // product, so it is omitted.) Added to the causal mask to restrict attention.
+        ggml_tensor * build_indexer_mask(ggml_tensor * qr, ggml_tensor * x_query, ggml_tensor * kvc,
+                                         const llama_layer & layer,
+                                         int64_t n_comp, int64_t n_win, int64_t topk,
+                                         ggml_tensor * rcos_tok, ggml_tensor * rsin_tok,
+                                         ggml_tensor * host_mask);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_mistral4 : public llama_model_deepseek2 {
     llama_model_mistral4(const struct llama_model_params & params) : llama_model_deepseek2(params) {}
     // reuse load_arch_hparams and load_arch_tensors from llama_model_deepseek2

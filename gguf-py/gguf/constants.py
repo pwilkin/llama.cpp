@@ -150,6 +150,11 @@ class Keys:
         EMBD_LENGTH_PER_LAYER_INP         = "{arch}.embedding_length_per_layer_input"
         SWIGLU_CLAMP_EXP                  = "{arch}.swiglu_clamp_exp"
         SWIGLU_CLAMP_SHEXP                = "{arch}.swiglu_clamp_shexp"
+        SWIGLU_LIMIT                      = "{arch}.swiglu_limit"
+        HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
+        HC_MULT                           = "{arch}.hyperconnection.mult"
+        HC_SINKHORN_ITERS                 = "{arch}.hyperconnection.sinkhorn_iters"
+        HC_EPS                            = "{arch}.hyperconnection.eps"
         DENSE_FEAT_IN_SIZE                = "{arch}.{dense}_feat_in"
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
 
@@ -167,6 +172,9 @@ class Keys:
         CAUSAL                       = "{arch}.attention.causal"
         Q_LORA_RANK                  = "{arch}.attention.q_lora_rank"
         KV_LORA_RANK                 = "{arch}.attention.kv_lora_rank"
+        O_LORA_RANK                  = "{arch}.attention.o_lora_rank"
+        O_GROUPS                     = "{arch}.attention.o_groups"
+        COMPRESS_RATIOS              = "{arch}.attention.compress_ratios"
         DECAY_LORA_RANK              = "{arch}.attention.decay_lora_rank"
         ICLR_LORA_RANK               = "{arch}.attention.iclr_lora_rank"
         VALUE_RESIDUAL_MIX_LORA_RANK = "{arch}.attention.value_residual_mix_lora_rank"
@@ -196,6 +204,7 @@ class Keys:
         DIMENSION_SECTIONS        = "{arch}.rope.dimension_sections"
         FREQ_BASE                 = "{arch}.rope.freq_base"
         FREQ_BASE_SWA             = "{arch}.rope.freq_base_swa"
+        FREQ_BASE_COMPRESS        = "{arch}.rope.freq_base_compress"
         SCALING_TYPE              = "{arch}.rope.scaling.type"
         SCALING_FACTOR            = "{arch}.rope.scaling.factor"
         SCALING_ALPHA             = "{arch}.rope.scaling.alpha"
@@ -454,6 +463,7 @@ class MODEL_ARCH(IntEnum):
     DEEPSEEK2        = auto()
     DEEPSEEK2OCR     = auto()
     DEEPSEEK32       = auto()
+    DEEPSEEK4        = auto()
     CHATGLM          = auto()
     GLM4             = auto()
     GLM4_MOE         = auto()
@@ -721,6 +731,26 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_PROJ         = auto()
     INDEXER_ATTN_K       = auto()
     INDEXER_ATTN_Q_B     = auto()
+    # deepseek-v4 (hyper-connections, MQA low-rank O, learned KV compressor, hash MoE)
+    HC_HEAD_FN           = auto()
+    HC_HEAD_BASE         = auto()
+    HC_HEAD_SCALE        = auto()
+    HC_ATTN_FN           = auto()
+    HC_ATTN_BASE         = auto()
+    HC_ATTN_SCALE        = auto()
+    HC_FFN_FN            = auto()
+    HC_FFN_BASE          = auto()
+    HC_FFN_SCALE         = auto()
+    ATTN_O_A             = auto()
+    COMPRESSOR_KV        = auto()
+    COMPRESSOR_GATE      = auto()
+    COMPRESSOR_NORM      = auto()
+    COMPRESSOR_APE       = auto()
+    INDEXER_COMPRESSOR_KV   = auto()
+    INDEXER_COMPRESSOR_GATE = auto()
+    INDEXER_COMPRESSOR_NORM = auto()
+    INDEXER_COMPRESSOR_APE  = auto()
+    FFN_GATE_TID2EID     = auto()
     # vision
     V_MMPROJ             = auto()
     V_MMPROJ_FC          = auto()
@@ -973,6 +1003,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DEEPSEEK2:        "deepseek2",
     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
     MODEL_ARCH.DEEPSEEK32:       "deepseek32",
+    MODEL_ARCH.DEEPSEEK4:        "deepseek4",
     MODEL_ARCH.CHATGLM:          "chatglm",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
@@ -1239,6 +1270,25 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
     MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
     MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.HC_HEAD_FN:                "hc_head_fn",
+    MODEL_TENSOR.HC_HEAD_BASE:              "hc_head_base",
+    MODEL_TENSOR.HC_HEAD_SCALE:             "hc_head_scale",
+    MODEL_TENSOR.HC_ATTN_FN:                "blk.{bid}.hc_attn_fn",
+    MODEL_TENSOR.HC_ATTN_BASE:              "blk.{bid}.hc_attn_base",
+    MODEL_TENSOR.HC_ATTN_SCALE:             "blk.{bid}.hc_attn_scale",
+    MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
+    MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
+    MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
+    MODEL_TENSOR.ATTN_O_A:                  "blk.{bid}.attn_o_a",
+    MODEL_TENSOR.COMPRESSOR_KV:             "blk.{bid}.compressor_kv",
+    MODEL_TENSOR.COMPRESSOR_GATE:           "blk.{bid}.compressor_gate",
+    MODEL_TENSOR.COMPRESSOR_NORM:           "blk.{bid}.compressor_norm",
+    MODEL_TENSOR.COMPRESSOR_APE:            "blk.{bid}.compressor_ape",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_KV:     "blk.{bid}.indexer.compressor_kv",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_GATE:   "blk.{bid}.indexer.compressor_gate",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_NORM:   "blk.{bid}.indexer.compressor_norm",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_APE:    "blk.{bid}.indexer.compressor_ape",
+    MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
     # vision
     MODEL_TENSOR.V_MMPROJ:                  "mm.{bid}",
     MODEL_TENSOR.V_MMPROJ_FC:               "mm.model.fc",
@@ -2907,6 +2957,49 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
     ],
+    MODEL_ARCH.DEEPSEEK4: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.HC_HEAD_FN,
+        MODEL_TENSOR.HC_HEAD_BASE,
+        MODEL_TENSOR.HC_HEAD_SCALE,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_O_A,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.COMPRESSOR_KV,
+        MODEL_TENSOR.COMPRESSOR_GATE,
+        MODEL_TENSOR.COMPRESSOR_NORM,
+        MODEL_TENSOR.COMPRESSOR_APE,
+        MODEL_TENSOR.INDEXER_PROJ,
+        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_KV,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_GATE,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_NORM,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_APE,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_TID2EID,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+    ],
     MODEL_ARCH.DEEPSEEK2OCR: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -4214,8 +4307,10 @@ class GGMLQuantizationType(IntEnum):
 
 
 class ExpertGatingFuncType(IntEnum):
-    SOFTMAX  = 1
-    SIGMOID  = 2
+    SOFTMAX        = 1
+    SIGMOID        = 2
+    SOFTMAX_WEIGHT = 3
+    SQRT_SOFTPLUS  = 4
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h

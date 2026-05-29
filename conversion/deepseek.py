@@ -459,3 +459,178 @@ class DeepseekV32Model(DeepseekV2Model):
         self.gguf_writer.add_indexer_head_count(self.hparams["index_n_heads"])
         self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
+
+
+@ModelBase.register("DeepseekV4ForCausalLM")
+class DeepseekV4Model(TextModel):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+
+    # source-name (after the "layers.{bid}." prefix) -> (gguf tensor enum, output suffix)
+    _LOCAL_MAP = {
+        "attn_norm.weight":                      (gguf.MODEL_TENSOR.ATTN_NORM,            ".weight"),
+        "ffn_norm.weight":                       (gguf.MODEL_TENSOR.FFN_NORM,             ".weight"),
+        "hc_attn_fn":                            (gguf.MODEL_TENSOR.HC_ATTN_FN,           ""),
+        "hc_attn_base":                          (gguf.MODEL_TENSOR.HC_ATTN_BASE,         ""),
+        "hc_attn_scale":                         (gguf.MODEL_TENSOR.HC_ATTN_SCALE,        ""),
+        "hc_ffn_fn":                             (gguf.MODEL_TENSOR.HC_FFN_FN,            ""),
+        "hc_ffn_base":                           (gguf.MODEL_TENSOR.HC_FFN_BASE,          ""),
+        "hc_ffn_scale":                          (gguf.MODEL_TENSOR.HC_FFN_SCALE,         ""),
+        "attn.attn_sink":                        (gguf.MODEL_TENSOR.ATTN_SINKS,           ""),
+        "attn.wq_a.weight":                      (gguf.MODEL_TENSOR.ATTN_Q_A,             ".weight"),
+        "attn.q_norm.weight":                    (gguf.MODEL_TENSOR.ATTN_Q_A_NORM,        ".weight"),
+        "attn.wq_b.weight":                      (gguf.MODEL_TENSOR.ATTN_Q_B,             ".weight"),
+        "attn.wkv.weight":                       (gguf.MODEL_TENSOR.ATTN_KV_A_MQA,        ".weight"),
+        "attn.kv_norm.weight":                   (gguf.MODEL_TENSOR.ATTN_KV_A_NORM,       ".weight"),
+        "attn.wo_a.weight":                      (gguf.MODEL_TENSOR.ATTN_O_A,             ".weight"),
+        "attn.wo_b.weight":                      (gguf.MODEL_TENSOR.ATTN_OUT,             ".weight"),
+        "attn.compressor.wkv.weight":            (gguf.MODEL_TENSOR.COMPRESSOR_KV,        ".weight"),
+        "attn.compressor.wgate.weight":          (gguf.MODEL_TENSOR.COMPRESSOR_GATE,      ".weight"),
+        "attn.compressor.norm.weight":           (gguf.MODEL_TENSOR.COMPRESSOR_NORM,      ".weight"),
+        "attn.compressor.ape":                   (gguf.MODEL_TENSOR.COMPRESSOR_APE,       ""),
+        "attn.indexer.wq_b.weight":              (gguf.MODEL_TENSOR.INDEXER_ATTN_Q_B,     ".weight"),
+        "attn.indexer.weights_proj.weight":      (gguf.MODEL_TENSOR.INDEXER_PROJ,         ".weight"),
+        "attn.indexer.compressor.wkv.weight":    (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_KV,   ".weight"),
+        "attn.indexer.compressor.wgate.weight":  (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_GATE, ".weight"),
+        "attn.indexer.compressor.norm.weight":   (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_NORM, ".weight"),
+        "attn.indexer.compressor.ape":           (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_APE,  ""),
+        "ffn.gate.weight":                       (gguf.MODEL_TENSOR.FFN_GATE_INP,         ".weight"),
+        "ffn.gate.bias":                         (gguf.MODEL_TENSOR.FFN_EXP_PROBS_B,      ".bias"),
+        "ffn.gate.tid2eid":                      (gguf.MODEL_TENSOR.FFN_GATE_TID2EID,     ""),
+        "ffn.shared_experts.w1.weight":          (gguf.MODEL_TENSOR.FFN_GATE_SHEXP,       ".weight"),
+        "ffn.shared_experts.w3.weight":          (gguf.MODEL_TENSOR.FFN_UP_SHEXP,         ".weight"),
+        "ffn.shared_experts.w2.weight":          (gguf.MODEL_TENSOR.FFN_DOWN_SHEXP,       ".weight"),
+    }
+    _GLOBAL_MAP = {
+        "embed.weight":   (gguf.MODEL_TENSOR.TOKEN_EMBD,    ".weight"),
+        "norm.weight":    (gguf.MODEL_TENSOR.OUTPUT_NORM,   ".weight"),
+        "head.weight":    (gguf.MODEL_TENSOR.OUTPUT,        ".weight"),
+        "hc_head_fn":     (gguf.MODEL_TENSOR.HC_HEAD_FN,    ""),
+        "hc_head_base":   (gguf.MODEL_TENSOR.HC_HEAD_BASE,  ""),
+        "hc_head_scale":  (gguf.MODEL_TENSOR.HC_HEAD_SCALE, ""),
+    }
+    # w1=gate, w3=up, w2=down -> stacked routed-expert tensors
+    _EXPERT_W = {
+        "w1": gguf.MODEL_TENSOR.FFN_GATE_EXP,
+        "w3": gguf.MODEL_TENSOR.FFN_UP_EXP,
+        "w2": gguf.MODEL_TENSOR.FFN_DOWN_EXP,
+    }
+
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # transformers' AutoConfig can drop/rename custom keys, so keep the raw config
+        import json
+        with open(self.dir_model / "config.json", encoding="utf-8") as f:
+            self._cfg = json.load(f)
+
+    def set_vocab(self):
+        try:
+            self._set_vocab_gpt2()
+            return
+        except Exception:
+            pass
+        # synthetic vocab for mock parity models (no tokenizer files);
+        # token ids are fed directly by the parity harness, so contents don't matter.
+        vocab_size = int(self.hparams["vocab_size"])
+        tokens = ["<unk>", "<s>", "</s>"] + [f"tok{i}" for i in range(3, vocab_size)]
+        toktypes = [gguf.TokenType.UNKNOWN, gguf.TokenType.CONTROL, gguf.TokenType.CONTROL] + \
+                   [gguf.TokenType.NORMAL] * (vocab_size - 3)
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores([0.0] * vocab_size)
+        self.gguf_writer.add_token_types(toktypes)
+        self.gguf_writer.add_unk_token_id(0)
+        self.gguf_writer.add_bos_token_id(int(self.hparams.get("bos_token_id", 0)))
+        self.gguf_writer.add_eos_token_id(int(self.hparams.get("eos_token_id", 1)))
+        self.gguf_writer.add_add_bos_token(False)
+        self.gguf_writer.add_add_eos_token(False)
+
+    def set_gguf_parameters(self):
+        # base set_gguf_parameters only knows softmax/sigmoid score funcs; hide ours
+        score_func = self.hparams.pop("scoring_func", self._cfg.get("scoring_func"))
+        super().set_gguf_parameters()
+        # use the raw config for DS4-specific hyperparameters (AutoConfig may mangle them)
+        hparams = self._cfg
+
+        # rope: base already writes freq_base + YaRN scaling (it normalizes the
+        # old-style {"type": "yarn", ...}); only the DS4-specific bits are added here.
+        self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+        # KV-compressed layers use a separate (larger) rope base + YaRN
+        self.gguf_writer.add_rope_freq_base_compress(hparams["compress_rope_theta"])
+
+        # MoE
+        self.gguf_writer.add_expert_count(hparams["n_routed_experts"])
+        self.gguf_writer.add_expert_shared_count(hparams["n_shared_experts"])
+        self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_weights_scale(hparams["routed_scaling_factor"])
+        self.gguf_writer.add_expert_weights_norm(bool(hparams.get("norm_topk_prob", True)))
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRT_SOFTPLUS)
+        assert score_func == "sqrtsoftplus", f"unexpected scoring_func {score_func!r}"
+        self.gguf_writer.add_hash_layer_count(hparams.get("num_hash_layers", 0))
+        self.gguf_writer.add_swiglu_limit(hparams.get("swiglu_limit", 0.0))
+
+        # MLA-style attention (single 512-d KV latent used as K and V) + grouped low-rank O
+        self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+        self.gguf_writer.add_o_lora_rank(hparams["o_lora_rank"])
+        self.gguf_writer.add_o_groups(hparams["o_groups"])
+        self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+        self.gguf_writer.add_compress_ratios(hparams["compress_ratios"])
+
+        # sparse-attention indexer
+        self.gguf_writer.add_indexer_head_count(hparams["index_n_heads"])
+        self.gguf_writer.add_indexer_key_length(hparams["index_head_dim"])
+        self.gguf_writer.add_indexer_top_k(hparams["index_topk"])
+
+        # hyper-connections
+        self.gguf_writer.add_hc_mult(hparams["hc_mult"])
+        self.gguf_writer.add_hc_sinkhorn_iters(hparams["hc_sinkhorn_iters"])
+        self.gguf_writer.add_hc_eps(hparams.get("hc_eps", hparams.get("rms_norm_eps", 1e-6)))
+
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # skip Multi-Token-Prediction layers (auxiliary; not part of the base model)
+        if name.startswith("mtp."):
+            return
+
+        # global (non-layer) tensors
+        if name in self._GLOBAL_MAP:
+            enum, suffix = self._GLOBAL_MAP[name]
+            yield self.format_tensor_name(enum, None, suffix), data_torch
+            return
+
+        m = re.match(r"layers\.(\d+)\.(.+)", name)
+        if m is None:
+            raise ValueError(f"DeepseekV4: unmapped tensor {name!r}")
+        bid = int(m.group(1))
+        local = m.group(2)
+
+        # routed experts: collect per-layer then stack over experts
+        em = re.match(r"ffn\.experts\.(\d+)\.(w[123])\.weight", local)
+        if em is not None:
+            n_experts = self._cfg["n_routed_experts"]
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+            self._experts[bid][local] = data_torch
+            if len(self._experts[bid]) >= n_experts * 3:
+                for wk, enum in self._EXPERT_W.items():
+                    datas = [self._experts[bid].pop(f"ffn.experts.{j}.{wk}.weight") for j in range(n_experts)]
+                    stacked = torch.stack(datas, dim=0)  # [n_expert, out, in]
+                    yield self.format_tensor_name(enum, bid, ".weight"), stacked
+            return
+
+        if local in self._LOCAL_MAP:
+            enum, suffix = self._LOCAL_MAP[local]
+            yield self.format_tensor_name(enum, bid, suffix), data_torch
+            return
+
+        raise ValueError(f"DeepseekV4: unmapped tensor {name!r} (local={local!r})")
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None:
+            leftover = [k for d in self._experts for k in d.keys()]
+            if leftover:
+                raise ValueError(f"Unprocessed experts: {leftover}")

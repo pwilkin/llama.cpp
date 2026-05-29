@@ -175,6 +175,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_deepseek2ocr(params);
         case LLM_ARCH_DEEPSEEK32:
             return new llama_model_deepseek32(params);
+        case LLM_ARCH_DEEPSEEK4:
+            return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -2102,14 +2104,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // DeepSeek-V4 stores the per-layer attention input x and its derived
+                        // compressed/indexer KV blocks in widened, non-transposed V cells and
+                        // recomputes its sparse attention from them via custom set_rows writes.
+                        // v_trans=false -> contiguous cells, so sub-region writes are clean.
+                        // Multi-sequence requires a non-unified (per-stream) cache so each sequence
+                        // is a private contiguous in-order buffer (what the compressor's
+                        // absolute-position block pooling needs); kv_unified defaults to false, and
+                        // the DS4 graph carries a stream axis (ne3 = n_stream) accordingly.
+                        const bool ds4       = arch == LLM_ARCH_DEEPSEEK4;
+                        const bool v_trans   = ds4 ? false : !cparams.flash_attn;
+                        const bool unified   = cparams.kv_unified;
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn,
+                                v_trans,
                                 cparams.offload_kqv,
-                                cparams.kv_unified,
+                                unified,
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,
                                 1,
@@ -2295,6 +2309,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:

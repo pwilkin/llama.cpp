@@ -1409,7 +1409,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * weights_mul) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1429,7 +1431,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        selected_experts_in,
+        weights_mul
     );
 }
 
@@ -1456,7 +1460,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * weights_mul) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1488,6 +1494,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
             {
                 probs = logits; // [n_expert, n_tokens]
+            } break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+            {
+                // deepseek-v4: probs = sqrt(softplus(logits))
+                probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); // [n_expert, n_tokens]
             } break;
         default:
             GGML_ABORT("fatal error");
@@ -1539,9 +1550,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // select experts
-    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-    cb(selected_experts->src[0], "ffn_moe_argsort", il);
-    cb(selected_experts, "ffn_moe_topk", il);
+    ggml_tensor * selected_experts;
+    if (selected_experts_in != nullptr) {
+        // externally-provided selection (e.g. DeepSeek-V4 hash routing via token->expert table)
+        selected_experts = selected_experts_in; // [n_expert_used, n_tokens]
+        cb(selected_experts, "ffn_moe_topk", il);
+    } else {
+        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        cb(selected_experts, "ffn_moe_topk", il);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -1581,6 +1599,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    // optional per-(slot,token) weight mask (deepseek-v4 hash routing: drop all but the
+    // last occurrence of a duplicated expert, matching the reference's last-write-wins add)
+    if (weights_mul != nullptr) {
+        weights = ggml_mul(ctx0, weights, ggml_reshape_3d(ctx0, weights_mul, 1, n_expert_used, n_tokens));
+        cb(weights, "ffn_moe_weights_masked", il);
     }
 
     //call early so that topk-moe can be used
@@ -1668,6 +1693,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate_exps) {
+                // DeepSeek-V4: clamp gate (pre-silu) to <= limit, up to [-limit, limit]
+                if (arch == LLM_ARCH_DEEPSEEK4 && hparams.f_swiglu_limit > 0.0f) {
+                    const float L = hparams.f_swiglu_limit;
+                    cur = ggml_clamp(ctx0, cur, -INFINITY, L);
+                    cb(cur, "ffn_moe_gate_clamped", il);
+                    cur = ggml_silu(ctx0, cur);
+                    cb(cur, "ffn_moe_silu", il);
+                    up  = ggml_clamp(ctx0, up, -L, L);
+                    cb(up, "ffn_moe_up_clamped", il);
+                    cur = ggml_mul(ctx0, cur, up);
+                    cb(cur, "ffn_moe_swiglu_limited", il);
+                    break;
+                }
                 // Step35: per-layer clamp for routed experts
                 if (arch == LLM_ARCH_STEP35 && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];

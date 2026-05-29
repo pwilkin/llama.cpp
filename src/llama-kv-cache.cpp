@@ -1098,6 +1098,13 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
+    // DeepSeek-V4 caches the per-layer attention input x (which already bakes in the prior layers'
+    // RoPE through the residual stream) and recomputes its sparse attention assuming cache-slot ==
+    // absolute position. A standard rope K-shift cannot correct x, so context-shift is unsupported;
+    // returning false makes a shift attempt fail loudly instead of silently corrupting the cache.
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        return false;
+    }
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
@@ -1198,6 +1205,15 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_v_base(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * v = layers[ikv].v; // [n_embd_v_gqa, kv_size, n_stream]
+
+    // global cell axis: column j = stream(j / kv_size), cell (j % kv_size)
+    return ggml_reshape_2d(ctx, v, v->ne[0], v->ne[1]*v->ne[2]);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2464,6 +2480,14 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_base(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_base(ctx, il);
+}
+
+uint32_t llama_kv_cache_context::get_s0() const {
+    return sinfos[i_cur].s0;
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

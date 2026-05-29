@@ -489,6 +489,24 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // deepseek-v4
+    struct ggml_tensor * hc_attn_fn    = nullptr;
+    struct ggml_tensor * hc_attn_base  = nullptr;
+    struct ggml_tensor * hc_attn_scale = nullptr;
+    struct ggml_tensor * hc_ffn_fn     = nullptr;
+    struct ggml_tensor * hc_ffn_base   = nullptr;
+    struct ggml_tensor * hc_ffn_scale  = nullptr;
+    struct ggml_tensor * wo_a          = nullptr; // grouped low-rank output down-projection
+    struct ggml_tensor * ffn_gate_tid2eid = nullptr; // hash-routing token->expert table
+    struct ggml_tensor * compressor_kv    = nullptr;
+    struct ggml_tensor * compressor_gate  = nullptr;
+    struct ggml_tensor * compressor_norm  = nullptr;
+    struct ggml_tensor * compressor_ape   = nullptr;
+    struct ggml_tensor * idx_compressor_kv   = nullptr;
+    struct ggml_tensor * idx_compressor_gate = nullptr;
+    struct ggml_tensor * idx_compressor_norm = nullptr;
+    struct ggml_tensor * idx_compressor_ape  = nullptr;
+
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -537,6 +555,11 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
+
+    // deepseek-v4 final hyper-connection head reduction (hc_mult streams -> 1)
+    struct ggml_tensor * hc_head_fn    = nullptr;
+    struct ggml_tensor * hc_head_base  = nullptr;
+    struct ggml_tensor * hc_head_scale = nullptr;
 
 
     // NVFP4 per-tensor scale2, input_scale for LM head

@@ -14,6 +14,7 @@ enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS  = 4, // deepseek-v4: probs = sqrt(softplus(logits))
 };
 
 enum llama_swa_type {
@@ -210,6 +211,18 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+
+    // deepseek-v4
+    uint32_t n_lora_o          = 0;     // o_lora_rank (grouped low-rank output projection)
+    uint32_t n_o_groups        = 0;     // o_groups
+    uint32_t n_hash_layers     = 0;     // leading layers using hash-based expert routing
+    uint32_t n_window          = 0;     // sliding-window size (custom DS4 window, not llama SWA)
+    uint32_t hc_mult           = 0;     // hyper-connection multiplicity (parallel residual streams)
+    uint32_t hc_sinkhorn_iters = 0;
+    float    hc_eps            = 1e-6f;
+    float    f_swiglu_limit    = 0.0f;  // clamp limit for expert/shared SwiGLU (0 = disabled)
+    float    rope_freq_base_compress = 0.0f; // rope base for KV-compressed layers
+    std::array<uint32_t, LLAMA_MAX_LAYERS> compress_ratios; // per-layer KV compression ratio (0 = none)
 
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;

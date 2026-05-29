@@ -916,6 +916,33 @@ class GGUFWriter:
     def add_kv_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.KV_LORA_RANK.format(arch=self.arch), length)
 
+    def add_o_lora_rank(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.O_LORA_RANK.format(arch=self.arch), length)
+
+    def add_o_groups(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.O_GROUPS.format(arch=self.arch), value)
+
+    def add_compress_ratios(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.COMPRESS_RATIOS.format(arch=self.arch), values)
+
+    def add_rope_freq_base_compress(self, value: float) -> None:
+        self.add_float32(Keys.Rope.FREQ_BASE_COMPRESS.format(arch=self.arch), value)
+
+    def add_swiglu_limit(self, value: float) -> None:
+        self.add_float32(Keys.LLM.SWIGLU_LIMIT.format(arch=self.arch), value)
+
+    def add_hash_layer_count(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.HASH_LAYER_COUNT.format(arch=self.arch), value)
+
+    def add_hc_mult(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.HC_MULT.format(arch=self.arch), value)
+
+    def add_hc_sinkhorn_iters(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.HC_SINKHORN_ITERS.format(arch=self.arch), value)
+
+    def add_hc_eps(self, value: float) -> None:
+        self.add_float32(Keys.LLM.HC_EPS.format(arch=self.arch), value)
+
     def add_decay_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.DECAY_LORA_RANK.format(arch=self.arch), length)
 
