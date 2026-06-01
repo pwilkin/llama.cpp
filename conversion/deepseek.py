@@ -524,6 +524,78 @@ class DeepseekV4Model(TextModel):
         with open(self.dir_model / "config.json", encoding="utf-8") as f:
             self._cfg = json.load(f)
 
+    def dequant_model(self):
+        # The released DeepSeek-V4 checkpoint is pre-quantized. Two formats coexist,
+        # each pairing a "<w>.weight" tensor with a sibling "<w>.scale" tensor whose
+        # values are power-of-two (E8M0) multipliers:
+        #   * attention / e_proj / h_proj weights are block-FP8: an E4M3 weight with
+        #     a per-(weight_block_size) scale (typically 128x128).
+        #   * routed + shared expert weights are FP4 (e2m1) packed two-per-int8-byte,
+        #     with a per-row / 32-column-group scale.
+        # Both are dequantized to float here so the rest of the pipeline only ever
+        # sees real-valued weights. Unquantized checkpoints (e.g. the mock parity
+        # models) have no quantization_config and fall back to the base handling.
+        # The "hc_*_scale" hyper-connection tensors use a "_scale" suffix (no dot) and
+        # are deliberately not matched here.
+        qc = self._cfg.get("quantization_config")
+        if not (isinstance(qc, dict) and qc.get("quant_method") == "fp8"
+                and qc.get("scale_fmt") == "ue8m0"):
+            super().dequant_model()
+            return
+
+        block_size = qc.get("weight_block_size", [128, 128])
+
+        def dequant_block_fp8(weight: Tensor, scale: Tensor) -> Tensor:
+            # each scale entry is a power-of-two multiplier shared over a weight block
+            scale = scale.float()
+            for dim, bs in enumerate(block_size):
+                scale = scale.repeat_interleave(bs, dim=dim)
+            # trim padding when a dim isn't an exact multiple of the block size
+            scale = scale[tuple(slice(0, s) for s in weight.shape)]
+            return weight.float() * scale
+
+        def decode_e2m1(code: Tensor) -> Tensor:
+            # 4-bit e2m1: bit3=sign, bits2-1=exp, bit0=mantissa. Decoded arithmetically
+            # (a from_eager lookup table breaks lazy meta-tracing with a device mismatch).
+            code = code.long()
+            sign = 1.0 - 2.0 * (code >> 3).float()                 # +1 / -1
+            exp = (code >> 1) & 3
+            mant = (code & 1).float()
+            # exp==0: subnormal 0.5*mant ; else 2^(exp-1) * (1 + 0.5*mant)
+            return sign * torch.where(exp == 0,
+                                      0.5 * mant,
+                                      torch.pow(2.0, (exp - 1).float()) * (1.0 + 0.5 * mant))
+
+        def dequant_fp4(weight_i8: Tensor, scale: Tensor) -> Tensor:
+            # two e2m1 codes per byte; the low nibble is the lower column index
+            u = weight_i8.view(torch.uint8)
+            in_dim = 2 * weight_i8.shape[-1]
+            vals = torch.stack([decode_e2m1(u & 0x0F), decode_e2m1((u >> 4) & 0x0F)], dim=-1).flatten(-2)
+            scale = scale.float()
+            group = in_dim // scale.shape[-1]
+            scale = scale.repeat_interleave(group, dim=-1)[..., :in_dim]
+            return vals * scale
+
+        to_remove: list[str] = []
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".scale"):
+                continue
+            weight_name = name[:-len(".scale")] + ".weight"
+            if weight_name not in self.model_tensors:
+                raise ValueError(f"DeepseekV4: scale {name!r} has no matching weight")
+            w = self.model_tensors[weight_name]
+            s = self.model_tensors[name]
+            wdtype = w().dtype
+            if wdtype == torch.int8:
+                self.model_tensors[weight_name] = lambda w=w, s=s: dequant_fp4(w(), s())
+            elif wdtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                self.model_tensors[weight_name] = lambda w=w, s=s: dequant_block_fp8(w(), s())
+            else:
+                raise ValueError(f"DeepseekV4: unexpected dtype {wdtype} for quantized weight {weight_name!r}")
+            to_remove.append(name)
+        for name in to_remove:
+            del self.model_tensors[name]
+
     def set_vocab(self):
         try:
             self._set_vocab_gpt2()

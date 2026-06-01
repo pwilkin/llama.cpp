@@ -2515,6 +2515,11 @@ class LazyTorchTensor(gguf.LazyBase):
         "F8_E5M2": torch.float8_e5m2,
     }
 
+    # F8_E8M0 (power-of-two MX block scale, e.g. DeepSeek-V4) only exists in newer torch
+    if hasattr(torch, "float8_e8m0fnu"):
+        _dtype_str_map["F8_E8M0"] = torch.float8_e8m0fnu
+        _dtype_byteswap_map[torch.float8_e8m0fnu] = np.uint8
+
     def numpy(self) -> gguf.LazyNumpyTensor:
         dtype = self._dtype_map[self.dtype]
         return gguf.LazyNumpyTensor(
