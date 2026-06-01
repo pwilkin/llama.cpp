@@ -2,6 +2,8 @@
 
 #include "../llama-kv-cache.h"
 
+#include <map>
+
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -667,6 +669,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     const int64_t idx_hd = hparams.indexer_head_size;
 
+    // Share per-ratio graph-input tensors across layers. The attention mask and the block-write
+    // cell-index list depend only on the compress ratio (+ the global positions), so every layer
+    // with the same ratio reuses one input each (keyed by cr; 0 = window-only). Without this, the
+    // real 43-layer model creates 100+ distinct inputs and trips GGML_SCHED_MAX_SPLIT_INPUTS (30).
+    std::map<int64_t, ggml_tensor *> mask_by_cr;
+    std::map<int64_t, ggml_tensor *> blkidx_by_cr;
+
     // Compute the `n_blk_max` compressed/indexer blocks for ONE stream, from that stream's cached x
     // (xcs [n_embd, n_kv]), ending at block (bstart + n_blk_max). Returns [out_dim, n_blk_max] (pooled,
     // normed, roped). Emits one extra block (a carry predecessor for overlap, or a trailing overshoot
@@ -717,12 +726,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             bases.push_back((s0 + s) * kv_size + bstart_s);                   // global cell base for cache stream (s0+s)
         }
         blk_all = ggml_reshape_2d(ctx0, ggml_cont(ctx0, blk_all), out_dim, n_blk_max * n_stream);
-        ggml_tensor * idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_blk_max * n_stream);
-        ggml_set_input(idxs);
-        {
+        // One shared cell-index input per ratio: bases + n_blk_max depend only on cr and the
+        // (global) positions, so it is identical across same-ratio layers and across the
+        // compressor/indexer calls within a layer. Only the set_rows region/values differ.
+        ggml_tensor * idxs;
+        auto bit = blkidx_by_cr.find(cr);
+        if (bit == blkidx_by_cr.end()) {
+            idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_blk_max * n_stream);
+            ggml_set_input(idxs);
             auto bi = std::make_unique<llm_graph_input_ds4_blkidx>(std::move(bases), n_blk_max);
             bi->idxs = idxs;
             res->add_input(std::move(bi));
+            blkidx_by_cr[cr] = idxs;
+        } else {
+            idxs = bit->second;
         }
         ggml_tensor * w = ggml_set_rows(ctx0, region, blk_all, idxs); // [out_dim, ncells] post-write
         ggml_build_forward_expand(gf, w);
@@ -795,11 +812,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                                   s0 * kv_size * comp_region->nb[1])); // [hd, n_comp, n_stream] @ stream s0
                 kv = ggml_concat(ctx0, kvw, comp_kv, 1);                  // [hd, n_win+n_comp, n_stream]
 
-                auto inp = std::make_unique<llm_graph_input_ds4_mask>(hparams.n_window, cr, n_comp, w_start, n_seq_tokens, n_stream);
-                inp->mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_win + n_comp, n_seq_tokens, 1, n_stream);
-                ggml_set_input(inp->mask);
-                mask = inp->mask;
-                res->add_input(std::move(inp));
+                auto mit = mask_by_cr.find(cr);
+                if (mit == mask_by_cr.end()) {
+                    auto inp = std::make_unique<llm_graph_input_ds4_mask>(hparams.n_window, cr, n_comp, w_start, n_seq_tokens, n_stream);
+                    inp->mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_win + n_comp, n_seq_tokens, 1, n_stream);
+                    ggml_set_input(inp->mask);
+                    mask = inp->mask;
+                    res->add_input(std::move(inp));
+                    mask_by_cr[cr] = mask;
+                } else {
+                    mask = mit->second;
+                }
 
                 if (has_indexer) {
                     const int64_t topk = (int64_t) hparams.indexer_top_k < n_comp ? (int64_t) hparams.indexer_top_k : n_comp;
@@ -814,11 +837,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 }
             } else {
                 kv = kvw;                                                 // pure sliding-window attention
-                auto inp = std::make_unique<llm_graph_input_ds4_mask>(hparams.n_window, 0, 0, w_start, n_seq_tokens, n_stream);
-                inp->mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_win, n_seq_tokens, 1, n_stream);
-                ggml_set_input(inp->mask);
-                mask = inp->mask;
-                res->add_input(std::move(inp));
+                auto mit = mask_by_cr.find(cr);  // cr == 0
+                if (mit == mask_by_cr.end()) {
+                    auto inp = std::make_unique<llm_graph_input_ds4_mask>(hparams.n_window, 0, 0, w_start, n_seq_tokens, n_stream);
+                    inp->mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_win, n_seq_tokens, 1, n_stream);
+                    ggml_set_input(inp->mask);
+                    mask = inp->mask;
+                    res->add_input(std::move(inp));
+                    mask_by_cr[cr] = mask;
+                } else {
+                    mask = mit->second;
+                }
             }
 
             // batched attention over streams (ne3). k = [hd, 1, n_keys, n_stream] (single KV head)
