@@ -2115,12 +2115,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         const bool ds4       = arch == LLM_ARCH_DEEPSEEK4;
                         const bool v_trans   = ds4 ? false : !cparams.flash_attn;
                         const bool unified   = cparams.kv_unified;
+                        // DS4 caches the per-layer attention input x (plus derived compressed/indexer
+                        // blocks) and reads it back into matmuls/concats, so the cache MUST be F32:
+                        // an F16/quantized cache yields type-mismatched ggml_concat in the graph
+                        // (a->type == b->type assert). Force it here so no --type-k/--type-v is needed.
+                        const ggml_type type_k = ds4 ? GGML_TYPE_F32 : params.type_k;
+                        const ggml_type type_v = ds4 ? GGML_TYPE_F32 : params.type_v;
 
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
-                                params.type_k,
-                                params.type_v,
+                                type_k,
+                                type_v,
                                 v_trans,
                                 cparams.offload_kqv,
                                 unified,
