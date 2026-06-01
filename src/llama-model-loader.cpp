@@ -506,6 +506,9 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
 
+    // deepseek4 reads compress_ratios with a tolerant length (may include the MTP layer)
+    template bool llama_model_loader::get_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, bool required);
+
 
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,

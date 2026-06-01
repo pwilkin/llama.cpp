@@ -13,9 +13,12 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     // custom sliding window (do NOT use hparams.n_swa: that triggers llama's SWA cache machinery)
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_window, false);
 
-    // per-layer KV compression ratios (0 = pure sliding-window attention)
+    // per-layer KV compression ratios (0 = pure sliding-window attention).
+    // The source config carries one entry per layer INCLUDING the MTP/nextn layer
+    // (n_layer + num_nextn_predict_layers entries), so read the whole array and use
+    // the first n_layer; get_arr (unlike get_key_or_arr) tolerates length != n_layer.
     std::fill(hparams.compress_ratios.begin(), hparams.compress_ratios.end(), 0);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.compress_ratios, hparams.n_layer, false);
+    ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.compress_ratios, false);
 
     // sparse-attention indexer
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    false);
