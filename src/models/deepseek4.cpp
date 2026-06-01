@@ -884,24 +884,30 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
         ggml_tensor * ffn_out;
         {
-            // hash layers: experts chosen by a token->expert table; weights still from the gate scores
+            // hash layers: experts chosen by a token->expert table; weights still from the gate scores.
+            // Hash always selects a FIXED hparams.n_expert_used experts/token (the tid2eid table width).
+            // The llm_graph_context n_expert_used member is inflated to n_expert during warmup so the
+            // learned-gating top-k path touches every expert; that inflation is invalid for the
+            // fixed-width hash selection (it would mismatch sel/wmul and abort in build_moe_ffn's
+            // reshape, and overrun the dedup table). Pin hash layers to the real per-token count.
             ggml_tensor * sel  = nullptr;
             ggml_tensor * wmul = nullptr;
             ggml_tensor * exp_b = layer.ffn_exp_probs_b;
+            const int64_t moe_n_used = is_hash ? (int64_t) hparams.n_expert_used : n_expert_used;
             if (is_hash) {
                 ggml_tensor * t2e = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, inp_tokens); // [n_used, n] f32
                 sel   = ggml_cast(ctx0, t2e, GGML_TYPE_I32);
                 exp_b = nullptr; // hash gating has no selection bias
                 // dedup mask (drop all but the last occurrence of a duplicated expert)
                 auto inp = std::make_unique<llm_graph_input_ds4_hash>(layer.ffn_gate_tid2eid);
-                inp->mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_expert_used, n_tokens);
+                inp->mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, moe_n_used, n_tokens);
                 ggml_set_input(inp->mask);
                 wmul = inp->mask;
                 res->add_input(std::move(inp));
             }
             ggml_tensor * moe = build_moe_ffn(x,
                 layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
-                exp_b, n_expert, n_expert_used, LLM_FFN_SILU,
+                exp_b, n_expert, moe_n_used, LLM_FFN_SILU,
                 hparams.expert_weights_norm, hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func, il,
                 /*probs_in*/ nullptr, /*gate_up_exps*/ nullptr,
