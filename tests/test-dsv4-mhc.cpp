@@ -7,7 +7,7 @@
 // inputs with deliberately odd sizes. See src/models/deepseek-v4.cpp.
 
 #include "ggml.h"
-#include "ggml-cpu.h"
+#include "ggml-backend.h"
 
 #include <cstdio>
 #include <cmath>
@@ -70,7 +70,11 @@ int main() {
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     for (ggml_tensor * t : { ws_n, po_n, sink_o, sink_n }) ggml_build_forward_expand(gf, t);
-    ggml_graph_compute_with_ctx(ctx, gf, 4);
+    // Compute via the CPU backend (ggml-base registry) rather than ggml_graph_compute_with_ctx, which
+    // is a ggml-cpu symbol not linked into this test target (llama_build_and_test links llama-common).
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_free(backend);
 
     const float *X3=(float*)x3->data,*W=(float*)w->data,*X2=(float*)x2->data,*R=(float*)res->data,*P=(float*)post->data,*C=(float*)comb->data;
     const float *WSN=(float*)ws_n->data,*PN=(float*)po_n->data,*SO=(float*)sink_o->data,*SN=(float*)sink_n->data;
