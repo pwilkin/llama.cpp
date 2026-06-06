@@ -216,6 +216,13 @@ ggml_tensor * llama_model_deepseek_v4_flash::graph::build_hc_weighted_sum(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[2];
 
+    if (nt == 0) {
+        // Empty token set (e.g. build_hc_head on an ubatch with n_outputs == 0): the batched mul_mat
+        // below would hit ggml_can_mul_mat's `nt % nt` (0 % 0 -> SIGFPE). The result is genuinely
+        // empty; return a 0-row view so the rest of the graph stays well-formed.
+        return ggml_view_2d(ctx0, x, n_embd, 0, x->nb[2], 0);
+    }
+
     ggml_tensor * xT  = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 0, 2, 3)); // [hc, n_embd, nt]
     ggml_tensor * wr  = ggml_reshape_3d(ctx0, weights, hc, 1, nt);          // [hc, 1, nt]
     ggml_tensor * out = ggml_mul_mat(ctx0, xT, wr);                         // [n_embd, 1, nt]
