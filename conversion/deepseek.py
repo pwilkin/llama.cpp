@@ -498,6 +498,11 @@ class DeepseekV4FlashModel(TextModel):
         return super().filter_tensors(item)
 
     def set_vocab(self):
+        # A vocab-less checkpoint (e.g. the parity mock, which feeds token ids directly and ships no
+        # tokenizer) converts with a "none" tokenizer; the real model always ships a tokenizer.json.
+        if not (self.dir_model / "tokenizer.json").is_file() and not (self.dir_model / "tokenizer.model").is_file():
+            self._set_vocab_none()
+            return
         self._set_vocab_gpt2()
 
     @staticmethod

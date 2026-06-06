@@ -6860,6 +6860,38 @@ struct test_fill : public test_case {
     }
 };
 
+// GGML_OP_SINKHORN
+struct test_sinkhorn : public test_case {
+    const ggml_type              type;
+    const std::array<int64_t, 4> ne;   // square matrices stacked along dims 2/3: ne[0] == ne[1]
+    const float                  eps;
+    const int                    n_iter;
+
+    std::string vars() override { return VARS_TO_STR4(type, ne, eps, n_iter); }
+
+    test_sinkhorn(std::array<int64_t, 4> ne = { 4, 4, 37, 1 }, ggml_type type = GGML_TYPE_F32,
+            float eps = 1e-6f, int n_iter = 20)
+        : type(type), ne(ne), eps(eps), n_iter(n_iter) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // positive inputs keep the doubly-stochastic normalization denominators away from zero
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, 0.0f, 1.0f);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_sinkhorn(ctx, a, eps, n_iter);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SOLVE_TRI
 struct test_solve_tri : public test_case {
     const ggml_type              type;
@@ -8952,6 +8984,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fill(2.0f, GGML_TYPE_F32, { 303, 207, 11, 3 }));
     test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F32, { 800, 600, 4, 4 }));
     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F32, { 2048, 512, 2, 2 }));
+
+    test_cases.emplace_back(new test_sinkhorn());                                      // DeepSeek-V4 mHC (4x4, 20 iters)
+    test_cases.emplace_back(new test_sinkhorn({ 4, 4, 1, 1 }));                         // single matrix
+    test_cases.emplace_back(new test_sinkhorn({ 4, 4, 1216, 1 }));                      // prefill-width batch
+    test_cases.emplace_back(new test_sinkhorn({ 8, 8, 64, 2 }, GGML_TYPE_F32, 1e-6f, 10));
 
     test_cases.emplace_back(new test_diag());
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 79, 1, 19, 13 }));

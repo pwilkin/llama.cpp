@@ -1340,15 +1340,18 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    if (attn_rot_k) {
-        int nrot = 64;
-
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+    // n_embd_head_k_all == 0 means this cache holds no layers (e.g. the DeepSeek-V4 lightning-indexer
+    // cache when the model has no ratio-4 layers); the loop below would otherwise divide by zero.
+    if (attn_rot_k && n_embd_head_k_all > 0) {
+        // The rotation spans the full head dim (the indexer mul_mat asserts k_rot->ne[0] == query head
+        // dim), so use the largest power of two dividing the head dim. For power-of-two head dims this
+        // equals the head dim itself (128 for the lightning indexer, 32 for small configs). The previous
+        // ">= 128"-floored loop produced nrot > head dim for head dims < 128.
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
+        int nrot = 1;
+        while (n_embd_head_k_all % (nrot * 2) == 0) {
             nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
+        }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);

@@ -210,19 +210,17 @@ static ggml_tensor * dsv4_hc_affine(
 ggml_tensor * llama_model_deepseek_v4_flash::graph::build_hc_weighted_sum(
         ggml_tensor * x,
         ggml_tensor * weights) const {
+    // out[e,t] = sum_ih x[e,ih,t] * weights[ih,t]
+    // Fused: contract the hc axis with one batched mul_mat instead of an hc-way
+    // mul/add chain (x is [n_embd, hc, nt], weights is [hc, nt]).
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[2];
 
-    ggml_tensor * acc = nullptr;
-    for (int64_t ih = 0; ih < hc; ++ih) {
-        ggml_tensor * xh = ggml_view_2d(ctx0, x, n_embd, nt, x->nb[2], ih*x->nb[1]);
-        ggml_tensor * wh = ggml_view_2d(ctx0, weights, 1, nt, weights->nb[1], ih*weights->nb[0]);
+    ggml_tensor * xT  = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 0, 2, 3)); // [hc, n_embd, nt]
+    ggml_tensor * wr  = ggml_reshape_3d(ctx0, weights, hc, 1, nt);          // [hc, 1, nt]
+    ggml_tensor * out = ggml_mul_mat(ctx0, xT, wr);                         // [n_embd, 1, nt]
 
-        ggml_tensor * cur = ggml_mul(ctx0, xh, wh);
-        acc = acc ? ggml_add(ctx0, acc, cur) : cur;
-    }
-
-    return acc;
+    return ggml_reshape_2d(ctx0, out, n_embd, nt);
 }
 
 ggml_tensor * llama_model_deepseek_v4_flash::graph::build_hc_sinkhorn(
@@ -231,33 +229,11 @@ ggml_tensor * llama_model_deepseek_v4_flash::graph::build_hc_sinkhorn(
     GGML_UNUSED(il);
 
     // comb is [dst_hc, src_hc, n_tokens]. Sinkhorn follows the reference:
-    // row softmax over dst, one column normalization, then repeated row/column normalization.
+    // softmax over dst, then a doubly-stochastic projection (eps + alternating row/col
+    // normalization for sinkhorn_iters). The whole normalization loop is one fused op
+    // (ggml_sinkhorn) instead of ~7 ggml ops per iteration.
     comb = ggml_soft_max(ctx0, comb);
-
-    ggml_tensor * eps = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-    eps = ggml_fill(ctx0, eps, hparams.dsv4_hc_eps);
-
-    comb = ggml_add(ctx0, comb, eps);
-
-    auto norm_cols = [&]() {
-        ggml_tensor * comb_src_dst = ggml_cont(ctx0, ggml_permute(ctx0, comb, 1, 0, 2, 3));
-        ggml_tensor * col_sum = ggml_sum_rows(ctx0, comb_src_dst);
-        col_sum = ggml_add(ctx0, col_sum, eps);
-        col_sum = ggml_permute(ctx0, col_sum, 1, 0, 2, 3);
-        comb = ggml_div(ctx0, comb, col_sum);
-    };
-
-    auto norm_rows = [&]() {
-        ggml_tensor * row_sum = ggml_sum_rows(ctx0, comb);
-        row_sum = ggml_add(ctx0, row_sum, eps);
-        comb = ggml_div(ctx0, comb, row_sum);
-    };
-
-    norm_cols();
-    for (uint32_t i = 1; i < hparams.dsv4_hc_sinkhorn_iters; ++i) {
-        norm_rows();
-        norm_cols();
-    }
+    comb = ggml_sinkhorn(ctx0, comb, hparams.dsv4_hc_eps, (int) hparams.dsv4_hc_sinkhorn_iters);
 
     return comb;
 }
@@ -322,25 +298,24 @@ ggml_tensor * llama_model_deepseek_v4_flash::graph::build_hc_post(
         int il) const {
     GGML_UNUSED(il);
 
+    // out[e,dst,t] = x[e,t]*post[dst,t] + sum_src residual[e,src,t]*comb[dst,src,t]
+    // Fused: append the new sublayer output x as an extra residual "stream" and
+    // the post gate as its comb column, then evaluate the whole dst<-src(+depth)
+    // mixing as one batched mul_mat (contracting hc+1) instead of the hc*hc
+    // mul/add loop + per-dst concat. comb is [dst, src, nt].
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[1];
 
-    ggml_tensor * out = nullptr;
-    for (int64_t dst = 0; dst < hc; ++dst) {
-        ggml_tensor * post_dst = ggml_view_2d(ctx0, post, 1, nt, post->nb[1], dst*post->nb[0]);
-        ggml_tensor * cur = ggml_mul(ctx0, x, post_dst);
+    ggml_tensor * x_row    = ggml_reshape_3d(ctx0, x, n_embd, 1, nt);   // [n_embd, 1, nt]
+    ggml_tensor * rp       = ggml_concat(ctx0, residual, x_row, 1);     // [n_embd, hc+1, nt]
 
-        for (int64_t src = 0; src < hc; ++src) {
-            ggml_tensor * res_src = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], src*residual->nb[1]);
-            ggml_tensor * comb_src_dst = ggml_view_2d(ctx0, comb, 1, nt, comb->nb[2], dst*comb->nb[0] + src*comb->nb[1]);
-            cur = ggml_add(ctx0, cur, ggml_mul(ctx0, res_src, comb_src_dst));
-        }
+    ggml_tensor * post_row = ggml_reshape_3d(ctx0, post, hc, 1, nt);    // [hc, 1, nt]
+    ggml_tensor * mix      = ggml_concat(ctx0, comb, post_row, 1);      // [hc(dst), hc+1(src'), nt]
 
-        cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, nt);
-        out = out ? ggml_concat(ctx0, out, cur, 1) : cur;
-    }
+    ggml_tensor * rpT  = ggml_cont(ctx0, ggml_permute(ctx0, rp,  1, 0, 2, 3)); // [hc+1, n_embd, nt]
+    ggml_tensor * mixT = ggml_cont(ctx0, ggml_permute(ctx0, mix, 1, 0, 2, 3)); // [hc+1, hc, nt]
 
-    return out;
+    return ggml_mul_mat(ctx0, rpT, mixT);                              // [n_embd, hc, nt]
 }
 
 ggml_tensor * llama_model_deepseek_v4_flash::graph::build_hc_head(

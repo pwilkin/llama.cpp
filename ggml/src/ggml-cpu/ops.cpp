@@ -2273,6 +2273,72 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
     }
 }
 
+// ggml_compute_forward_sinkhorn
+
+static void ggml_compute_forward_sinkhorn_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    const float eps    = ggml_get_op_params_f32(dst, 0);
+    const int   n_iter = ggml_get_op_params_i32(dst, 1);
+
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
+
+    GGML_ASSERT(ne0 == ne1); // square matrices; element (i = ne0, j = ne1) at index i + j*n
+
+    const int64_t n    = ne0;        // matrix dim
+    const int64_t nmat = ne2*ne3;    // number of stacked matrices (src0 and dst are contiguous)
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t m = ith; m < nmat; m += nth) {
+        const float * s = (const float *)((const char *) src0->data + (size_t)(m*n*n)*sizeof(float));
+        float       * d = (float       *)((char       *) dst->data  + (size_t)(m*n*n)*sizeof(float));
+
+        for (int64_t e = 0; e < n*n; ++e) {
+            d[e] = s[e] + eps;
+        }
+
+        // normalize over ne1 (j): divide each ne0-row i by (eps + sum_j)
+        auto norm_ne1 = [&]() {
+            for (int64_t i = 0; i < n; ++i) {
+                float sum = eps;
+                for (int64_t j = 0; j < n; ++j) sum += d[i + j*n];
+                for (int64_t j = 0; j < n; ++j) d[i + j*n] /= sum;
+            }
+        };
+        // normalize over ne0 (i): divide each ne1-col j by (eps + sum_i)
+        auto norm_ne0 = [&]() {
+            for (int64_t j = 0; j < n; ++j) {
+                float sum = eps;
+                for (int64_t i = 0; i < n; ++i) sum += d[i + j*n];
+                for (int64_t i = 0; i < n; ++i) d[i + j*n] /= sum;
+            }
+        };
+
+        norm_ne1();
+        for (int it = 1; it < n_iter; ++it) {
+            norm_ne0();
+            norm_ne1();
+        }
+    }
+}
+
+void ggml_compute_forward_sinkhorn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_sinkhorn_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("unsupported type for ggml_compute_forward_sinkhorn: %s", ggml_type_name(src0->type));
+            }
+    }
+}
+
 // ggml_compute_tri
 
 static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggml_tensor * dst) {

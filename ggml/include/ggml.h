@@ -583,6 +583,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_SINKHORN,
+
         GGML_OP_COUNT,
     };
 
@@ -2339,6 +2341,17 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 c);
+
+    // Sinkhorn-Knopp doubly-stochastic normalization of square matrices stacked along dims 2/3.
+    // a: [n, n, ne2, ne3] with ne0 == ne1, F32, contiguous. For each n x n matrix M:
+    //   M += eps; normalize over ne1; then repeat (normalize over ne0; normalize over ne1) n_iter-1 times.
+    // (eps is also added to every normalization denominator.) Apply ggml_soft_max over ne0 beforehand.
+    // Fuses the DeepSeek-V4 mHC residual-mixing Sinkhorn loop into a single op.
+    GGML_API struct ggml_tensor * ggml_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 eps,
+            int                   n_iter);
 
     GGML_API struct ggml_tensor * ggml_fill_inplace(
             struct ggml_context * ctx,

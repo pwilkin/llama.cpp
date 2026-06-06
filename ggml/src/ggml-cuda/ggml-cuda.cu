@@ -64,6 +64,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/sinkhorn.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3114,6 +3115,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
+        case GGML_OP_SINKHORN:
+            ggml_cuda_op_sinkhorn(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5423,6 +5427,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
+        case GGML_OP_SINKHORN:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_DIAG:

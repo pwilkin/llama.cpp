@@ -1984,6 +1984,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_fill(params, tensor);
             } break;
+        case GGML_OP_SINKHORN:
+            {
+                ggml_compute_forward_sinkhorn(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
@@ -2208,6 +2212,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_FILL:
+        case GGML_OP_SINKHORN:
             {
                 n_tasks = n_threads;
             } break;

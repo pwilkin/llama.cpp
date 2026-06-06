@@ -1078,9 +1078,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "SINKHORN",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1188,9 +1190,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "sinkhorn(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5248,6 +5252,29 @@ struct ggml_tensor * ggml_fill_inplace(
     struct ggml_tensor  * a,
     float                 c) {
     return ggml_fill_impl(ctx, a, c, true);
+}
+
+// ggml_sinkhorn
+
+struct ggml_tensor * ggml_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 eps,
+        int                   n_iter) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[0] == a->ne[1]); // square matrices stacked along dims 2/3
+    GGML_ASSERT(n_iter >= 1);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+
+    result->op     = GGML_OP_SINKHORN;
+    result->src[0] = a;
+
+    return result;
 }
 
 // ggml_argsort
