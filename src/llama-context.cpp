@@ -3407,6 +3407,13 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_DEEPSEEK_V4_FLASH) {
+        // DeepSeek-V4 uses an F32 KV cache and custom compressed / top-k attention masks (CSA/HCA/
+        // lightning indexer), which ggml_flash_attn_ext does not support (it requires an F16 mask).
+        LLAMA_LOG_WARN("%s: flash_attn is not compatible with DeepSeek-V4 - forcing off\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);

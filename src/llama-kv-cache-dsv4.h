@@ -234,8 +234,26 @@ public:
     const comp_plan & get_hca_plan() const;
     const comp_plan & get_lid_plan() const;
 
+    // full-context graph reservation (init_full): the per-ubatch plans don't exist yet, so build a
+    // worst-case plan (n_kv = compressed-cache capacity, n_tokens = the reserve ubatch) so graph_reserve
+    // sizes the CSA/HCA/indexer compute buffers for the maximum. See build_inp_dsv4().
+    bool is_reserve() const { return reserve; }
+    comp_plan reserve_plan_csa(uint32_t n_tokens) const;
+    comp_plan reserve_plan_hca(uint32_t n_tokens) const;
+    comp_plan reserve_plan_lid(uint32_t n_tokens) const;
+
 private:
     size_t i_next = 0;
+
+    // set only for the init_full (graph-reservation) context; the fields below carry the compressed
+    // cache capacities / state params needed to synthesize worst-case reservation plans.
+    bool     reserve        = false;
+    uint32_t csa_kv_size    = 0;
+    uint32_t csa_state_size = 0;
+    uint32_t csa_n_stream   = 1;
+    uint32_t hca_kv_size    = 0;
+    uint32_t hca_state_size = 0;
+    uint32_t hca_n_stream   = 1;
 
     std::vector<llama_ubatch> ubatches;
 

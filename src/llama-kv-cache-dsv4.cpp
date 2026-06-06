@@ -374,6 +374,38 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
     return plans;
 }
 
+// Worst-case plan for graph reservation: a synthetic ubatch of n_tokens tokens placed at the highest
+// positions (so n_visible peaks at the compressed-cache capacity kv_size). It is a real
+// dsv4_build_comp_plan output, so every inter-array invariant the graph asserts holds, and its
+// n_tokens matches the reserve ubatch (avoiding shape mismatches). graph_reserve only allocates, so
+// the index *values* are irrelevant — only the resulting tensor shapes, which bound any real ubatch.
+static llama_kv_cache_dsv4_context::comp_plan dsv4_build_full_plan(
+        uint32_t ratio, bool overlap, uint32_t state_size, uint32_t kv_size, uint32_t n_stream,
+        uint32_t n_tokens) {
+    n_tokens = std::max<uint32_t>(n_tokens, 1);
+
+    std::vector<llama_pos>      pos(n_tokens);
+    std::vector<llama_seq_id>   seq(n_tokens, 0);
+    std::vector<llama_seq_id *> seq_id(n_tokens);
+    std::vector<int32_t>        n_seq_id(n_tokens, 1);
+
+    const llama_pos last = (llama_pos) kv_size * (llama_pos) ratio - 1;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_pos p = last - (llama_pos) (n_tokens - 1 - i);
+        pos[i]    = p < 0 ? 0 : p;
+        seq_id[i] = &seq[i];
+    }
+
+    llama_ubatch ub = {};
+    ub.n_tokens = n_tokens;
+    ub.n_pos    = 1;
+    ub.pos      = pos.data();
+    ub.seq_id   = seq_id.data();
+    ub.n_seq_id = n_seq_id.data();
+
+    return dsv4_build_comp_plan(ub, ratio, overlap, state_size, kv_size, n_stream);
+}
+
 static void dsv4_make_k_only(llama_hparams & hparams) {
     // llama_kv_cache uses hparams.is_mla() to allocate K-only storage.
     hparams.n_embd_head_k_mla_impl = hparams.n_embd_head_k();
@@ -1043,6 +1075,15 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     status(llama_memory_status_combine(
                 llama_memory_status_combine(ctx_raw->get_status(), ctx_csa->get_status()),
                 llama_memory_status_combine(ctx_hca->get_status(), ctx_lid->get_status()))) {
+    // graph reservation: remember the compressed-cache capacities / state params so build_inp_dsv4
+    // can synthesize worst-case (full-context) plans and reserve the CSA/HCA/indexer compute buffers.
+    reserve        = true;
+    csa_kv_size    = kv->get_csa()->get_size();
+    csa_state_size = kv->get_csa_state()->get_state_size();
+    csa_n_stream   = kv->get_csa_state()->get_n_stream();
+    hca_kv_size    = kv->get_hca()->get_size();
+    hca_state_size = kv->get_hca_state()->get_state_size();
+    hca_n_stream   = kv->get_hca_state()->get_n_stream();
 }
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
@@ -1156,6 +1197,19 @@ const llama_dsv4_comp_state * llama_kv_cache_dsv4_context::get_lid_state() const
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return lid_state;
+}
+
+llama_kv_cache_dsv4_context::comp_plan llama_kv_cache_dsv4_context::reserve_plan_csa(uint32_t n_tokens) const {
+    return dsv4_build_full_plan(DSV4_CSA_RATIO, true, csa_state_size, csa_kv_size, csa_n_stream, n_tokens);
+}
+
+llama_kv_cache_dsv4_context::comp_plan llama_kv_cache_dsv4_context::reserve_plan_hca(uint32_t n_tokens) const {
+    return dsv4_build_full_plan(DSV4_HCA_RATIO, false, hca_state_size, hca_kv_size, hca_n_stream, n_tokens);
+}
+
+llama_kv_cache_dsv4_context::comp_plan llama_kv_cache_dsv4_context::reserve_plan_lid(uint32_t n_tokens) const {
+    // the lightning-indexer cache mirrors the CSA compressor (ratio 4, overlap); plans_lid == plans_csa
+    return reserve_plan_csa(n_tokens);
 }
 
 const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_csa_plan() const {

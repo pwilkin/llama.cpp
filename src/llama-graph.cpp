@@ -2967,9 +2967,23 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     inp_raw->self_k_rot_swa = raw_ctx->get_swa()->build_input_k_rot(ctx0);
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
 
-    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(), "csa");
-    dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(), "hca");
-    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(), "lid");
+    if (mctx_cur->is_reserve()) {
+        // graph reservation (init_full): the per-ubatch plans don't exist yet. Build worst-case plans
+        // (n_kv = compressed-cache capacity) sized to THIS reservation's n_tokens so the reserved
+        // compute buffer covers the CSA/HCA/indexer attention tensors at full context. set_input() is
+        // never called for a reserve graph, so the synthetic index values are never consumed.
+        const uint32_t nt = (uint32_t) n_tokens;
+        const auto csa_plan = mctx_cur->reserve_plan_csa(nt);
+        const auto hca_plan = mctx_cur->reserve_plan_hca(nt);
+        const auto lid_plan = mctx_cur->reserve_plan_lid(nt);
+        dsv4_build_comp_inputs(ctx0, inp->inp_csa, csa_plan, "csa");
+        dsv4_build_comp_inputs(ctx0, inp->inp_hca, hca_plan, "hca");
+        dsv4_build_comp_inputs(ctx0, inp->inp_lid, lid_plan, "lid");
+    } else {
+        dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(), "csa");
+        dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(), "hca");
+        dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(), "lid");
+    }
     inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);
 
     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
