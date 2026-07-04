@@ -58,14 +58,19 @@ std::vector<uint32_t> read_u32(const std::string & path) {
     return v;
 }
 
-// One loaded op: its kernel + the instruction BO (uploaded once). The AIE DPU
-// kernel signature is (opcode, instr, instr_len, bo3..bo7) — 5 buffer slots;
-// this unary design uses bo3=in, bo4=out, the rest are dummies.
+// One loaded op: kernel + instruction BO (uploaded once) + persistent I/O
+// buffers reused across calls (BO allocation pins memory, so we do it once).
+// The AIE DPU kernel signature is (opcode, instr, instr_len, bo3..bo7) — 5
+// buffer slots; this unary design uses bo3=in, bo4=out, the rest are dummies.
 struct op_kernel {
     xrt::hw_context ctx;
     xrt::kernel     kernel;
     xrt::bo         bo_instr;
     unsigned        instr_words = 0;
+    xrt::bo         bo_in;
+    xrt::bo         bo_out;
+    ggml_bf16_t *   in_map  = nullptr;
+    ggml_bf16_t *   out_map = nullptr;
     xrt::bo         dummy[3]; // slots 5,6,7
 };
 
@@ -110,19 +115,23 @@ struct npu_state {
             xrt::xclbin xclbin(kdir + "/" + name + ".xclbin");
             device.register_xclbin(xclbin);
 
-            op_kernel k{
-                /* ctx    */ xrt::hw_context(device, xclbin.get_uuid()),
-                /* kernel */ xrt::kernel(),
-                /* instr  */ xrt::bo(),
-                /* words  */ (unsigned) instr.size(),
-                /* dummy  */ {},
-            };
-            k.kernel = xrt::kernel(k.ctx, KERNEL_NAME);
+            op_kernel k;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
 
             k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t),
                                  xrt::bo::flags::cacheable, k.kernel.group_id(1));
             std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
             k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            // persistent I/O buffers (reused across calls)
+            k.bo_in  = xrt::bo(device, sizeof(uint16_t) * KERNEL_LEN,
+                               xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.bo_out = xrt::bo(device, sizeof(uint16_t) * KERNEL_LEN,
+                               xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.in_map  = k.bo_in.map<ggml_bf16_t *>();
+            k.out_map = k.bo_out.map<ggml_bf16_t *>();
 
             for (int i = 0; i < 3; i++) {
                 k.dummy[i] = xrt::bo(device, sizeof(uint16_t) * KERNEL_LEN,
@@ -158,29 +167,21 @@ bool ggml_xdna_npu_try_unary(enum ggml_unary_op op, const float * src, float * d
     }
 
     try {
-        xrt::bo bo_in(N.device, sizeof(uint16_t) * KERNEL_LEN,
-                      xrt::bo::flags::host_only, k->kernel.group_id(3));
-        xrt::bo bo_out(N.device, sizeof(uint16_t) * KERNEL_LEN,
-                       xrt::bo::flags::host_only, k->kernel.group_id(4));
-
-        ggml_bf16_t * in_map  = bo_in.map<ggml_bf16_t *>();
-        ggml_bf16_t * out_map = bo_out.map<ggml_bf16_t *>();
-
         for (int64_t off = 0; off < n; off += KERNEL_LEN) {
             const int64_t chunk = std::min<int64_t>(KERNEL_LEN, n - off);
+            const size_t  bytes = (size_t) chunk * sizeof(ggml_bf16_t);
 
-            ggml_fp32_to_bf16_row(src + off, in_map, chunk);
-            if (chunk < KERNEL_LEN) {
-                std::memset(in_map + chunk, 0, (KERNEL_LEN - chunk) * sizeof(ggml_bf16_t));
-            }
-            bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            // only the live [0,chunk) region matters; the kernel reads/writes the
+            // full tile but we sync and read back just what we filled.
+            ggml_fp32_to_bf16_row(src + off, k->in_map, chunk);
+            k->bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
 
             auto run = k->kernel(RUN_OPCODE, k->bo_instr, k->instr_words,
-                                 bo_in, bo_out, k->dummy[0], k->dummy[1], k->dummy[2]);
+                                 k->bo_in, k->bo_out, k->dummy[0], k->dummy[1], k->dummy[2]);
             run.wait();
 
-            bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            ggml_bf16_to_fp32_row(out_map, dst + off, chunk);
+            k->bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, 0);
+            ggml_bf16_to_fp32_row(k->out_map, dst + off, chunk);
         }
         if (std::getenv("GGML_XDNA_DEBUG")) {
             fprintf(stderr, "[xdna] ran %s on NPU (n=%lld)\n", op_name(op), (long long) n);
