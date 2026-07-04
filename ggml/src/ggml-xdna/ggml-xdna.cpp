@@ -233,6 +233,71 @@ static void ggml_backend_xdna_compute_get_rows(ggml_tensor * dst) {
     }
 }
 
+// FLASH_ATTN_EXT: dst[dv,h,iq,i3] = softmax(scale*Q·K^T + mask)·V, per head with
+// GQA. Correct host implementation (the eligible case: no ALiBi bias, no sinks;
+// softcap and f16/quantized K/V handled). Serves as the always-correct base;
+// the NPU per-head path (below) accelerates the common head sizes.
+static void ggml_backend_xdna_compute_flash_attn_ext(ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    float scale = 1.0f, max_bias = 0.0f, softcap = 0.0f;
+    std::memcpy(&scale,   (const float *) dst->op_params + 0, sizeof(float));
+    std::memcpy(&max_bias,(const float *) dst->op_params + 1, sizeof(float));
+    std::memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (softcap != 0.0f) scale /= softcap;
+
+    const int64_t DK  = q->ne[0], DV = v->ne[0];
+    const int64_t NQ  = q->ne[1], NH = q->ne[2], NB = q->ne[3];
+    const int64_t NKV = k->ne[1];
+    const int64_t rk2 = NH / k->ne[2], rk3 = NB / k->ne[3];
+    const int64_t rv2 = NH / v->ne[2], rv3 = NB / v->ne[3];
+
+    const struct ggml_type_traits * ttk = ggml_get_type_traits(k->type);
+    const struct ggml_type_traits * ttv = ggml_get_type_traits(v->type);
+    float * d = (float *) dst->data;
+
+    std::vector<float> krow(DK), vrow(DV), s(NKV);
+    auto deq = [](const struct ggml_type_traits * tt, ggml_type t, const void * src, float * out, int64_t n) {
+        if (t == GGML_TYPE_F32) std::memcpy(out, src, n * sizeof(float));
+        else                    tt->to_float(src, out, n);
+    };
+
+    for (int64_t i3 = 0; i3 < NB; i3++)
+    for (int64_t h  = 0; h  < NH; h++)
+    for (int64_t iq = 0; iq < NQ; iq++) {
+        const float * qr = (const float *) ((const char *) q->data + iq * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]);
+        const ggml_fp16_t * mr = mask ? (const ggml_fp16_t *) ((const char *) mask->data +
+                                     iq * mask->nb[1] + (i3 % mask->ne[3]) * mask->nb[3]) : nullptr;
+        float mx = -INFINITY;
+        for (int64_t ic = 0; ic < NKV; ic++) {
+            const void * kp = (const char *) k->data + ic * k->nb[1] + (h / rk2) * k->nb[2] + (i3 / rk3) * k->nb[3];
+            deq(ttk, k->type, kp, krow.data(), DK);
+            float acc = 0.0f;
+            for (int64_t dd = 0; dd < DK; dd++) acc += qr[dd] * krow[dd];
+            acc *= scale;
+            if (softcap != 0.0f) acc = softcap * tanhf(acc);
+            if (mr) acc += ggml_fp16_to_fp32(mr[ic]);
+            s[ic] = acc;
+            mx = std::max(mx, acc);
+        }
+        double sum = 0.0;
+        for (int64_t ic = 0; ic < NKV; ic++) { s[ic] = expf(s[ic] - mx); sum += s[ic]; }
+        const float inv = 1.0f / (float) sum;
+
+        float * out = d + DV * (h + NH * (iq + NQ * i3));
+        for (int64_t dd = 0; dd < DV; dd++) out[dd] = 0.0f;
+        for (int64_t ic = 0; ic < NKV; ic++) {
+            const void * vp = (const char *) v->data + ic * v->nb[1] + (h / rv2) * v->nb[2] + (i3 / rv3) * v->nb[3];
+            deq(ttv, v->type, vp, vrow.data(), DV);
+            const float w = s[ic] * inv;
+            for (int64_t dd = 0; dd < DV; dd++) out[dd] += w * vrow[dd];
+        }
+    }
+}
+
 // ---- backend (stream) ------------------------------------------------------
 
 static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
@@ -281,6 +346,10 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
 
             case GGML_OP_GET_ROWS:
                 ggml_backend_xdna_compute_get_rows(node);
+                break;
+
+            case GGML_OP_FLASH_ATTN_EXT:
+                ggml_backend_xdna_compute_flash_attn_ext(node);
                 break;
 
             case GGML_OP_NONE:
@@ -464,6 +533,23 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             return op->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
                    ids->ne[1] == 1 && ids->ne[2] == 1 && // 1-D index list
                    (a->type == GGML_TYPE_F32 || (tt && tt->to_float));
+        }
+
+        case GGML_OP_FLASH_ATTN_EXT: {
+            const struct ggml_tensor * q    = op->src[0];
+            const struct ggml_tensor * k    = op->src[1];
+            const struct ggml_tensor * v    = op->src[2];
+            const struct ggml_tensor * mask = op->src[3];
+            float max_bias = 0.0f;
+            std::memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+            const struct ggml_type_traits * ttk = ggml_get_type_traits(k->type);
+            const struct ggml_type_traits * ttv = ggml_get_type_traits(v->type);
+            return op->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 &&
+                   max_bias == 0.0f &&               // no ALiBi
+                   op->src[4] == nullptr &&          // no attention sinks
+                   (mask == nullptr || mask->type == GGML_TYPE_F16) &&
+                   (k->type == GGML_TYPE_F32 || (ttk && ttk->to_float)) &&
+                   (v->type == GGML_TYPE_F32 || (ttv && ttv->to_float));
         }
 
         case GGML_OP_RMS_NORM:
