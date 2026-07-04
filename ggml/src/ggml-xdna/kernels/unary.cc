@@ -106,6 +106,22 @@ void xdna_softmax_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
     }
 }
 
+// SWIGLU (ggml GGML_GLU_OP_SWIGLU): out = silu(gate) * up. The input packs the
+// two halves [gate (TILE_N) | up (TILE_N)]; output is TILE_N.
+void xdna_swiglu_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
+    const aie::vector<bfloat16, V> half = aie::broadcast<bfloat16, V>(0.5f);
+    const aie::vector<bfloat16, V> one  = aie::broadcast<bfloat16, V>(1.0f);
+    auto it_g = aie::cbegin_vector<V>(a);
+    auto it_u = aie::cbegin_vector<V>(a + TILE_N);
+    auto it_o = aie::begin_vector<V>(c);
+    for (int i = 0; i < TILE_N; i += V) {
+        aie::vector<bfloat16, V> g    = *it_g++;
+        aie::vector<bfloat16, V> u    = *it_u++;
+        aie::vector<bfloat16, V> silu = aie::mul(g, vsigmoid(g, half, one)).to_vector<bfloat16>();
+        *it_o++ = aie::mul(silu, u).to_vector<bfloat16>();
+    }
+}
+
 void xdna_relu_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
     auto it_in  = aie::cbegin_vector<V>(a);
     auto it_out = aie::begin_vector<V>(c);
