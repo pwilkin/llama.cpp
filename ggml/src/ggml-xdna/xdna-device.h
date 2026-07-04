@@ -29,6 +29,14 @@ bool ggml_xdna_npu_try_rows(const char * op, int row_len, const float * src, flo
 // caller must pre-broadcast b to full size. Returns false if unavailable.
 bool ggml_xdna_npu_try_binary(const char * op, const float * a, const float * b, float * c, int64_t n);
 
+// Fused flash attention on the NPU (streaming online-softmax kernel), per head
+// with GQA. Handles the eligible case (DK==DV, f16 mask, no ALiBi/sinks/softcap,
+// NKV a multiple of the block size, a matching flash_<NQ>_<DK>_<NKV>.xclbin).
+// Returns false otherwise so the caller uses the host path.
+bool ggml_xdna_npu_try_flash(const struct ggml_tensor * q, const struct ggml_tensor * k,
+                             const struct ggml_tensor * v, const struct ggml_tensor * mask,
+                             struct ggml_tensor * dst, float scale);
+
 #ifdef __cplusplus
 }
 #endif

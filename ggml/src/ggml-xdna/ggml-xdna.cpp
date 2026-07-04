@@ -255,6 +255,11 @@ static void ggml_backend_xdna_compute_flash_attn_ext(ggml_tensor * dst) {
     const int64_t rk2 = NH / k->ne[2], rk3 = NB / k->ne[3];
     const int64_t rv2 = NH / v->ne[2], rv3 = NB / v->ne[3];
 
+    // try the NPU streaming flash kernel first (falls back to host below)
+    if (softcap == 0.0f && ggml_xdna_npu_try_flash(q, k, v, mask, dst, scale)) {
+        return;
+    }
+
     const struct ggml_type_traits * ttk = ggml_get_type_traits(k->type);
     const struct ggml_type_traits * ttv = ggml_get_type_traits(v->type);
     float * d = (float *) dst->data;

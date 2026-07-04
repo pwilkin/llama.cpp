@@ -32,6 +32,13 @@ namespace {
 constexpr int      KERNEL_LEN   = 4096;
 constexpr uint64_t RUN_OPCODE   = 3; // "execute instruction sequence"
 constexpr char     KERNEL_NAME[] = "MLIR_AIE";
+constexpr int      FLASH_BLK    = 16; // KV block size the flash xclbins use
+
+// dequantize one row of `n` elements of type `t` to f32
+inline void deq_row(const struct ggml_type_traits * tt, ggml_type t, const void * src, float * out, int64_t n) {
+    if (t == GGML_TYPE_F32) std::memcpy(out, src, n * sizeof(float));
+    else                    tt->to_float(src, out, n);
+}
 
 const char * op_name(enum ggml_unary_op op) {
     switch (op) {
@@ -87,15 +94,63 @@ struct mm_kernel {
     xrt::bo         dummy[2]; // slots 6,7
 };
 
+// A loaded streaming-flash kernel for a fixed (NQ, DK, NKV). Q @3 (bf16),
+// KV blocks @4 (bf16), STATE/output @5 (fp32).
+struct flash_kernel {
+    xrt::hw_context ctx;
+    xrt::kernel     kernel;
+    xrt::bo         bo_instr;
+    unsigned        instr_words = 0;
+    int             NQ = 0, DK = 0, NKV = 0, NBLK = 0;
+    xrt::bo         boQ, boKV, boO;
+    ggml_bf16_t *   Q_map  = nullptr;
+    ggml_bf16_t *   KV_map = nullptr;
+    float *         O_map  = nullptr;
+    xrt::bo         dummy[2];
+};
+
 struct npu_state {
     xrt::device            device;
     std::string            kdir;
     bool                   ok = false;
-    std::map<int, op_kernel>         ops;
-    std::map<std::string, op_kernel> named; // reductions etc., keyed by xclbin base name
-    std::map<std::string, mm_kernel> mms;
-    std::map<std::string, mm_kernel> bins;  // 2-in/1-out binary, keyed by op name
+    std::map<int, op_kernel>          ops;
+    std::map<std::string, op_kernel>  named; // reductions etc., keyed by xclbin base name
+    std::map<std::string, mm_kernel>  mms;
+    std::map<std::string, mm_kernel>  bins;  // 2-in/1-out binary, keyed by op name
+    std::map<std::string, flash_kernel> flashes;
     std::mutex             mtx;
+
+    // load + cache flash_<NQ>_<DK>_<NKV>.xclbin
+    flash_kernel * get_flash(int NQ, int DK, int NKV) {
+        const std::string key = std::to_string(NQ) + "_" + std::to_string(DK) + "_" + std::to_string(NKV);
+        auto it = flashes.find(key);
+        if (it != flashes.end()) return &it->second;
+        const std::string base = kdir + "/flash_" + key;
+        const std::vector<uint32_t> instr = read_u32(base + "_insts.bin");
+        if (instr.empty()) return nullptr;
+        try {
+            xrt::xclbin xclbin(base + ".xclbin");
+            device.register_xclbin(xclbin);
+            flash_kernel k;
+            k.NQ = NQ; k.DK = DK; k.NKV = NKV; k.NBLK = NKV / FLASH_BLK;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t), xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            const int blk_elems = 2 * FLASH_BLK * DK + NQ * FLASH_BLK;
+            k.boQ  = xrt::bo(device, (size_t) NQ * DK * sizeof(uint16_t),          xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.boKV = xrt::bo(device, (size_t) k.NBLK * blk_elems * sizeof(uint16_t), xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.boO  = xrt::bo(device, (size_t) (NQ * DK + 2 * NQ) * sizeof(float),  xrt::bo::flags::host_only, k.kernel.group_id(5));
+            k.Q_map  = k.boQ.map<ggml_bf16_t *>();
+            k.KV_map = k.boKV.map<ggml_bf16_t *>();
+            k.O_map  = k.boO.map<float *>();
+            for (int i = 0; i < 2; i++) k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(6 + i));
+            auto res = flashes.emplace(key, std::move(k));
+            return &res.first->second;
+        } catch (...) { return nullptr; }
+    }
 
     // load + cache a 2-in/1-out binary kernel by name ("add"/"mul"). Reuses the
     // mm_kernel struct (A=in0 @3, B=in1 @4, C=out @5), sized KERNEL_LEN.
@@ -459,9 +514,98 @@ bool ggml_xdna_npu_try_binary(const char * op, const float * a, const float * b,
     }
 }
 
+bool ggml_xdna_npu_try_flash(const struct ggml_tensor * q, const struct ggml_tensor * k,
+                             const struct ggml_tensor * v, const struct ggml_tensor * mask,
+                             struct ggml_tensor * dst, float scale) {
+    npu_state & N = npu();
+    if (!N.ok) {
+        return false;
+    }
+    const int DK  = (int) q->ne[0];
+    const int DV  = (int) v->ne[0];
+    const int NQ  = (int) q->ne[1];
+    const int NH  = (int) q->ne[2];
+    const int NB  = (int) q->ne[3];
+    const int NKV = (int) k->ne[1];
+    if (DK != DV || NKV % FLASH_BLK != 0) {
+        return false;
+    }
+    const int rk2 = NH / (int) k->ne[2], rk3 = NB / (int) k->ne[3];
+    const int rv2 = NH / (int) v->ne[2], rv3 = NB / (int) v->ne[3];
+
+    std::lock_guard<std::mutex> lock(N.mtx);
+    flash_kernel * fk = N.get_flash(NQ, DK, NKV);
+    if (!fk) {
+        return false;
+    }
+
+    const int blk_elems = 2 * FLASH_BLK * DK + NQ * FLASH_BLK;
+    const struct ggml_type_traits * ttk = ggml_get_type_traits(k->type);
+    const struct ggml_type_traits * ttv = ggml_get_type_traits(v->type);
+    std::vector<float> krow(DK), vrow(DV);
+    float * d = (float *) dst->data;
+
+    try {
+        for (int i3 = 0; i3 < NB; i3++)
+        for (int h  = 0; h  < NH; h++) {
+            // Q pre-scaled (the flash xclbin bakes scale=1)
+            for (int iq = 0; iq < NQ; iq++) {
+                const float * qr = (const float *) ((const char *) q->data + iq * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]);
+                for (int dd = 0; dd < DK; dd++) fk->Q_map[iq * DK + dd] = ggml_fp32_to_bf16(scale * qr[dd]);
+            }
+            // K/V/mask packed per block
+            for (int b = 0; b < fk->NBLK; b++) {
+                ggml_bf16_t * blk = fk->KV_map + (size_t) b * blk_elems;
+                for (int ic = 0; ic < FLASH_BLK; ic++) {
+                    const int kv = b * FLASH_BLK + ic;
+                    const void * kp = (const char *) k->data + kv * k->nb[1] + (h / rk2) * k->nb[2] + (i3 / rk3) * k->nb[3];
+                    const void * vp = (const char *) v->data + kv * v->nb[1] + (h / rv2) * v->nb[2] + (i3 / rv3) * v->nb[3];
+                    deq_row(ttk, k->type, kp, krow.data(), DK);
+                    deq_row(ttv, v->type, vp, vrow.data(), DV);
+                    for (int dd = 0; dd < DK; dd++) blk[ic * DK + dd]               = ggml_fp32_to_bf16(krow[dd]);
+                    for (int dd = 0; dd < DV; dd++) blk[FLASH_BLK * DK + ic * DV + dd] = ggml_fp32_to_bf16(vrow[dd]);
+                }
+                ggml_bf16_t * mblk = blk + 2 * FLASH_BLK * DK;
+                for (int iq = 0; iq < NQ; iq++) {
+                    if (mask) {
+                        const ggml_fp16_t * mr = (const ggml_fp16_t *) ((const char *) mask->data +
+                                                 iq * mask->nb[1] + (i3 % mask->ne[3]) * mask->nb[3]);
+                        for (int ic = 0; ic < FLASH_BLK; ic++) {
+                            mblk[iq * FLASH_BLK + ic] = ggml_fp32_to_bf16(ggml_fp16_to_fp32(mr[b * FLASH_BLK + ic]));
+                        }
+                    } else {
+                        for (int ic = 0; ic < FLASH_BLK; ic++) mblk[iq * FLASH_BLK + ic] = ggml_fp32_to_bf16(0.0f);
+                    }
+                }
+            }
+            fk->boQ.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            fk->boKV.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto run = fk->kernel(RUN_OPCODE, fk->bo_instr, fk->instr_words,
+                                  fk->boQ, fk->boKV, fk->boO, fk->dummy[0], fk->dummy[1]);
+            run.wait();
+            fk->boO.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            // O_map[iq*DV+dv] -> dst[dv, h, iq, i3]  (dst = [DV, NH, NQ, NB])
+            for (int iq = 0; iq < NQ; iq++)
+                for (int dv = 0; dv < DV; dv++)
+                    d[dv + DV * (h + NH * (iq + NQ * i3))] = fk->O_map[iq * DV + dv];
+        }
+        if (std::getenv("GGML_XDNA_DEBUG")) {
+            fprintf(stderr, "[xdna] ran flash_attn %dx%dx%d (heads=%d) on NPU\n", NQ, DK, NKV, NH);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 #else // !GGML_XDNA_HAS_XRT
 
 bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t) {
+    return false;
+}
+
+bool ggml_xdna_npu_try_flash(const struct ggml_tensor *, const struct ggml_tensor *, const struct ggml_tensor *,
+                             const struct ggml_tensor *, struct ggml_tensor *, float) {
     return false;
 }
 
