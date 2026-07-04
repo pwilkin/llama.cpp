@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #ifndef _WIN32
 #    include <unistd.h>
@@ -94,6 +95,46 @@ static void ggml_backend_xdna_compute_unary(ggml_tensor * dst) {
     }
 }
 
+// dst = mul_mat(a, b): dst[n,m] = sum_k a(k,n) * b(k,m). Try the NPU; if there
+// is no xclbin for this shape, fall back to a host matmul so the op is always
+// correct (a is dequantized to f32 for the fallback).
+static void ggml_backend_xdna_compute_mul_mat(ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    if (ggml_xdna_npu_try_mul_mat(a, b, dst)) {
+        return; // ran on the NPU
+    }
+
+    // host fallback
+    const int64_t K = a->ne[0];
+    const int64_t N = a->ne[1];
+    const int64_t M = b->ne[1];
+
+    const float * bf = (const float *) b->data;
+    float *       df = (float *)       dst->data;
+
+    const float * af;
+    std::vector<float> adeq;
+    if (a->type == GGML_TYPE_F32) {
+        af = (const float *) a->data;
+    } else {
+        adeq.resize((size_t) K * N);
+        ggml_get_type_traits(a->type)->to_float(a->data, adeq.data(), (int64_t) K * N);
+        af = adeq.data();
+    }
+
+    for (int64_t m = 0; m < M; m++) {
+        for (int64_t n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; k++) {
+                acc += af[k + n * K] * bf[k + m * K];
+            }
+            df[n + m * N] = acc;
+        }
+    }
+}
+
 // ---- backend (stream) ------------------------------------------------------
 
 static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
@@ -118,6 +159,10 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
         switch (node->op) {
             case GGML_OP_UNARY:
                 ggml_backend_xdna_compute_unary(node);
+                break;
+
+            case GGML_OP_MUL_MAT:
+                ggml_backend_xdna_compute_mul_mat(node);
                 break;
 
             case GGML_OP_NONE:
@@ -264,6 +309,27 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op) &&
                    ggml_backend_xdna_supports_unary(ggml_get_unary_op(op));
+
+        case GGML_OP_MUL_MAT: {
+            const struct ggml_tensor * a = op->src[0]; // weights [K,N]
+            const struct ggml_tensor * b = op->src[1]; // activations [K,M]
+            if (op->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) {
+                return false; // 2D only for now
+            }
+            if (b->ne[0] != a->ne[0] || !ggml_is_contiguous(b)) {
+                return false;
+            }
+            // inner tile 32, and the ping-pong runtime needs M_div_m even, so
+            // require M (b->ne[1]) a multiple of 64 and K,N multiples of 32.
+            if (b->ne[1] % 64 || a->ne[0] % 32 || a->ne[1] % 32) {
+                return false;
+            }
+            const struct ggml_type_traits * tt = ggml_get_type_traits(a->type);
+            return a->type == GGML_TYPE_F32 || (tt && tt->to_float);
+        }
 
         default:
             return false;

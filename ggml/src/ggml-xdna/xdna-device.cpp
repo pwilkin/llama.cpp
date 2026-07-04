@@ -74,11 +74,25 @@ struct op_kernel {
     xrt::bo         dummy[3]; // slots 5,6,7
 };
 
+// A loaded matmul, keyed by (M,K,N). A[M,K] and B[K,N] bf16 inputs, C[M,N] f32.
+struct mm_kernel {
+    xrt::hw_context ctx;
+    xrt::kernel     kernel;
+    xrt::bo         bo_instr;
+    unsigned        instr_words = 0;
+    xrt::bo         boA, boB, boC;
+    ggml_bf16_t *   A_map = nullptr;
+    ggml_bf16_t *   B_map = nullptr;
+    float *         C_map = nullptr;
+    xrt::bo         dummy[2]; // slots 6,7
+};
+
 struct npu_state {
     xrt::device            device;
     std::string            kdir;
     bool                   ok = false;
-    std::map<int, op_kernel> ops;
+    std::map<int, op_kernel>         ops;
+    std::map<std::string, mm_kernel> mms;
     std::mutex             mtx;
 
     npu_state() {
@@ -144,6 +158,49 @@ struct npu_state {
             return nullptr;
         }
     }
+
+    // load + cache the matmul xclbin for shape (M,K,N), or nullptr if not found
+    mm_kernel * get_matmul(int M, int K, int Nn) {
+        const std::string key = std::to_string(M) + "_" + std::to_string(K) + "_" + std::to_string(Nn);
+        auto it = mms.find(key);
+        if (it != mms.end()) {
+            return &it->second;
+        }
+        const std::string base = kdir + "/matmul_" + key;
+        const std::vector<uint32_t> instr = read_u32(base + "_insts.bin");
+        if (instr.empty()) {
+            return nullptr;
+        }
+        try {
+            xrt::xclbin xclbin(base + ".xclbin");
+            device.register_xclbin(xclbin);
+
+            mm_kernel k;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t),
+                                 xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            k.boA = xrt::bo(device, (size_t) M * K * sizeof(uint16_t),  xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.boB = xrt::bo(device, (size_t) K * Nn * sizeof(uint16_t), xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.boC = xrt::bo(device, (size_t) M * Nn * sizeof(float),    xrt::bo::flags::host_only, k.kernel.group_id(5));
+            k.A_map = k.boA.map<ggml_bf16_t *>();
+            k.B_map = k.boB.map<ggml_bf16_t *>();
+            k.C_map = k.boC.map<float *>();
+            for (int i = 0; i < 2; i++) {
+                k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(6 + i));
+            }
+
+            auto res = mms.emplace(key, std::move(k));
+            return &res.first->second;
+        } catch (...) {
+            return nullptr;
+        }
+    }
 };
 
 npu_state & npu() {
@@ -197,9 +254,73 @@ bool ggml_xdna_npu_try_unary(enum ggml_unary_op op, const float * src, float * d
     }
 }
 
+bool ggml_xdna_npu_try_mul_mat(const struct ggml_tensor * a, const struct ggml_tensor * b, struct ggml_tensor * dst) {
+    npu_state & N = npu();
+    if (!N.ok) {
+        return false;
+    }
+    // 2D only for now (no batched heads), f32 activations/output
+    if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) {
+        return false;
+    }
+    if (b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || b->ne[0] != a->ne[0]) {
+        return false;
+    }
+    const int K  = (int) a->ne[0];
+    const int Nn = (int) a->ne[1];
+    const int M  = (int) b->ne[1];
+
+    std::lock_guard<std::mutex> lock(N.mtx);
+    mm_kernel * k = N.get_matmul(M, K, Nn);
+    if (!k) {
+        return false;
+    }
+
+    try {
+        // A[M,K] = activations b (b is ggml [K,M]; b_data[m*K+k] == A[m*K+k])
+        ggml_fp32_to_bf16_row((const float *) b->data, k->A_map, (int64_t) M * K);
+
+        // B[K,N] (col-major N x K) = weights a, dequantized to f32 then bf16.
+        // Dequantized a is [K,N] row-major (a_f32[k+n*K]); that is exactly the
+        // N x K col-major layout the kernel wants (B[n*K+k]).
+        const auto * tt = ggml_get_type_traits(a->type);
+        if (a->type == GGML_TYPE_F32) {
+            ggml_fp32_to_bf16_row((const float *) a->data, k->B_map, (int64_t) K * Nn);
+        } else if (tt && tt->to_float) {
+            std::vector<float> adeq((size_t) K * Nn);
+            tt->to_float(a->data, adeq.data(), (int64_t) K * Nn);
+            ggml_fp32_to_bf16_row(adeq.data(), k->B_map, (int64_t) K * Nn);
+        } else {
+            return false;
+        }
+
+        k->boA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        k->boB.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto run = k->kernel(RUN_OPCODE, k->bo_instr, k->instr_words,
+                             k->boA, k->boB, k->boC, k->dummy[0], k->dummy[1]);
+        run.wait();
+
+        k->boC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        // C[M,N] f32 and dst [N,M] f32 share the linear layout: C[m*N+n] == dst[n+m*N]
+        std::memcpy(dst->data, k->C_map, (size_t) M * Nn * sizeof(float));
+
+        if (std::getenv("GGML_XDNA_DEBUG")) {
+            fprintf(stderr, "[xdna] ran mul_mat %dx%dx%d on NPU\n", M, K, Nn);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 #else // !GGML_XDNA_HAS_XRT
 
 bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t) {
+    return false;
+}
+
+bool ggml_xdna_npu_try_mul_mat(const struct ggml_tensor *, const struct ggml_tensor *, struct ggml_tensor *) {
     return false;
 }
 
