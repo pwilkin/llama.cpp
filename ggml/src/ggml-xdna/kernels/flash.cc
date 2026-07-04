@@ -70,34 +70,53 @@ extern "C" void xdna_flash_bf16(bfloat16 *restrict IN, bfloat16 *restrict O) {
         for (int iq = 0; iq < NQ; iq++) {
             const bfloat16 *restrict qr = Q + iq * DH;
 
-            // scores over the BLK keys of this block
-            float s[BLK];
-            float smax = -1e30f;
+            // scores over the BLK keys of this block (scalar dot, into bf16)
+            bfloat16 sc[BLK];
             for (int ic = 0; ic < BLK; ic++) {
                 const int k = b * BLK + ic;
                 const bfloat16 *restrict kr = K + k * DH;
                 float acc = 0.0f;
                 for (int d = 0; d < DH; d++) acc += (float) qr[d] * (float) kr[d];
-                acc = acc * ATTN_SCALE + (float) M[iq * KV + k];
-                s[ic] = acc;
-                if (acc > smax) smax = acc;
+                sc[ic] = (bfloat16) (acc * ATTN_SCALE + (float) M[iq * KV + k]);
             }
 
-            const float m_new = m[iq] > smax ? m[iq] : smax;
-            const float corr  = sexp2((m[iq] - m_new) * LOG2E);
-
-            float psum = 0.0f;
-            for (int ic = 0; ic < BLK; ic++) {
-                s[ic] = sexp2((s[ic] - m_new) * LOG2E);
-                psum += s[ic];
+            // vectorized block max
+            aie::vector<bfloat16, 16> vmax = aie::broadcast<bfloat16, 16>((bfloat16) -3.0e38f);
+            {
+                auto it = aie::cbegin_vector<16>(sc);
+                for (int j = 0; j < BLK; j += 16) vmax = aie::max(vmax, *it++);
             }
+            const float m_blk = aie::reduce_max(vmax);
+            const float m_new = m[iq] > m_blk ? m[iq] : m_blk;
+
+            // vectorized P = exp2((sc - m_new)*log2e), psum = sum
+            const aie::vector<bfloat16, 16> vmn    = aie::broadcast<bfloat16, 16>((bfloat16) m_new);
+            const aie::vector<bfloat16, 16> vlog2e = aie::broadcast<bfloat16, 16>((bfloat16) LOG2E);
+            bfloat16 P[BLK];
+            aie::accum<accfloat, 16> vsum;
+            vsum.from_vector(aie::zeros<float, 16>());
+            {
+                auto it = aie::cbegin_vector<16>(sc);
+                bfloat16 * po = P;
+                for (int j = 0; j < BLK; j += 16) {
+                    aie::vector<bfloat16, 16> xm = aie::sub(*it++, vmn);
+                    aie::accum<accfloat, 16>  s2 = aie::mul(xm, vlog2e);
+                    aie::vector<bfloat16, 16> e  = aie::exp2<bfloat16>(s2.to_vector<float>());
+                    aie::store_v(po, e);
+                    po += 16;
+                    vsum = aie::add(vsum, e);
+                }
+            }
+            const float psum = aie::reduce_add(vsum.to_vector<float>());
+
+            // cross-block correction (0 on the first block: running max is -inf)
+            const float corr = (m[iq] <= -1.0e29f) ? 0.0f : sexp2((m[iq] - m_new) * LOG2E);
             l[iq] = corr * l[iq] + psum;
 
-            // O = corr*O + P·V_block
             for (int d = 0; d < DH; d++) {
                 float ov = corr * Oacc[iq * DH + d];
                 for (int ic = 0; ic < BLK; ic++) {
-                    ov += s[ic] * (float) V[(b * BLK + ic) * DH + d];
+                    ov += (float) P[ic] * (float) V[(b * BLK + ic) * DH + d];
                 }
                 Oacc[iq * DH + d] = ov;
             }
