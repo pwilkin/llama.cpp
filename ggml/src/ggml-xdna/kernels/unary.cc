@@ -39,7 +39,34 @@ static inline aie::vector<bfloat16, V> vsigmoid(const aie::vector<bfloat16, V> &
     return aie::mul(t1, half);
 }
 
+// RMS norm over one TILE_N-element row: y = x / sqrt(mean(x^2) + eps).
+// The sum of squares is accumulated in fp32 (aie::mac -> accfloat) for accuracy;
+// only the final scale is bf16. eps is baked at compile time (RMS_EPS) — the
+// weight multiply is a separate ggml MUL, so this kernel is normalize-only.
+#ifndef RMS_EPS
+#    define RMS_EPS 1e-6f
+#endif
+
 extern "C" {
+
+void xdna_rms_norm_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
+    auto it_sq = aie::cbegin_vector<V>(a);
+    aie::accum<accfloat, V> ss;
+    ss.from_vector(aie::zeros<float, V>());
+    for (int i = 0; i < TILE_N; i += V) {
+        aie::vector<bfloat16, V> x = *it_sq++;
+        ss = aie::mac(ss, x, x); // ss += x*x  (fp32 accumulate)
+    }
+    const float mean  = aie::reduce_add(ss.to_vector<float>()) / (float) TILE_N;
+    const float scale = aie::invsqrt(mean + RMS_EPS);
+
+    aie::vector<bfloat16, V> sv = aie::broadcast<bfloat16, V>((bfloat16) scale);
+    auto it_in  = aie::cbegin_vector<V>(a);
+    auto it_out = aie::begin_vector<V>(c);
+    for (int i = 0; i < TILE_N; i += V) {
+        *it_out++ = aie::mul(*it_in++, sv).to_vector<bfloat16>();
+    }
+}
 
 void xdna_relu_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
     auto it_in  = aie::cbegin_vector<V>(a);

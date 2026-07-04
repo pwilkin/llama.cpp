@@ -9,7 +9,7 @@
 #        make relu       # just one op
 #        make clean
 
-OPS    := relu neg abs exp tanh sigmoid silu gelu gelu_quick
+OPS    := relu neg abs exp tanh sigmoid silu gelu gelu_quick rms_norm
 LENGTH ?= 4096
 TILE   ?= 1024
 
