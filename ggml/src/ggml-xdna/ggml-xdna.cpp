@@ -135,6 +135,54 @@ static void ggml_backend_xdna_compute_mul_mat(ggml_tensor * dst) {
     }
 }
 
+// RMS norm over each row of ne[0]: y = x / sqrt(mean(x^2) + eps). NPU kernel
+// bakes eps = 1e-6, so only that eps uses the NPU; otherwise host fallback.
+static void ggml_backend_xdna_compute_rms_norm(ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    float eps;
+    std::memcpy(&eps, dst->op_params, sizeof(float));
+
+    const int64_t ne0   = src->ne[0];
+    const int64_t nrows = ggml_nrows(src);
+    const float * s = (const float *) src->data;
+    float *       d = (float *)       dst->data;
+
+    if (eps == 1e-6f && ggml_xdna_npu_try_rows("rms_norm", (int) ne0, s, d, ne0 * nrows)) {
+        return;
+    }
+    for (int64_t r = 0; r < nrows; r++) {
+        const float * x = s + r * ne0;
+        float *       y = d + r * ne0;
+        double ss = 0.0;
+        for (int64_t i = 0; i < ne0; i++) ss += (double) x[i] * x[i];
+        const float sc = 1.0f / sqrtf((float) (ss / ne0) + eps);
+        for (int64_t i = 0; i < ne0; i++) y[i] = x[i] * sc;
+    }
+}
+
+// Plain softmax over each row of ne[0] (no mask, scale 1) — the eligible case.
+static void ggml_backend_xdna_compute_soft_max(ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    const int64_t ne0   = src->ne[0];
+    const int64_t nrows = ggml_nrows(src);
+    const float * s = (const float *) src->data;
+    float *       d = (float *)       dst->data;
+
+    if (ggml_xdna_npu_try_rows("softmax", (int) ne0, s, d, ne0 * nrows)) {
+        return;
+    }
+    for (int64_t r = 0; r < nrows; r++) {
+        const float * x = s + r * ne0;
+        float *       y = d + r * ne0;
+        float mx = -INFINITY;
+        for (int64_t i = 0; i < ne0; i++) mx = std::max(mx, x[i]);
+        double sum = 0.0;
+        for (int64_t i = 0; i < ne0; i++) { y[i] = expf(x[i] - mx); sum += y[i]; }
+        const float inv = 1.0f / (float) sum;
+        for (int64_t i = 0; i < ne0; i++) y[i] *= inv;
+    }
+}
+
 // ---- backend (stream) ------------------------------------------------------
 
 static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
@@ -163,6 +211,14 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
 
             case GGML_OP_MUL_MAT:
                 ggml_backend_xdna_compute_mul_mat(node);
+                break;
+
+            case GGML_OP_RMS_NORM:
+                ggml_backend_xdna_compute_rms_norm(node);
+                break;
+
+            case GGML_OP_SOFT_MAX:
+                ggml_backend_xdna_compute_soft_max(node);
                 break;
 
             case GGML_OP_NONE:
@@ -329,6 +385,24 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             }
             const struct ggml_type_traits * tt = ggml_get_type_traits(a->type);
             return a->type == GGML_TYPE_F32 || (tt && tt->to_float);
+        }
+
+        case GGML_OP_RMS_NORM:
+            // any eps handled (NPU for 1e-6, host fallback otherwise)
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+
+        case GGML_OP_SOFT_MAX: {
+            // only the plain case (no mask, unit scale, no ALiBi bias)
+            float scale = 1.0f, max_bias = 0.0f;
+            std::memcpy(&scale,    (const float *) op->op_params + 0, sizeof(float));
+            std::memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1] == nullptr && op->src[2] == nullptr && // no mask, no sinks
+                   scale == 1.0f && max_bias == 0.0f &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         }
 
         default:

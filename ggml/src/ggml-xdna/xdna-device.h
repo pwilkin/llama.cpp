@@ -20,6 +20,11 @@ bool ggml_xdna_npu_try_unary(enum ggml_unary_op op, const float * src, float * d
 // the op is otherwise unsupported, in which case the caller falls back.
 bool ggml_xdna_npu_try_mul_mat(const struct ggml_tensor * a, const struct ggml_tensor * b, struct ggml_tensor * dst);
 
+// Per-row reduction (op = "rms_norm" | "softmax"): applies the kernel to each
+// contiguous row of `row_len` elements over the flat `src`/`dst` of `n` total
+// elements. Uses <op>_<row_len>.xclbin. Returns false if unavailable.
+bool ggml_xdna_npu_try_rows(const char * op, int row_len, const float * src, float * dst, int64_t n);
+
 #ifdef __cplusplus
 }
 #endif

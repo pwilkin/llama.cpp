@@ -92,8 +92,44 @@ struct npu_state {
     std::string            kdir;
     bool                   ok = false;
     std::map<int, op_kernel>         ops;
+    std::map<std::string, op_kernel> named; // reductions etc., keyed by xclbin base name
     std::map<std::string, mm_kernel> mms;
     std::mutex             mtx;
+
+    // load + cache a 1-in/1-out kernel by xclbin base name (e.g. "rms_norm_1024")
+    op_kernel * get_named(const std::string & name) {
+        auto it = named.find(name);
+        if (it != named.end()) {
+            return &it->second;
+        }
+        const std::vector<uint32_t> instr = read_u32(kdir + "/" + name + "_insts.bin");
+        if (instr.empty()) {
+            return nullptr;
+        }
+        try {
+            xrt::xclbin xclbin(kdir + "/" + name + ".xclbin");
+            device.register_xclbin(xclbin);
+            op_kernel k;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t),
+                                 xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k.bo_in  = xrt::bo(device, sizeof(uint16_t) * KERNEL_LEN, xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.bo_out = xrt::bo(device, sizeof(uint16_t) * KERNEL_LEN, xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.in_map  = k.bo_in.map<ggml_bf16_t *>();
+            k.out_map = k.bo_out.map<ggml_bf16_t *>();
+            for (int i = 0; i < 3; i++) {
+                k.dummy[i] = xrt::bo(device, sizeof(uint16_t) * KERNEL_LEN, xrt::bo::flags::host_only, k.kernel.group_id(5 + i));
+            }
+            auto res = named.emplace(name, std::move(k));
+            return &res.first->second;
+        } catch (...) {
+            return nullptr;
+        }
+    }
 
     npu_state() {
         const char * d = std::getenv("GGML_XDNA_KERNELS");
@@ -314,6 +350,43 @@ bool ggml_xdna_npu_try_mul_mat(const struct ggml_tensor * a, const struct ggml_t
     }
 }
 
+bool ggml_xdna_npu_try_rows(const char * op, int row_len, const float * src, float * dst, int64_t n) {
+    npu_state & N = npu();
+    if (!N.ok) {
+        return false;
+    }
+    // rows must align to the kernel's tiles within a KERNEL_LEN run
+    if (row_len <= 0 || KERNEL_LEN % row_len != 0 || n % row_len != 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(N.mtx);
+    op_kernel * k = N.get_named(std::string(op) + "_" + std::to_string(row_len));
+    if (!k) {
+        return false;
+    }
+
+    try {
+        for (int64_t off = 0; off < n; off += KERNEL_LEN) {
+            const int64_t chunk = std::min<int64_t>(KERNEL_LEN, n - off);
+            const size_t  bytes = (size_t) chunk * sizeof(ggml_bf16_t);
+            ggml_fp32_to_bf16_row(src + off, k->in_map, chunk);
+            k->bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+            auto run = k->kernel(RUN_OPCODE, k->bo_instr, k->instr_words,
+                                 k->bo_in, k->bo_out, k->dummy[0], k->dummy[1], k->dummy[2]);
+            run.wait();
+            k->bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, 0);
+            ggml_bf16_to_fp32_row(k->out_map, dst + off, chunk);
+        }
+        if (std::getenv("GGML_XDNA_DEBUG")) {
+            fprintf(stderr, "[xdna] ran %s row=%d on NPU (n=%lld)\n", op, row_len, (long long) n);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 #else // !GGML_XDNA_HAS_XRT
 
 bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t) {
@@ -321,6 +394,10 @@ bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t
 }
 
 bool ggml_xdna_npu_try_mul_mat(const struct ggml_tensor *, const struct ggml_tensor *, struct ggml_tensor *) {
+    return false;
+}
+
+bool ggml_xdna_npu_try_rows(const char *, int, const float *, float *, int64_t) {
     return false;
 }
 
