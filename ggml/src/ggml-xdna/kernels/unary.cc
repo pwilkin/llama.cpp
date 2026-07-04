@@ -68,6 +68,44 @@ void xdna_rms_norm_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
     }
 }
 
+// Numerically-stable softmax over one TILE_N-element row:
+//   m = max(x);  e = exp(x - m);  y = e / sum(e)
+// exp is 2^(log2e*x) via aie::exp2; the sum accumulates in fp32.
+void xdna_softmax_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
+    const aie::vector<bfloat16, V> log2e = aie::broadcast<bfloat16, V>(1.44269504089f);
+
+    // pass 1: row max
+    auto it0 = aie::cbegin_vector<V>(a);
+    aie::vector<bfloat16, V> vmax = *it0;
+    for (int i = 0; i < TILE_N; i += V) {
+        vmax = aie::max(vmax, *it0++);
+    }
+    const bfloat16 rmax = aie::reduce_max(vmax);
+    const aie::vector<bfloat16, V> vm = aie::broadcast<bfloat16, V>(rmax);
+
+    // pass 2: e = exp(x - max) -> c, accumulate sum in fp32
+    auto it1 = aie::cbegin_vector<V>(a);
+    auto ot1 = aie::begin_vector<V>(c);
+    aie::accum<accfloat, V> vsum;
+    vsum.from_vector(aie::zeros<float, V>());
+    for (int i = 0; i < TILE_N; i += V) {
+        aie::vector<bfloat16, V> xm = aie::sub(*it1++, vm);
+        aie::accum<accfloat, V>  s  = aie::mul(xm, log2e);
+        aie::vector<bfloat16, V> e  = aie::exp2<bfloat16>(s.to_vector<float>());
+        *ot1++ = e;
+        vsum = aie::add(vsum, e); // accumulate exp in fp32
+    }
+    const float sum = aie::reduce_add(vsum.to_vector<float>());
+    const aie::vector<bfloat16, V> vinv = aie::broadcast<bfloat16, V>((bfloat16) aie::inv(sum));
+
+    // pass 3: normalize c *= 1/sum
+    auto it2 = aie::cbegin_vector<V>(c);
+    auto ot2 = aie::begin_vector<V>(c);
+    for (int i = 0; i < TILE_N; i += V) {
+        *ot2++ = aie::mul(*it2++, vinv).to_vector<bfloat16>();
+    }
+}
+
 void xdna_relu_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
     auto it_in  = aie::cbegin_vector<V>(a);
     auto it_out = aie::begin_vector<V>(c);

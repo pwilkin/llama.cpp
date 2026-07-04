@@ -33,6 +33,7 @@ OPS = {
     "gelu_quick": "xdna_gelu_quick_bf16",
     # reduction kernel (row length = --tile); one xclbin per row size
     "rms_norm":   "xdna_rms_norm_bf16",
+    "softmax":    "xdna_softmax_bf16",
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
