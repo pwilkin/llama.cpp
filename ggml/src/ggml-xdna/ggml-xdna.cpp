@@ -6,6 +6,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #ifndef _WIN32
@@ -115,13 +117,25 @@ static void ggml_backend_xdna_compute_mul_mat(ggml_tensor * dst) {
     float *       df = (float *)       dst->data;
 
     const float * af;
-    std::vector<float> adeq;
     if (a->type == GGML_TYPE_F32) {
         af = (const float *) a->data;
     } else {
-        adeq.resize((size_t) K * N);
-        ggml_get_type_traits(a->type)->to_float(a->data, adeq.data(), (int64_t) K * N);
-        af = adeq.data();
+        // Weights are constant across calls, so dequantize once and cache by data
+        // pointer. This is only the host-fallback path (shapes without an xclbin);
+        // it keeps whole-model runs on XDNA tolerable while ops migrate to the NPU.
+        static std::unordered_map<const void *, std::vector<float>> cache;
+        static std::mutex cache_mtx;
+        std::vector<float> * slot;
+        {
+            std::lock_guard<std::mutex> lk(cache_mtx);
+            auto it = cache.find(a->data);
+            if (it == cache.end()) {
+                it = cache.emplace(a->data, std::vector<float>((size_t) K * N)).first;
+                ggml_get_type_traits(a->type)->to_float(a->data, it->second.data(), (int64_t) K * N);
+            }
+            slot = &it->second; // node storage is stable; safe to use after unlock
+        }
+        af = slot->data();
     }
 
     for (int64_t m = 0; m < M; m++) {
