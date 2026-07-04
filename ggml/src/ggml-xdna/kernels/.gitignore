@@ -1,0 +1,6 @@
+# build outputs and local toolchain
+build/
+.aie-venv
+*.o
+*.xclbin
+*.mlir
