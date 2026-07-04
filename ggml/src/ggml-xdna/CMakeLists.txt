@@ -1,5 +1,6 @@
 ggml_add_backend_library(ggml-xdna
-                         ggml-xdna.cpp)
+                         ggml-xdna.cpp
+                         xdna-device.cpp)
 
 # AMD XDNA / Ryzen AI NPU userspace runtime (XRT + the amdxdna driver).
 #
@@ -9,7 +10,7 @@ ggml_add_backend_library(ggml-xdna
 # (GGML_XDNA_HAS_XRT) that real AIE `.xclbin` kernels will use.
 find_path(XRT_INCLUDE_DIR
     NAMES xrt/xrt_device.h
-    PATHS /opt/xilinx/xrt/include $ENV{XILINX_XRT}/include)
+    PATHS /opt/xilinx/xrt/include $ENV{XILINX_XRT}/include /usr/include)
 
 find_library(XRT_COREUTIL
     NAMES xrt_coreutil

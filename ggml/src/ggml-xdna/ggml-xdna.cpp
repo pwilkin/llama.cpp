@@ -1,4 +1,5 @@
 #include "ggml-xdna.h"
+#include "xdna-device.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -82,6 +83,11 @@ static void ggml_backend_xdna_compute_unary(ggml_tensor * dst) {
     const float * s = (const float *) src->data;
     float *       d = (float *)       dst->data;
     const int64_t n = ggml_nelements(dst);
+
+    // try the NPU (XRT + .xclbin) first; fall back to the host kernel otherwise
+    if (ggml_xdna_npu_try_unary(op, s, d, n)) {
+        return;
+    }
 
     for (int64_t i = 0; i < n; i++) {
         d[i] = ggml_backend_xdna_unary_f32(op, s[i]);
