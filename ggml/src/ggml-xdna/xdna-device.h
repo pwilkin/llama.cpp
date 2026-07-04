@@ -25,6 +25,10 @@ bool ggml_xdna_npu_try_mul_mat(const struct ggml_tensor * a, const struct ggml_t
 // elements. Uses <op>_<row_len>.xclbin. Returns false if unavailable.
 bool ggml_xdna_npu_try_rows(const char * op, int row_len, const float * src, float * dst, int64_t n);
 
+// Elementwise binary (op = "add" | "mul"): c = a (op) b over n elements. The
+// caller must pre-broadcast b to full size. Returns false if unavailable.
+bool ggml_xdna_npu_try_binary(const char * op, const float * a, const float * b, float * c, int64_t n);
+
 #ifdef __cplusplus
 }
 #endif

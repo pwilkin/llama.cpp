@@ -183,6 +183,33 @@ static void ggml_backend_xdna_compute_soft_max(ggml_tensor * dst) {
     }
 }
 
+// dst = a (op) b, elementwise with ggml broadcast of b. Same-shape contiguous
+// runs on the NPU; broadcast cases use a host fallback.
+static void ggml_backend_xdna_compute_binary(ggml_tensor * dst, const char * op, bool is_mul) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const float * af = (const float *) a->data;
+    const float * bf = (const float *) b->data;
+    float *       df = (float *)       dst->data;
+
+    if (ggml_are_same_shape(a, b) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+        ggml_xdna_npu_try_binary(op, af, bf, df, ggml_nelements(dst))) {
+        return;
+    }
+
+    // host fallback with broadcast (contiguous)
+    const int64_t ne0 = dst->ne[0], ne1 = dst->ne[1], ne2 = dst->ne[2], ne3 = dst->ne[3];
+    for (int64_t i3 = 0; i3 < ne3; i3++)
+    for (int64_t i2 = 0; i2 < ne2; i2++)
+    for (int64_t i1 = 0; i1 < ne1; i1++)
+    for (int64_t i0 = 0; i0 < ne0; i0++) {
+        const int64_t di = i0 + ne0 * (i1 + ne1 * (i2 + ne2 * i3));
+        const int64_t bi = (i0 % b->ne[0]) + b->ne[0] * ((i1 % b->ne[1]) +
+                            b->ne[1] * ((i2 % b->ne[2]) + b->ne[2] * (i3 % b->ne[3])));
+        df[di] = is_mul ? af[di] * bf[bi] : af[di] + bf[bi];
+    }
+}
+
 // ---- backend (stream) ------------------------------------------------------
 
 static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
@@ -219,6 +246,14 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
 
             case GGML_OP_SOFT_MAX:
                 ggml_backend_xdna_compute_soft_max(node);
+                break;
+
+            case GGML_OP_MUL:
+                ggml_backend_xdna_compute_binary(node, "mul", true);
+                break;
+
+            case GGML_OP_ADD:
+                ggml_backend_xdna_compute_binary(node, "add", false);
                 break;
 
             case GGML_OP_NONE:
@@ -386,6 +421,14 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             const struct ggml_type_traits * tt = ggml_get_type_traits(a->type);
             return a->type == GGML_TYPE_F32 || (tt && tt->to_float);
         }
+
+        case GGML_OP_MUL:
+        case GGML_OP_ADD:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) && ggml_can_repeat(op->src[1], op->src[0]);
 
         case GGML_OP_RMS_NORM:
             // any eps handled (NPU for 1e-6, host fallback otherwise)
