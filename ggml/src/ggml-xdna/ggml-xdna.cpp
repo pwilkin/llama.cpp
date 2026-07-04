@@ -210,6 +210,29 @@ static void ggml_backend_xdna_compute_binary(ggml_tensor * dst, const char * op,
     }
 }
 
+// GET_ROWS: gather rows of the (possibly quantized) table `a` at indices `ids`
+// into f32 dst. A pure gather — no NPU compute benefit — done on the host, but
+// it keeps the op on this backend and exercises the all-quants dequantizer.
+static void ggml_backend_xdna_compute_get_rows(ggml_tensor * dst) {
+    const ggml_tensor * a   = dst->src[0]; // table [ne0, n_rows, ...]
+    const ggml_tensor * ids = dst->src[1]; // i32 indices
+    const int64_t ne0  = a->ne[0];
+    const int64_t nids = ggml_nelements(ids);
+    const struct ggml_type_traits * tt = ggml_get_type_traits(a->type);
+    float * d = (float *) dst->data;
+
+    for (int64_t i = 0; i < nids; i++) {
+        const int32_t row = ((const int32_t *) ids->data)[i];
+        const void *  src = (const char *) a->data + row * a->nb[1];
+        float *       out = d + i * ne0;
+        if (a->type == GGML_TYPE_F32) {
+            std::memcpy(out, src, ne0 * sizeof(float));
+        } else {
+            tt->to_float(src, out, ne0);
+        }
+    }
+}
+
 // ---- backend (stream) ------------------------------------------------------
 
 static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
@@ -254,6 +277,10 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
 
             case GGML_OP_ADD:
                 ggml_backend_xdna_compute_binary(node, "add", false);
+                break;
+
+            case GGML_OP_GET_ROWS:
+                ggml_backend_xdna_compute_get_rows(node);
                 break;
 
             case GGML_OP_NONE:
@@ -429,6 +456,15 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                    op->src[1]->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    ggml_is_contiguous(op) && ggml_can_repeat(op->src[1], op->src[0]);
+
+        case GGML_OP_GET_ROWS: {
+            const struct ggml_tensor * a   = op->src[0];
+            const struct ggml_tensor * ids = op->src[1];
+            const struct ggml_type_traits * tt = ggml_get_type_traits(a->type);
+            return op->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+                   ids->ne[1] == 1 && ids->ne[2] == 1 && // 1-D index list
+                   (a->type == GGML_TYPE_F32 || (tt && tt->to_float));
+        }
 
         case GGML_OP_RMS_NORM:
             // any eps handled (NPU for 1e-6, host fallback otherwise)
