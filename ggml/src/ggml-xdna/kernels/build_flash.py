@@ -37,7 +37,9 @@ def build_module(NQ, DH, BLK, NBLK, scale):
         inp.release(1)
         o.release(1)
 
-    worker = Worker(core_fn, [ofIN.cons(), ofO.prod(), flash], stack_size=0x1000)
+    # stack must hold the fp32 state arrays (Oacc[NQ*DH], m/l[NQ]) — NQ*DH floats
+    # alone is several KB, so give it generous room or the core stack overflows.
+    worker = Worker(core_fn, [ofIN.cons(), ofO.prod(), flash], stack_size=0x6000)
 
     rt = Runtime()
     with rt.sequence(in_ty, o_ty) as (IN, O):

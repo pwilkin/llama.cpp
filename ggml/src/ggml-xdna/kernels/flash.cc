@@ -15,6 +15,12 @@
 // Layout (packed into one input buffer): [ Q(NQ*DH) | K(NBLK*BLK*DH) |
 // V(NBLK*BLK*DH) | mask(NQ*NBLK*BLK) ]. Output O[NQ*DH]. bf16 in/out, fp32 accum.
 //
+// Validated on RyzenAI-npu5 (NQ=16,DH=64,BLK=16,NBLK=2, causal mask): matches the
+// CPU reference, 0/1024 elements off. NOTE: the fp32 state arrays (Oacc[NQ*DH],
+// m/l[NQ]) live on the core stack, so the IRON Worker stack_size must be large
+// enough to hold them (build_flash.py sets 0x6000) — too small silently corrupts
+// the running softmax state (the bug that took the longest to find).
+//
 //===----------------------------------------------------------------------===//
 
 #include <aie_api/aie.hpp>
@@ -41,16 +47,6 @@ using namespace aie;
 static constexpr int  KV  = NBLK * BLK;
 static constexpr float LOG2E = 1.44269504089f;
 
-// scalar exp2 via a length-1 lane of a broadcast vector (no scalar exp on AIE;
-// exp2 on XDNA2 is bf16-output only). Clamp the argument: softmax args are <= 0,
-// and masked/first-block values are hugely negative — feeding those to the LUT
-// garbages out, so treat anything below the bf16 underflow point as 0.
-static inline float sexp2(float x) {
-    if (x <= -88.0f) return 0.0f;
-    aie::vector<bfloat16, 16> r = aie::exp2<bfloat16>(aie::broadcast<float, 16>(x));
-    return (float) r[0];
-}
-
 extern "C" void xdna_flash_bf16(bfloat16 *restrict IN, bfloat16 *restrict O) {
     bfloat16 *restrict Q = IN;
     bfloat16 *restrict K = IN + NQ * DH;
@@ -71,7 +67,7 @@ extern "C" void xdna_flash_bf16(bfloat16 *restrict IN, bfloat16 *restrict O) {
             const bfloat16 *restrict qr = Q + iq * DH;
 
             // scores over the BLK keys of this block (scalar dot, into bf16)
-            bfloat16 sc[BLK];
+            alignas(32) bfloat16 sc[BLK];
             for (int ic = 0; ic < BLK; ic++) {
                 const int k = b * BLK + ic;
                 const bfloat16 *restrict kr = K + k * DH;
@@ -92,7 +88,7 @@ extern "C" void xdna_flash_bf16(bfloat16 *restrict IN, bfloat16 *restrict O) {
             // vectorized P = exp2((sc - m_new)*log2e), psum = sum
             const aie::vector<bfloat16, 16> vmn    = aie::broadcast<bfloat16, 16>((bfloat16) m_new);
             const aie::vector<bfloat16, 16> vlog2e = aie::broadcast<bfloat16, 16>((bfloat16) LOG2E);
-            bfloat16 P[BLK];
+            alignas(32) bfloat16 P[BLK];
             aie::accum<accfloat, 16> vsum;
             vsum.from_vector(aie::zeros<float, 16>());
             {
@@ -109,8 +105,15 @@ extern "C" void xdna_flash_bf16(bfloat16 *restrict IN, bfloat16 *restrict O) {
             }
             const float psum = aie::reduce_add(vsum.to_vector<float>());
 
-            // cross-block correction (0 on the first block: running max is -inf)
-            const float corr = (m[iq] <= -1.0e29f) ? 0.0f : sexp2((m[iq] - m_new) * LOG2E);
+            // cross-block correction exp(m_old - m_new), via the SAME accum ->
+            // exp2 path as the scores (0 on the first block: running max is -inf)
+            float corr = 0.0f;
+            if (m[iq] > -1.0e29f) {
+                aie::vector<bfloat16, 16> dv = aie::broadcast<bfloat16, 16>((bfloat16) (m[iq] - m_new));
+                aie::accum<accfloat, 16>  da = aie::mul(dv, vlog2e);
+                aie::vector<bfloat16, 16> ce = aie::exp2<bfloat16>(da.to_vector<float>());
+                corr = (float) ce[0];
+            }
             l[iq] = corr * l[iq] + psum;
 
             for (int d = 0; d < DH; d++) {
