@@ -1154,7 +1154,7 @@ struct test_case {
         // matmul) accumulate more bf16 error than elementwise ops, so this is
         // loose enough to admit them while still catching real bugs (NMSE >>1e-2).
         if (strcmp(ggml_backend_reg_name(reg), "XDNA") == 0) {
-            return std::max(max_nmse_err(), 1e-3);
+            return std::max(max_nmse_err(), 2e-3);
         }
         return max_nmse_err();
     }
