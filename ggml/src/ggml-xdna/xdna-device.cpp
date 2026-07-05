@@ -173,6 +173,21 @@ struct gemv_kernel {
     xrt::bo         dummy[2];
 };
 
+// A loaded NEOX rope kernel for (head_dim HD, rotary dims NDIMS). cos/sin @3
+// (bf16, host-precomputed), src head-rows @4, out @5. Processes NR rows/call.
+struct rope_kernel {
+    xrt::hw_context ctx;
+    xrt::kernel     kernel;
+    xrt::bo         bo_instr;
+    unsigned        instr_words = 0;
+    int             HD = 0, NDIMS = 0, NR = 0;
+    xrt::bo         bo_cs, bo_src, bo_out;
+    ggml_bf16_t *   cs_map  = nullptr;
+    ggml_bf16_t *   src_map = nullptr;
+    ggml_bf16_t *   out_map = nullptr;
+    xrt::bo         dummy[2];
+};
+
 // A loaded gated-delta-net kernel for a fixed head dim SV. params @3 (bf16),
 // state row-blocks @4 in / @5 out (bf16). One recurrent step per (head, seq).
 struct gdn_kernel {
@@ -232,7 +247,39 @@ struct npu_state {
     std::map<int, glu_kernel>           glus;   // keyed by NC (row width)
     std::map<int, umulti_kernel>        umultis; // multi-op unary (key 0)
     std::map<int, bmulti_kernel>        bmultis; // multi-op binary (key 0)
+    std::map<std::string, rope_kernel>  ropes;   // keyed by "HD_NDIMS"
     std::mutex             mtx;
+
+    // load + cache rope_<HD>_<NDIMS>.xclbin (NR=4)
+    rope_kernel * get_rope(int HD, int NDIMS) {
+        const std::string key = std::to_string(HD) + "_" + std::to_string(NDIMS);
+        auto it = ropes.find(key);
+        if (it != ropes.end()) return &it->second;
+        const std::string base = kdir + "/rope_" + key;
+        const std::vector<uint32_t> instr = read_u32(base + "_insts.bin");
+        if (instr.empty()) return nullptr;
+        try {
+            xrt::xclbin xclbin(base + ".xclbin");
+            device.register_xclbin(xclbin);
+            rope_kernel k;
+            k.HD = HD; k.NDIMS = NDIMS; k.NR = 4;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t), xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k.bo_cs  = xrt::bo(device, (size_t) NDIMS * sizeof(uint16_t),      xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.bo_src = xrt::bo(device, (size_t) k.NR * HD * sizeof(uint16_t),  xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.bo_out = xrt::bo(device, (size_t) k.NR * HD * sizeof(uint16_t),  xrt::bo::flags::host_only, k.kernel.group_id(5));
+            k.cs_map  = k.bo_cs.map<ggml_bf16_t *>();
+            k.src_map = k.bo_src.map<ggml_bf16_t *>();
+            k.out_map = k.bo_out.map<ggml_bf16_t *>();
+            for (int i = 0; i < 2; i++) k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(6 + i));
+            auto res = ropes.emplace(key, std::move(k));
+            return &res.first->second;
+        } catch (...) { return nullptr; }
+    }
 
     // load + cache binary_multi.xclbin
     bmulti_kernel * get_bmulti() {
@@ -1195,6 +1242,78 @@ bool ggml_xdna_npu_try_glu(struct ggml_tensor * dst) {
     }
 }
 
+bool ggml_xdna_npu_try_rope(struct ggml_tensor * dst) {
+    npu_state & N = npu();
+    if (!N.ok) {
+        return false;
+    }
+    const ggml_tensor * src = dst->src[0];
+    const ggml_tensor * pos = dst->src[1];
+    const int head_dim = (int) src->ne[0];
+    const int n_head   = (int) src->ne[1];
+    const int n_tokens = (int) src->ne[2];
+    const int n_dims   = ggml_get_op_params_i32(dst, 1);
+    float freq_base = 0.0f, freq_scale = 1.0f, ext_factor = 0.0f, attn_factor = 1.0f;
+    std::memcpy(&freq_base,   (const char *) dst->op_params + 5 * 4, 4);
+    std::memcpy(&freq_scale,  (const char *) dst->op_params + 6 * 4, 4);
+    std::memcpy(&ext_factor,  (const char *) dst->op_params + 7 * 4, 4);
+    std::memcpy(&attn_factor, (const char *) dst->op_params + 8 * 4, 4);
+
+    // decode step, head dim 256, n_rot 64, no yarn — matches rope_256_64.xclbin.
+    if (n_tokens != 1 || head_dim != 256 || n_dims != 64 || ext_factor != 0.0f) {
+        return false;
+    }
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        pos == nullptr || pos->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(N.mtx);
+    rope_kernel * rk = N.get_rope(head_dim, n_dims);
+    if (!rk) {
+        return false;
+    }
+    const int NR = rk->NR, nd2 = n_dims / 2;
+    try {
+        // host-precompute cos/sin for this token (imrope == NEOX for text)
+        const int32_t p = ((const int32_t *) pos->data)[0];
+        const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
+        for (int j = 0; j < nd2; j++) {
+            const float th = freq_scale * (float) p * std::pow(theta_scale, (float) j);
+            rk->cs_map[j]       = ggml_fp32_to_bf16(std::cos(th) * attn_factor);
+            rk->cs_map[nd2 + j] = ggml_fp32_to_bf16(std::sin(th) * attn_factor);
+        }
+        rk->bo_cs.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        for (int hb = 0; hb < n_head; hb += NR) {
+            const int nrows = std::min(NR, n_head - hb);
+            for (int r = 0; r < NR; r++) {
+                if (r < nrows) {
+                    const float * s = (const float *) ((const char *) src->data + (hb + r) * src->nb[1]);
+                    for (int i = 0; i < head_dim; i++) rk->src_map[r * head_dim + i] = ggml_fp32_to_bf16(s[i]);
+                } else {
+                    for (int i = 0; i < head_dim; i++) rk->src_map[r * head_dim + i] = ggml_fp32_to_bf16(0.0f);
+                }
+            }
+            rk->bo_src.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto run = rk->kernel(RUN_OPCODE, rk->bo_instr, rk->instr_words,
+                                  rk->bo_cs, rk->bo_src, rk->bo_out, rk->dummy[0], rk->dummy[1]);
+            run.wait();
+            rk->bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            for (int r = 0; r < nrows; r++) {
+                float * d = (float *) ((char *) dst->data + (hb + r) * dst->nb[1]);
+                for (int i = 0; i < head_dim; i++) d[i] = ggml_bf16_to_fp32(rk->out_map[r * head_dim + i]);
+            }
+        }
+        if (std::getenv("GGML_XDNA_DEBUG")) {
+            fprintf(stderr, "[xdna] ran rope hd=%d nrot=%d heads=%d on NPU\n", head_dim, n_dims, n_head);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 #else // !GGML_XDNA_HAS_XRT
 
 bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t) {
@@ -1202,6 +1321,10 @@ bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t
 }
 
 bool ggml_xdna_npu_try_gdn(struct ggml_tensor *) {
+    return false;
+}
+
+bool ggml_xdna_npu_try_rope(struct ggml_tensor *) {
     return false;
 }
 

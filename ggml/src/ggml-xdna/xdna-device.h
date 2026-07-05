@@ -50,6 +50,10 @@ bool ggml_xdna_npu_try_ssm_conv(struct ggml_tensor * dst);
 // multiple of 1024 and a matching swiglu_<NC>.xclbin.
 bool ggml_xdna_npu_try_glu(struct ggml_tensor * dst);
 
+// NEOX rotary embedding on the NPU (host precomputes cos/sin). Handles the decode
+// case (n_tokens==1, head dim 256, n_rot 64, no yarn) via a rope_<HD>_<NDIMS>.xclbin.
+bool ggml_xdna_npu_try_rope(struct ggml_tensor * dst);
+
 #ifdef __cplusplus
 }
 #endif

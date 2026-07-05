@@ -417,6 +417,12 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
                 }
                 break;
 
+            case GGML_OP_ROPE:
+                if (!ggml_xdna_npu_try_rope(node)) {
+                    GGML_ABORT("%s: rope has no host fallback\n", __func__);
+                }
+                break;
+
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
             case GGML_OP_VIEW:
@@ -546,6 +552,14 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
     GGML_UNUSED(max_tensor_size);
 }
 
+// Ops with NO host fallback (they GGML_ABORT if the xclbin is missing) must only
+// be claimed when the NPU kernels are actually deployed; otherwise leave them to
+// the CPU backend. Deployment is signalled by GGML_XDNA_KERNELS.
+static bool ggml_xdna_strict_ok() {
+    const char * k = std::getenv("GGML_XDNA_KERNELS");
+    return k && k[0];
+}
+
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_NONE:
@@ -628,7 +642,8 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             // fallback, so this must be strict).
             const struct ggml_tensor * v = op->src[2];
             const struct ggml_tensor * g = op->src[3];
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+            return ggml_xdna_strict_ok() &&
+                   op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[5]->type == GGML_TYPE_F32 &&
                    v->ne[0] == 128 && v->ne[2] == 1 &&
                    (g->ne[0] == 1 || g->ne[0] == v->ne[0]);
@@ -639,7 +654,8 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             // ssm_conv xclbin block). Strict — no host fallback.
             const struct ggml_tensor * ci = op->src[0];
             const struct ggml_tensor * w  = op->src[1];
-            return op->type == GGML_TYPE_F32 && ci->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+            return ggml_xdna_strict_ok() &&
+                   op->type == GGML_TYPE_F32 && ci->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
                    op->ne[1] == 1 && w->ne[0] == 4 && ci->ne[0] == 4 && (ci->ne[1] % 256) == 0;
         }
 
@@ -654,12 +670,27 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                    op->src[0]->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
 
+        case GGML_OP_ROPE: {
+            // decode NEOX/imrope, head dim 256, n_rot 64, no yarn — matches
+            // rope_256_64.xclbin and ggml_xdna_npu_try_rope (no host fallback).
+            const struct ggml_tensor * src = op->src[0];
+            const struct ggml_tensor * pos = op->src[1];
+            float ext_factor = 0.0f;
+            std::memcpy(&ext_factor, (const char *) op->op_params + 7 * 4, 4);
+            return ggml_xdna_strict_ok() &&
+                   op->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32 &&
+                   pos != nullptr && pos->type == GGML_TYPE_I32 &&
+                   src->ne[0] == 256 && src->ne[2] == 1 &&
+                   ggml_get_op_params_i32(op, 1) == 64 && ext_factor == 0.0f;
+        }
+
         case GGML_OP_GLU: {
             // swiglu, 2-input (silu(gate)*up), not swapped, row width % 1024,
             // f32 — strict (no host fallback). Matches ggml_xdna_npu_try_glu.
             const struct ggml_tensor * gate = op->src[0];
             const struct ggml_tensor * up   = op->src[1];
-            return ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU &&
+            return ggml_xdna_strict_ok() &&
+                   ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU &&
                    ggml_get_op_params_i32(op, 1) == 0 && // not swapped
                    up != nullptr && op->type == GGML_TYPE_F32 &&
                    gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 &&
