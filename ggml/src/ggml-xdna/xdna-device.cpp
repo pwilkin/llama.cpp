@@ -329,6 +329,9 @@ struct npu_state {
             for (int i = 0; i < 2; i++) k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(6 + i));
             auto res = flashes.emplace(key, std::move(k));
             return &res.first->second;
+        } catch (const std::exception & e) {
+            if (std::getenv("GGML_XDNA_FLASHDBG")) fprintf(stderr, "[xdna] get_flash threw: %s\n", e.what());
+            return nullptr;
         } catch (...) { return nullptr; }
     }
 
@@ -749,6 +752,10 @@ bool ggml_xdna_npu_try_flash(const struct ggml_tensor * q, const struct ggml_ten
     const int NH  = (int) q->ne[2];
     const int NB  = (int) q->ne[3];
     const int NKV = (int) k->ne[1];
+    if (std::getenv("GGML_XDNA_FLASHDBG")) {
+        fprintf(stderr, "[xdna] flash req NQ=%d DK=%d DV=%d NKV=%d NH=%d kt=%d vt=%d\n",
+                NQ, DK, DV, NKV, NH, k->type, v->type);
+    }
     if (DK != DV || NKV % FLASH_BLK != 0) {
         return false;
     }
@@ -758,6 +765,7 @@ bool ggml_xdna_npu_try_flash(const struct ggml_tensor * q, const struct ggml_ten
     std::lock_guard<std::mutex> lock(N.mtx);
     flash_kernel * fk = N.get_flash(NQ, DK, NKV);
     if (!fk) {
+        if (std::getenv("GGML_XDNA_FLASHDBG")) fprintf(stderr, "[xdna] flash get_flash(%d,%d,%d) NULL\n", NQ, DK, NKV);
         return false;
     }
 
@@ -815,7 +823,11 @@ bool ggml_xdna_npu_try_flash(const struct ggml_tensor * q, const struct ggml_ten
             fprintf(stderr, "[xdna] ran flash_attn %dx%dx%d (heads=%d) on NPU\n", NQ, DK, NKV, NH);
         }
         return true;
+    } catch (const std::exception & e) {
+        if (std::getenv("GGML_XDNA_FLASHDBG")) fprintf(stderr, "[xdna] flash run threw: %s\n", e.what());
+        return false;
     } catch (...) {
+        if (std::getenv("GGML_XDNA_FLASHDBG")) fprintf(stderr, "[xdna] flash run threw unknown\n");
         return false;
     }
 }
