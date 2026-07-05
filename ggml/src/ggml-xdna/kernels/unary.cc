@@ -216,6 +216,41 @@ void xdna_silu_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
     }
 }
 
+// Multi-op unary: one xclbin serves several unary ops via a runtime op-code
+// (op[0]), branching once before the tile loop. Consolidates contexts (the NPU
+// caps concurrent hw-contexts). Codes: 0=silu 1=sigmoid 2=exp 3=neg 4=relu 5=tanh.
+void xdna_unary_multi(int32_t *restrict op, bfloat16 *restrict a, bfloat16 *restrict c) {
+    const int o = op[0];
+    const aie::vector<bfloat16, V> half  = aie::broadcast<bfloat16, V>(0.5f);
+    const aie::vector<bfloat16, V> one   = aie::broadcast<bfloat16, V>(1.0f);
+    const aie::vector<bfloat16, V> zero  = aie::broadcast<bfloat16, V>(0.0f);
+    const aie::vector<bfloat16, V> log2e = aie::broadcast<bfloat16, V>(1.44269504089f);
+    auto it_in  = aie::cbegin_vector<V>(a);
+    auto it_out = aie::begin_vector<V>(c);
+    if (o == 0) {          // silu
+        for (int i = 0; i < TILE_N; i += V) {
+            aie::vector<bfloat16, V> x = *it_in++;
+            *it_out++ = aie::mul(x, vsigmoid(x, half, one)).to_vector<bfloat16>();
+        }
+    } else if (o == 1) {   // sigmoid
+        for (int i = 0; i < TILE_N; i += V) *it_out++ = vsigmoid(*it_in++, half, one);
+    } else if (o == 2) {   // exp
+        for (int i = 0; i < TILE_N; i += V) {
+            aie::accum<accfloat, V> s = aie::mul(*it_in++, log2e);
+            *it_out++ = aie::exp2<bfloat16>(s.to_vector<float>());
+        }
+    } else if (o == 3) {   // neg
+        for (int i = 0; i < TILE_N; i += V) *it_out++ = aie::sub(zero, *it_in++);
+    } else if (o == 4) {   // relu
+        for (int i = 0; i < TILE_N; i += V) *it_out++ = aie::max(zero, *it_in++);
+    } else {               // tanh (o == 5)
+        for (int i = 0; i < TILE_N; i += V) {
+            aie::accum<accfloat, V> s = aie::mul(*it_in++, one);
+            *it_out++ = aie::tanh<bfloat16>(s.to_vector<float>());
+        }
+    }
+}
+
 void xdna_gelu_quick_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
     auto it_in  = aie::cbegin_vector<V>(a);
     auto it_out = aie::begin_vector<V>(c);

@@ -82,6 +82,34 @@ struct op_kernel {
     xrt::bo         dummy[3]; // slots 5,6,7
 };
 
+// Multi-op unary kernel (one hw-context for several unary ops). op-code @3 (int32),
+// in @4 / out @5 (bf16). Consolidates contexts against the NPU's context cap.
+struct umulti_kernel {
+    xrt::hw_context ctx;
+    xrt::kernel     kernel;
+    xrt::bo         bo_instr;
+    unsigned        instr_words = 0;
+    xrt::bo         bo_op, bo_in, bo_out;
+    int32_t *       op_map  = nullptr;
+    ggml_bf16_t *   in_map  = nullptr;
+    ggml_bf16_t *   out_map = nullptr;
+    xrt::bo         dummy[2]; // slots 6,7
+};
+
+// op-code for the multi-op unary xclbin, or -1 if not consolidated (falls back to
+// a per-op xclbin). Codes must match xdna_unary_multi in unary.cc.
+inline int unary_multi_code(enum ggml_unary_op op) {
+    switch (op) {
+        case GGML_UNARY_OP_SILU:    return 0;
+        case GGML_UNARY_OP_SIGMOID: return 1;
+        case GGML_UNARY_OP_EXP:     return 2;
+        case GGML_UNARY_OP_NEG:     return 3;
+        case GGML_UNARY_OP_RELU:    return 4;
+        case GGML_UNARY_OP_TANH:    return 5;
+        default:                    return -1;
+    }
+}
+
 // A loaded matmul, keyed by (M,K,N). A[M,K] and B[K,N] bf16 inputs, C[M,N] f32.
 struct mm_kernel {
     xrt::hw_context ctx;
@@ -181,7 +209,37 @@ struct npu_state {
     std::map<int, gdn_kernel>           gdns;   // keyed by SV (head dim)
     std::map<int, conv_kernel>          convs;  // keyed by NC (channels)
     std::map<int, glu_kernel>           glus;   // keyed by NC (row width)
+    std::map<int, umulti_kernel>        umultis; // multi-op unary (key 0)
     std::mutex             mtx;
+
+    // load + cache unary_multi.xclbin (LENGTH=4096)
+    umulti_kernel * get_umulti() {
+        auto it = umultis.find(0);
+        if (it != umultis.end()) return &it->second;
+        const std::string base = kdir + "/unary_multi";
+        const std::vector<uint32_t> instr = read_u32(base + "_insts.bin");
+        if (instr.empty()) return nullptr;
+        try {
+            xrt::xclbin xclbin(base + ".xclbin");
+            device.register_xclbin(xclbin);
+            umulti_kernel k;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t), xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k.bo_op  = xrt::bo(device, 16 * sizeof(int32_t),              xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.bo_in  = xrt::bo(device, sizeof(uint16_t) * KERNEL_LEN,     xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.bo_out = xrt::bo(device, sizeof(uint16_t) * KERNEL_LEN,     xrt::bo::flags::host_only, k.kernel.group_id(5));
+            k.op_map  = k.bo_op.map<int32_t *>();
+            k.in_map  = k.bo_in.map<ggml_bf16_t *>();
+            k.out_map = k.bo_out.map<ggml_bf16_t *>();
+            for (int i = 0; i < 2; i++) k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(6 + i));
+            auto res = umultis.emplace(0, std::move(k));
+            return &res.first->second;
+        } catch (...) { return nullptr; }
+    }
 
     // load + cache swiglu_<NC>.xclbin (TILE=1024)
     glu_kernel * get_glu(int NC) {
@@ -529,6 +587,33 @@ bool ggml_xdna_npu_try_unary(enum ggml_unary_op op, const float * src, float * d
     }
 
     std::lock_guard<std::mutex> lock(N.mtx);
+
+    // consolidated multi-op unary path (one hw-context for several ops)
+    const int code = unary_multi_code(op);
+    if (code >= 0) {
+        umulti_kernel * u = N.get_umulti();
+        if (u) {
+            try {
+                u->op_map[0] = code;
+                u->bo_op.sync(XCL_BO_SYNC_BO_TO_DEVICE, sizeof(int32_t), 0);
+                for (int64_t off = 0; off < n; off += KERNEL_LEN) {
+                    const int64_t chunk = std::min<int64_t>(KERNEL_LEN, n - off);
+                    const size_t  bytes = (size_t) chunk * sizeof(ggml_bf16_t);
+                    ggml_fp32_to_bf16_row(src + off, u->in_map, chunk);
+                    u->bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+                    auto run = u->kernel(RUN_OPCODE, u->bo_instr, u->instr_words,
+                                         u->bo_op, u->bo_in, u->bo_out, u->dummy[0], u->dummy[1]);
+                    run.wait();
+                    u->bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, 0);
+                    ggml_bf16_to_fp32_row(u->out_map, dst + off, chunk);
+                }
+                if (std::getenv("GGML_XDNA_DEBUG")) {
+                    fprintf(stderr, "[xdna] ran %s on NPU (n=%lld, multi)\n", op_name(op), (long long) n);
+                }
+                return true;
+            } catch (...) { /* fall through to the per-op xclbin */ }
+        }
+    }
 
     op_kernel * k = N.get(op);
     if (!k) {
