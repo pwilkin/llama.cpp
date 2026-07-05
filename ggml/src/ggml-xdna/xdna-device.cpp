@@ -109,6 +109,20 @@ struct flash_kernel {
     xrt::bo         dummy[2];
 };
 
+// A loaded gemv kernel for a fixed (K, N). x @3 (bf16), W @4 (bf16, cached per
+// weight tensor), y @5 (fp32). Used for M=1 (decode) matmuls.
+struct gemv_kernel {
+    xrt::hw_context ctx;
+    xrt::kernel     kernel;
+    xrt::bo         bo_instr;
+    unsigned        instr_words = 0;
+    int             K = 0, N = 0;
+    xrt::bo         x_bo, y_bo;
+    ggml_bf16_t *   x_map = nullptr;
+    float *         y_map = nullptr;
+    xrt::bo         dummy[2];
+};
+
 struct npu_state {
     xrt::device            device;
     std::string            kdir;
@@ -118,7 +132,38 @@ struct npu_state {
     std::map<std::string, mm_kernel>  mms;
     std::map<std::string, mm_kernel>  bins;  // 2-in/1-out binary, keyed by op name
     std::map<std::string, flash_kernel> flashes;
+    std::map<std::string, gemv_kernel>  gemvs;
+    std::map<const void *, xrt::bo>     wcache; // per-weight bf16 W bo (gemv)
     std::mutex             mtx;
+
+    // load + cache gemv_<K>_<N>.xclbin
+    gemv_kernel * get_gemv(int K, int Nn) {
+        const std::string key = std::to_string(K) + "_" + std::to_string(Nn);
+        auto it = gemvs.find(key);
+        if (it != gemvs.end()) return &it->second;
+        const std::string base = kdir + "/gemv_" + key;
+        const std::vector<uint32_t> instr = read_u32(base + "_insts.bin");
+        if (instr.empty()) return nullptr;
+        try {
+            xrt::xclbin xclbin(base + ".xclbin");
+            device.register_xclbin(xclbin);
+            gemv_kernel k;
+            k.K = K; k.N = Nn;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t), xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k.x_bo = xrt::bo(device, (size_t) K  * sizeof(uint16_t), xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.y_bo = xrt::bo(device, (size_t) Nn * sizeof(float),    xrt::bo::flags::host_only, k.kernel.group_id(5));
+            k.x_map = k.x_bo.map<ggml_bf16_t *>();
+            k.y_map = k.y_bo.map<float *>();
+            for (int i = 0; i < 2; i++) k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(6 + i));
+            auto res = gemvs.emplace(key, std::move(k));
+            return &res.first->second;
+        } catch (...) { return nullptr; }
+    }
 
     // load + cache flash_<NQ>_<DK>_<NKV>.xclbin
     flash_kernel * get_flash(int NQ, int DK, int NKV) {
@@ -400,6 +445,48 @@ bool ggml_xdna_npu_try_mul_mat(const struct ggml_tensor * a, const struct ggml_t
     const int M  = (int) b->ne[1];
 
     std::lock_guard<std::mutex> lock(N.mtx);
+
+    // M=1 (decode) is gemv — the tiled matmul kernel needs M%64, so use the
+    // dedicated gemv kernel with a per-weight cached bf16 W buffer.
+    if (M == 1) {
+        gemv_kernel * g = N.get_gemv(K, Nn);
+        if (!g) {
+            return false;
+        }
+        try {
+            auto wit = N.wcache.find(a->data);
+            if (wit == N.wcache.end()) {
+                xrt::bo wbo(N.device, (size_t) Nn * K * sizeof(uint16_t), xrt::bo::flags::host_only, g->kernel.group_id(4));
+                ggml_bf16_t * wm = wbo.map<ggml_bf16_t *>();
+                const auto * tt = ggml_get_type_traits(a->type);
+                if (a->type == GGML_TYPE_F32) {
+                    ggml_fp32_to_bf16_row((const float *) a->data, wm, (int64_t) K * Nn);
+                } else if (tt && tt->to_float) {
+                    std::vector<float> adeq((size_t) K * Nn);
+                    tt->to_float(a->data, adeq.data(), (int64_t) K * Nn);
+                    ggml_fp32_to_bf16_row(adeq.data(), wm, (int64_t) K * Nn);
+                } else {
+                    return false;
+                }
+                wbo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                wit = N.wcache.emplace(a->data, std::move(wbo)).first;
+            }
+            ggml_fp32_to_bf16_row((const float *) b->data, g->x_map, (int64_t) K);
+            g->x_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto run = g->kernel(RUN_OPCODE, g->bo_instr, g->instr_words,
+                                 g->x_bo, wit->second, g->y_bo, g->dummy[0], g->dummy[1]);
+            run.wait();
+            g->y_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            std::memcpy(dst->data, g->y_map, (size_t) Nn * sizeof(float));
+            if (std::getenv("GGML_XDNA_DEBUG")) {
+                fprintf(stderr, "[xdna] ran gemv %dx%d on NPU\n", K, Nn);
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     mm_kernel * k = N.get_matmul(M, K, Nn);
     if (!k) {
         return false;

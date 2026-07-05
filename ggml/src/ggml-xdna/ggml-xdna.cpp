@@ -528,9 +528,14 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             if (b->ne[0] != a->ne[0] || !ggml_is_contiguous(b)) {
                 return false;
             }
-            // inner tile 32, and the ping-pong runtime needs M_div_m even, so
-            // require M (b->ne[1]) a multiple of 64 and K,N multiples of 32.
-            if (b->ne[1] % 64 || a->ne[0] % 32 || a->ne[1] % 32) {
+            // M=1 (decode) uses the gemv kernel (needs K%16); M>1 uses the tiled
+            // matmul, whose inner tile is 32 and ping-pong runtime needs M_div_m
+            // even, so require M%64 and K,N%32. Shapes without an xclbin still
+            // fall back to the (correct) host matmul.
+            if (a->ne[0] % 16) {
+                return false;
+            }
+            if (b->ne[1] != 1 && (b->ne[1] % 64 || a->ne[0] % 32 || a->ne[1] % 32)) {
                 return false;
             }
             const struct ggml_type_traits * tt = ggml_get_type_traits(a->type);
