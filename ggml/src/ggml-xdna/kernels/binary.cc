@@ -42,4 +42,19 @@ void xdna_mul_bf16(bfloat16 *restrict a, bfloat16 *restrict b, bfloat16 *restric
     }
 }
 
+// Multi-op binary: one xclbin serves mul/add via a runtime op-code (op[0]).
+// Both operands arrive packed in one input (ab = [a(TILE_N) | b(TILE_N)]) because
+// an AIE compute tile has only 2 input DMA channels (op + ab). Codes: 0=mul 1=add.
+void xdna_binary_multi(int32_t *restrict op, bfloat16 *restrict ab, bfloat16 *restrict c) {
+    const int o = op[0];
+    auto ia = aie::cbegin_vector<V>(ab);
+    auto ib = aie::cbegin_vector<V>(ab + TILE_N);
+    auto ic = aie::begin_vector<V>(c);
+    if (o == 0) {
+        for (int i = 0; i < TILE_N; i += V) *ic++ = aie::mul(*ia++, *ib++).to_vector<bfloat16>();
+    } else {
+        for (int i = 0; i < TILE_N; i += V) *ic++ = aie::add(*ia++, *ib++);
+    }
+}
+
 } // extern "C"
