@@ -37,6 +37,11 @@ bool ggml_xdna_npu_try_flash(const struct ggml_tensor * q, const struct ggml_ten
                              const struct ggml_tensor * v, const struct ggml_tensor * mask,
                              struct ggml_tensor * dst, float scale);
 
+// Fused gated-delta-net (linear attention) on the NPU, one recurrent step per
+// (head, seq). Handles the decode case (n_tokens==1, head dim 128, vector gate,
+// a matching gdn_<SV>.xclbin). Returns false otherwise for the host path.
+bool ggml_xdna_npu_try_gdn(struct ggml_tensor * dst);
+
 #ifdef __cplusplus
 }
 #endif

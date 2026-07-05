@@ -371,6 +371,12 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
                 ggml_backend_xdna_compute_flash_attn_ext(node);
                 break;
 
+            case GGML_OP_GATED_DELTA_NET:
+                if (!ggml_xdna_npu_try_gdn(node)) {
+                    GGML_ABORT("%s: gated_delta_net has no host fallback\n", __func__);
+                }
+                break;
+
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
             case GGML_OP_VIEW:
@@ -574,6 +580,18 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                    (mask == nullptr || mask->type == GGML_TYPE_F16) &&
                    (k->type == GGML_TYPE_F32 || (ttk && ttk->to_float)) &&
                    (v->type == GGML_TYPE_F32 || (ttv && ttv->to_float));
+        }
+
+        case GGML_OP_GATED_DELTA_NET: {
+            // decode step (n_tokens==1), head dim 128 (gdn_128.xclbin), vector
+            // gate, f32 inputs — matches ggml_xdna_npu_try_gdn exactly (no host
+            // fallback, so this must be strict).
+            const struct ggml_tensor * v = op->src[2];
+            const struct ggml_tensor * g = op->src[3];
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[5]->type == GGML_TYPE_F32 &&
+                   v->ne[0] == 128 && v->ne[2] == 1 &&
+                   (g->ne[0] == 1 || g->ne[0] == v->ne[0]);
         }
 
         case GGML_OP_RMS_NORM:

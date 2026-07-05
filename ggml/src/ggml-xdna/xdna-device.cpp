@@ -33,6 +33,7 @@ constexpr int      KERNEL_LEN   = 4096;
 constexpr uint64_t RUN_OPCODE   = 3; // "execute instruction sequence"
 constexpr char     KERNEL_NAME[] = "MLIR_AIE";
 constexpr int      FLASH_BLK    = 16; // KV block size the flash xclbins use
+constexpr int      GDN_R        = 16; // state rows per block the gdn xclbins use
 
 // dequantize one row of `n` elements of type `t` to f32
 inline void deq_row(const struct ggml_type_traits * tt, ggml_type t, const void * src, float * out, int64_t n) {
@@ -123,6 +124,21 @@ struct gemv_kernel {
     xrt::bo         dummy[2];
 };
 
+// A loaded gated-delta-net kernel for a fixed head dim SV. params @3 (bf16),
+// state row-blocks @4 in / @5 out (bf16). One recurrent step per (head, seq).
+struct gdn_kernel {
+    xrt::hw_context ctx;
+    xrt::kernel     kernel;
+    xrt::bo         bo_instr;
+    unsigned        instr_words = 0;
+    int             SV = 0, R = 0, NB = 0;
+    xrt::bo         boP, boI, boO;
+    ggml_bf16_t *   P_map = nullptr;
+    ggml_bf16_t *   I_map = nullptr;
+    ggml_bf16_t *   O_map = nullptr;
+    xrt::bo         dummy[2];
+};
+
 struct npu_state {
     xrt::device            device;
     std::string            kdir;
@@ -134,7 +150,39 @@ struct npu_state {
     std::map<std::string, flash_kernel> flashes;
     std::map<std::string, gemv_kernel>  gemvs;
     std::map<const void *, xrt::bo>     wcache; // per-weight bf16 W bo (gemv)
+    std::map<int, gdn_kernel>           gdns;   // keyed by SV (head dim)
     std::mutex             mtx;
+
+    // load + cache gdn_<SV>.xclbin
+    gdn_kernel * get_gdn(int SV) {
+        auto it = gdns.find(SV);
+        if (it != gdns.end()) return &it->second;
+        const std::string base = kdir + "/gdn_" + std::to_string(SV);
+        const std::vector<uint32_t> instr = read_u32(base + "_insts.bin");
+        if (instr.empty()) return nullptr;
+        try {
+            xrt::xclbin xclbin(base + ".xclbin");
+            device.register_xclbin(xclbin);
+            gdn_kernel k;
+            k.SV = SV; k.R = GDN_R; k.NB = SV / GDN_R;
+            const int blk = k.R * SV + k.R;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t), xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k.boP = xrt::bo(device, (size_t) (3 * SV + 16) * sizeof(uint16_t), xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.boI = xrt::bo(device, (size_t) k.NB * blk * sizeof(uint16_t),     xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.boO = xrt::bo(device, (size_t) k.NB * blk * sizeof(uint16_t),     xrt::bo::flags::host_only, k.kernel.group_id(5));
+            k.P_map = k.boP.map<ggml_bf16_t *>();
+            k.I_map = k.boI.map<ggml_bf16_t *>();
+            k.O_map = k.boO.map<ggml_bf16_t *>();
+            for (int i = 0; i < 2; i++) k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(6 + i));
+            auto res = gdns.emplace(SV, std::move(k));
+            return &res.first->second;
+        } catch (...) { return nullptr; }
+    }
 
     // load + cache gemv_<K>_<N>.xclbin
     gemv_kernel * get_gemv(int K, int Nn) {
@@ -685,9 +733,111 @@ bool ggml_xdna_npu_try_flash(const struct ggml_tensor * q, const struct ggml_ten
     }
 }
 
+bool ggml_xdna_npu_try_gdn(struct ggml_tensor * dst) {
+    npu_state & N = npu();
+    if (!N.ok) {
+        return false;
+    }
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    const int S_v      = (int) v->ne[0];
+    const int H        = (int) v->ne[1];
+    const int n_tokens = (int) v->ne[2];
+    const int n_seqs   = (int) v->ne[3];
+
+    // decode step only for now; head dim must match a built gdn_<SV>.xclbin; the
+    // gate is scalar (g.ne0==1) or per-dim (kda, ==S_v); all inputs f32.
+    if (n_tokens != 1 || S_v != 128 || (g->ne[0] != 1 && g->ne[0] != S_v)) {
+        return false;
+    }
+    const bool kda = (g->ne[0] == S_v);
+    if (q->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(N.mtx);
+    gdn_kernel * gk = N.get_gdn(S_v);
+    if (!gk) {
+        return false;
+    }
+    const int   R   = gk->R, NB = gk->NB, blk = R * S_v + R;
+    const float scale = 1.0f / std::sqrt((float) S_v);
+    const int64_t state_seq_stride = state->nb[3] / sizeof(float);
+    const int64_t rq3 = v->ne[3] / q->ne[3], rk3 = v->ne[3] / k->ne[3];
+    const int64_t attn_score_elems = (int64_t) S_v * H * n_tokens * n_seqs;
+    float * attn_out_base  = (float *) dst->data;
+    float * state_out_base = (float *) dst->data + attn_score_elems;
+    const float * state_in_base = (const float *) state->data;
+
+    try {
+        for (int iv3 = 0; iv3 < n_seqs; iv3++)
+        for (int iv1 = 0; iv1 < H; iv1++) {
+            const int iq1 = iv1 % (int) q->ne[1];
+            const int ik1 = iv1 % (int) k->ne[1];
+            const int iq3 = iv3 / rq3;
+            const int ik3 = iv3 / rk3;
+            const float * q_d = (const float *) ((const char *) q->data + iq3 * q->nb[3] + iq1 * q->nb[1]);
+            const float * k_d = (const float *) ((const char *) k->data + ik3 * k->nb[3] + ik1 * k->nb[1]);
+            const float * v_d = (const float *) ((const char *) v->data + iv3 * v->nb[3] + iv1 * v->nb[1]);
+            const float * g_d = (const float *) ((const char *) g->data + iv3 * g->nb[3] + iv1 * g->nb[1]);
+            const float   bv  = *(const float *) ((const char *) beta->data + iv3 * beta->nb[3] + iv1 * beta->nb[1]);
+
+            // gate decay: scalar gate broadcasts exp(g[0]); kda uses exp(g[i])
+            for (int i = 0; i < S_v; i++) gk->P_map[i]          = ggml_fp32_to_bf16(std::exp(kda ? g_d[i] : g_d[0]));
+            for (int i = 0; i < S_v; i++) gk->P_map[S_v + i]     = ggml_fp32_to_bf16(k_d[i]);
+            for (int i = 0; i < S_v; i++) gk->P_map[2 * S_v + i] = ggml_fp32_to_bf16(q_d[i]);
+            gk->P_map[3 * S_v]     = ggml_fp32_to_bf16(bv);
+            gk->P_map[3 * S_v + 1] = ggml_fp32_to_bf16(scale);
+
+            const float * s_in = state_in_base + iv3 * state_seq_stride + (int64_t) iv1 * S_v * S_v;
+            for (int b = 0; b < NB; b++) {
+                ggml_bf16_t * bin = gk->I_map + (size_t) b * blk;
+                for (int r = 0; r < R; r++) {
+                    const int j = b * R + r;
+                    for (int i = 0; i < S_v; i++) bin[r * S_v + i] = ggml_fp32_to_bf16(s_in[j * S_v + i]);
+                    bin[R * S_v + r] = ggml_fp32_to_bf16(v_d[j]);
+                }
+            }
+
+            gk->boP.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            gk->boI.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto run = gk->kernel(RUN_OPCODE, gk->bo_instr, gk->instr_words,
+                                  gk->boP, gk->boI, gk->boO, gk->dummy[0], gk->dummy[1]);
+            run.wait();
+            gk->boO.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+            float * attn_data = attn_out_base  + (int64_t) (iv3 * H + iv1) * S_v;
+            float * s_out     = state_out_base + (int64_t) (iv3 * H + iv1) * S_v * S_v; // slot 0
+            for (int b = 0; b < NB; b++) {
+                const ggml_bf16_t * bo = gk->O_map + (size_t) b * blk;
+                for (int r = 0; r < R; r++) {
+                    const int j = b * R + r;
+                    for (int i = 0; i < S_v; i++) s_out[j * S_v + i] = ggml_bf16_to_fp32(bo[r * S_v + i]);
+                    attn_data[j] = ggml_bf16_to_fp32(bo[R * S_v + r]);
+                }
+            }
+        }
+        if (std::getenv("GGML_XDNA_DEBUG")) {
+            fprintf(stderr, "[xdna] ran gated_delta_net H=%d seqs=%d on NPU\n", H, n_seqs);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 #else // !GGML_XDNA_HAS_XRT
 
 bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t) {
+    return false;
+}
+
+bool ggml_xdna_npu_try_gdn(struct ggml_tensor *) {
     return false;
 }
 
