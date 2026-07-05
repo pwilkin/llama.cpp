@@ -139,6 +139,20 @@ struct gdn_kernel {
     xrt::bo         dummy[2];
 };
 
+// A loaded ssm_conv kernel for a fixed channel count NC (KW=4). in @3 (bf16
+// channel blocks), out @4 (fp32).
+struct conv_kernel {
+    xrt::hw_context ctx;
+    xrt::kernel     kernel;
+    xrt::bo         bo_instr;
+    unsigned        instr_words = 0;
+    int             NC = 0, KW = 0, R = 0, NB = 0;
+    xrt::bo         boI, boO;
+    ggml_bf16_t *   I_map = nullptr;
+    float *         O_map = nullptr;
+    xrt::bo         dummy[3];
+};
+
 struct npu_state {
     xrt::device            device;
     std::string            kdir;
@@ -151,7 +165,37 @@ struct npu_state {
     std::map<std::string, gemv_kernel>  gemvs;
     std::map<const void *, xrt::bo>     wcache; // per-weight bf16 W bo (gemv)
     std::map<int, gdn_kernel>           gdns;   // keyed by SV (head dim)
+    std::map<int, conv_kernel>          convs;  // keyed by NC (channels)
     std::mutex             mtx;
+
+    // load + cache ssm_conv_<NC>.xclbin (KW=4, R=256)
+    conv_kernel * get_ssm_conv(int NC) {
+        auto it = convs.find(NC);
+        if (it != convs.end()) return &it->second;
+        const std::string base = kdir + "/ssm_conv_" + std::to_string(NC);
+        const std::vector<uint32_t> instr = read_u32(base + "_insts.bin");
+        if (instr.empty()) return nullptr;
+        try {
+            xrt::xclbin xclbin(base + ".xclbin");
+            device.register_xclbin(xclbin);
+            conv_kernel k;
+            k.NC = NC; k.KW = 4; k.R = 256; k.NB = NC / 256;
+            const int blk = 2 * k.KW * k.R;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t), xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k.boI = xrt::bo(device, (size_t) k.NB * blk * sizeof(uint16_t), xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.boO = xrt::bo(device, (size_t) NC * sizeof(float),            xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.I_map = k.boI.map<ggml_bf16_t *>();
+            k.O_map = k.boO.map<float *>();
+            for (int i = 0; i < 3; i++) k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(5 + i));
+            auto res = convs.emplace(NC, std::move(k));
+            return &res.first->second;
+        } catch (...) { return nullptr; }
+    }
 
     // load + cache gdn_<SV>.xclbin
     gdn_kernel * get_gdn(int SV) {
@@ -831,6 +875,56 @@ bool ggml_xdna_npu_try_gdn(struct ggml_tensor * dst) {
     }
 }
 
+bool ggml_xdna_npu_try_ssm_conv(struct ggml_tensor * dst) {
+    npu_state & N = npu();
+    if (!N.ok) {
+        return false;
+    }
+    const ggml_tensor * ci = dst->src[0]; // conv_input [KW-1+n_tokens, NC]
+    const ggml_tensor * w  = dst->src[1]; // weight [KW, NC]
+    const int NC = (int) ci->ne[1];
+    const int KW = (int) w->ne[0];
+    const int n_tokens = (int) dst->ne[1];
+    if (n_tokens != 1 || KW != 4 || (int) ci->ne[0] != KW || (NC % 256) != 0) {
+        return false;
+    }
+    if (ci->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(N.mtx);
+    conv_kernel * ck = N.get_ssm_conv(NC);
+    if (!ck) {
+        return false;
+    }
+    const int R = ck->R, NB = ck->NB, blk = 2 * KW * R;
+    try {
+        for (int b = 0; b < NB; b++) {
+            ggml_bf16_t * bin = ck->I_map + (size_t) b * blk;
+            for (int t = 0; t < KW; t++) {
+                for (int c = 0; c < R; c++) {
+                    const int cc = b * R + c;
+                    const float xv = *(const float *) ((const char *) ci->data + t * ci->nb[0] + cc * ci->nb[1]);
+                    const float wv = *(const float *) ((const char *) w->data  + t * w->nb[0]  + cc * w->nb[1]);
+                    bin[t * R + c]        = ggml_fp32_to_bf16(xv);
+                    bin[(KW + t) * R + c] = ggml_fp32_to_bf16(wv);
+                }
+            }
+        }
+        ck->boI.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto run = ck->kernel(RUN_OPCODE, ck->bo_instr, ck->instr_words,
+                              ck->boI, ck->boO, ck->dummy[0], ck->dummy[1], ck->dummy[2]);
+        run.wait();
+        ck->boO.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        std::memcpy(dst->data, ck->O_map, (size_t) NC * sizeof(float));
+        if (std::getenv("GGML_XDNA_DEBUG")) {
+            fprintf(stderr, "[xdna] ran ssm_conv NC=%d on NPU\n", NC);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 #else // !GGML_XDNA_HAS_XRT
 
 bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t) {
@@ -838,6 +932,10 @@ bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t
 }
 
 bool ggml_xdna_npu_try_gdn(struct ggml_tensor *) {
+    return false;
+}
+
+bool ggml_xdna_npu_try_ssm_conv(struct ggml_tensor *) {
     return false;
 }
 

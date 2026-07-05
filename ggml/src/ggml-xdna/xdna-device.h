@@ -42,6 +42,10 @@ bool ggml_xdna_npu_try_flash(const struct ggml_tensor * q, const struct ggml_ten
 // a matching gdn_<SV>.xclbin). Returns false otherwise for the host path.
 bool ggml_xdna_npu_try_gdn(struct ggml_tensor * dst);
 
+// Causal depthwise conv1d (SSM_CONV) on the NPU, one output token. Handles the
+// decode case (n_tokens==1, KW==4, a matching ssm_conv_<NC>.xclbin).
+bool ggml_xdna_npu_try_ssm_conv(struct ggml_tensor * dst);
+
 #ifdef __cplusplus
 }
 #endif

@@ -377,6 +377,12 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
                 }
                 break;
 
+            case GGML_OP_SSM_CONV:
+                if (!ggml_xdna_npu_try_ssm_conv(node)) {
+                    GGML_ABORT("%s: ssm_conv has no host fallback\n", __func__);
+                }
+                break;
+
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
             case GGML_OP_VIEW:
@@ -592,6 +598,15 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                    op->src[5]->type == GGML_TYPE_F32 &&
                    v->ne[0] == 128 && v->ne[2] == 1 &&
                    (g->ne[0] == 1 || g->ne[0] == v->ne[0]);
+        }
+
+        case GGML_OP_SSM_CONV: {
+            // decode (n_tokens==1), 4-tap conv, channels a multiple of 256 (the
+            // ssm_conv xclbin block). Strict — no host fallback.
+            const struct ggml_tensor * ci = op->src[0];
+            const struct ggml_tensor * w  = op->src[1];
+            return op->type == GGML_TYPE_F32 && ci->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+                   op->ne[1] == 1 && w->ne[0] == 4 && ci->ne[0] == 4 && (ci->ne[1] % 256) == 0;
         }
 
         case GGML_OP_RMS_NORM:
