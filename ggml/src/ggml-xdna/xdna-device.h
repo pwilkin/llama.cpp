@@ -46,6 +46,10 @@ bool ggml_xdna_npu_try_gdn(struct ggml_tensor * dst);
 // decode case (n_tokens==1, KW==4, a matching ssm_conv_<NC>.xclbin).
 bool ggml_xdna_npu_try_ssm_conv(struct ggml_tensor * dst);
 
+// SWIGLU (silu(gate)*up) on the NPU. Handles the 2-input GLU with row width a
+// multiple of 1024 and a matching swiglu_<NC>.xclbin.
+bool ggml_xdna_npu_try_glu(struct ggml_tensor * dst);
+
 #ifdef __cplusplus
 }
 #endif

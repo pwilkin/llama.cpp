@@ -153,6 +153,20 @@ struct conv_kernel {
     xrt::bo         dummy[3];
 };
 
+// A loaded swiglu (GLU) kernel for a fixed row width NC. Input @3 is [gate|up]
+// packed per TILE block (bf16); output @4 is [NC] bf16.
+struct glu_kernel {
+    xrt::hw_context ctx;
+    xrt::kernel     kernel;
+    xrt::bo         bo_instr;
+    unsigned        instr_words = 0;
+    int             NC = 0, TILE = 0, NB = 0;
+    xrt::bo         boI, boO;
+    ggml_bf16_t *   I_map = nullptr;
+    ggml_bf16_t *   O_map = nullptr;
+    xrt::bo         dummy[3];
+};
+
 struct npu_state {
     xrt::device            device;
     std::string            kdir;
@@ -166,7 +180,36 @@ struct npu_state {
     std::map<const void *, xrt::bo>     wcache; // per-weight bf16 W bo (gemv)
     std::map<int, gdn_kernel>           gdns;   // keyed by SV (head dim)
     std::map<int, conv_kernel>          convs;  // keyed by NC (channels)
+    std::map<int, glu_kernel>           glus;   // keyed by NC (row width)
     std::mutex             mtx;
+
+    // load + cache swiglu_<NC>.xclbin (TILE=1024)
+    glu_kernel * get_glu(int NC) {
+        auto it = glus.find(NC);
+        if (it != glus.end()) return &it->second;
+        const std::string base = kdir + "/swiglu_" + std::to_string(NC);
+        const std::vector<uint32_t> instr = read_u32(base + "_insts.bin");
+        if (instr.empty()) return nullptr;
+        try {
+            xrt::xclbin xclbin(base + ".xclbin");
+            device.register_xclbin(xclbin);
+            glu_kernel k;
+            k.NC = NC; k.TILE = 1024; k.NB = NC / 1024;
+            k.ctx         = xrt::hw_context(device, xclbin.get_uuid());
+            k.kernel      = xrt::kernel(k.ctx, KERNEL_NAME);
+            k.instr_words = (unsigned) instr.size();
+            k.bo_instr = xrt::bo(device, instr.size() * sizeof(uint32_t), xrt::bo::flags::cacheable, k.kernel.group_id(1));
+            std::memcpy(k.bo_instr.map<void *>(), instr.data(), instr.size() * sizeof(uint32_t));
+            k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k.boI = xrt::bo(device, (size_t) NC * 2 * sizeof(uint16_t), xrt::bo::flags::host_only, k.kernel.group_id(3));
+            k.boO = xrt::bo(device, (size_t) NC * sizeof(uint16_t),     xrt::bo::flags::host_only, k.kernel.group_id(4));
+            k.I_map = k.boI.map<ggml_bf16_t *>();
+            k.O_map = k.boO.map<ggml_bf16_t *>();
+            for (int i = 0; i < 3; i++) k.dummy[i] = xrt::bo(device, 64, xrt::bo::flags::host_only, k.kernel.group_id(5 + i));
+            auto res = glus.emplace(NC, std::move(k));
+            return &res.first->second;
+        } catch (...) { return nullptr; }
+    }
 
     // load + cache ssm_conv_<NC>.xclbin (KW=4, R=256)
     conv_kernel * get_ssm_conv(int NC) {
@@ -925,6 +968,55 @@ bool ggml_xdna_npu_try_ssm_conv(struct ggml_tensor * dst) {
     }
 }
 
+bool ggml_xdna_npu_try_glu(struct ggml_tensor * dst) {
+    npu_state & N = npu();
+    if (!N.ok) {
+        return false;
+    }
+    const ggml_tensor * gate = dst->src[0];
+    const ggml_tensor * up   = dst->src[1];
+    if (up == nullptr) {
+        return false; // 2-input GLU only (no single-input split)
+    }
+    const int NC = (int) gate->ne[0];
+    if ((NC % 1024) != 0 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t nrows = ggml_nrows(gate);
+    std::lock_guard<std::mutex> lock(N.mtx);
+    glu_kernel * gk = N.get_glu(NC);
+    if (!gk) {
+        return false;
+    }
+    const int TILE = gk->TILE, NB = gk->NB;
+    try {
+        for (int64_t r = 0; r < nrows; r++) {
+            const float * gr = (const float *) ((const char *) gate->data + r * gate->nb[1]);
+            const float * ur = (const float *) ((const char *) up->data   + r * up->nb[1]);
+            for (int b = 0; b < NB; b++) {
+                ggml_bf16_t * blk = gk->I_map + (size_t) b * 2 * TILE;
+                for (int i = 0; i < TILE; i++) {
+                    blk[i]        = ggml_fp32_to_bf16(gr[b * TILE + i]);
+                    blk[TILE + i] = ggml_fp32_to_bf16(ur[b * TILE + i]);
+                }
+            }
+            gk->boI.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto run = gk->kernel(RUN_OPCODE, gk->bo_instr, gk->instr_words,
+                                  gk->boI, gk->boO, gk->dummy[0], gk->dummy[1], gk->dummy[2]);
+            run.wait();
+            gk->boO.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            float * dr = (float *) ((char *) dst->data + r * dst->nb[1]);
+            for (int i = 0; i < NC; i++) dr[i] = ggml_bf16_to_fp32(gk->O_map[i]);
+        }
+        if (std::getenv("GGML_XDNA_DEBUG")) {
+            fprintf(stderr, "[xdna] ran swiglu NC=%d rows=%ld on NPU\n", NC, (long) nrows);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 #else // !GGML_XDNA_HAS_XRT
 
 bool ggml_xdna_npu_try_unary(enum ggml_unary_op, const float *, float *, int64_t) {
@@ -936,6 +1028,10 @@ bool ggml_xdna_npu_try_gdn(struct ggml_tensor *) {
 }
 
 bool ggml_xdna_npu_try_ssm_conv(struct ggml_tensor *) {
+    return false;
+}
+
+bool ggml_xdna_npu_try_glu(struct ggml_tensor *) {
     return false;
 }
 

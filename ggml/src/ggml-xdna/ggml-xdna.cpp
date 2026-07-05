@@ -411,6 +411,12 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
                 }
                 break;
 
+            case GGML_OP_GLU:
+                if (!ggml_xdna_npu_try_glu(node)) {
+                    GGML_ABORT("%s: glu has no host fallback\n", __func__);
+                }
+                break;
+
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
             case GGML_OP_VIEW:
@@ -647,6 +653,18 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+
+        case GGML_OP_GLU: {
+            // swiglu, 2-input (silu(gate)*up), not swapped, row width % 1024,
+            // f32 — strict (no host fallback). Matches ggml_xdna_npu_try_glu.
+            const struct ggml_tensor * gate = op->src[0];
+            const struct ggml_tensor * up   = op->src[1];
+            return ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU &&
+                   ggml_get_op_params_i32(op, 1) == 0 && // not swapped
+                   up != nullptr && op->type == GGML_TYPE_F32 &&
+                   gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 &&
+                   (gate->ne[0] % 1024) == 0;
+        }
 
         case GGML_OP_SOFT_MAX: {
             // only the plain case (no mask, unit scale, no ALiBi bias)
