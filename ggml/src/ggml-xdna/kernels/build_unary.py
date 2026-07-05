@@ -33,6 +33,7 @@ OPS = {
     "gelu_quick": "xdna_gelu_quick_bf16",
     # reduction kernel (row length = --tile); one xclbin per row size
     "rms_norm":   "xdna_rms_norm_bf16",
+    "l2_norm":    "xdna_l2_norm_bf16",
     "softmax":    "xdna_softmax_bf16",
 }
 

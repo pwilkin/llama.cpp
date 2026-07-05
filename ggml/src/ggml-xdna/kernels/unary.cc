@@ -68,6 +68,27 @@ void xdna_rms_norm_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
     }
 }
 
+// L2 normalize one TILE_N-element row: y = x / sqrt(sum(x^2) + eps).
+// Same as rms_norm but without the 1/N (sum, not mean).
+void xdna_l2_norm_bf16(bfloat16 *restrict a, bfloat16 *restrict c) {
+    auto it_sq = aie::cbegin_vector<V>(a);
+    aie::accum<accfloat, V> ss;
+    ss.from_vector(aie::zeros<float, V>());
+    for (int i = 0; i < TILE_N; i += V) {
+        aie::vector<bfloat16, V> x = *it_sq++;
+        ss = aie::mac(ss, x, x);
+    }
+    const float sum   = aie::reduce_add(ss.to_vector<float>());
+    const float scale = aie::invsqrt(sum + RMS_EPS);
+
+    aie::vector<bfloat16, V> sv = aie::broadcast<bfloat16, V>((bfloat16) scale);
+    auto it_in  = aie::cbegin_vector<V>(a);
+    auto it_out = aie::begin_vector<V>(c);
+    for (int i = 0; i < TILE_N; i += V) {
+        *it_out++ = aie::mul(*it_in++, sv).to_vector<bfloat16>();
+    }
+}
+
 // Numerically-stable softmax over one TILE_N-element row:
 //   m = max(x);  e = exp(x - m);  y = e / sum(e)
 // exp is 2^(log2e*x) via aie::exp2; the sum accumulates in fp32.

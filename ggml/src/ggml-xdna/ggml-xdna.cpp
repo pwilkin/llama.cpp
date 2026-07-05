@@ -174,6 +174,30 @@ static void ggml_backend_xdna_compute_rms_norm(ggml_tensor * dst) {
     }
 }
 
+// L2 normalize each row of ne[0]: y = x / sqrt(sum(x^2) + eps).
+static void ggml_backend_xdna_compute_l2_norm(ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    float eps;
+    std::memcpy(&eps, dst->op_params, sizeof(float));
+
+    const int64_t ne0   = src->ne[0];
+    const int64_t nrows = ggml_nrows(src);
+    const float * s = (const float *) src->data;
+    float *       d = (float *)       dst->data;
+
+    if (ggml_xdna_npu_try_rows("l2_norm", (int) ne0, s, d, ne0 * nrows)) {
+        return;
+    }
+    for (int64_t r = 0; r < nrows; r++) {
+        const float * x = s + r * ne0;
+        float *       y = d + r * ne0;
+        double ss = 0.0;
+        for (int64_t i = 0; i < ne0; i++) ss += (double) x[i] * x[i];
+        const float sc = 1.0f / sqrtf((float) ss + eps);
+        for (int64_t i = 0; i < ne0; i++) y[i] = x[i] * sc;
+    }
+}
+
 // Plain softmax over each row of ne[0] (no mask, scale 1) — the eligible case.
 static void ggml_backend_xdna_compute_soft_max(ggml_tensor * dst) {
     const ggml_tensor * src = dst->src[0];
@@ -349,6 +373,10 @@ static ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, ggml_
 
             case GGML_OP_RMS_NORM:
                 ggml_backend_xdna_compute_rms_norm(node);
+                break;
+
+            case GGML_OP_L2_NORM:
+                ggml_backend_xdna_compute_l2_norm(node);
                 break;
 
             case GGML_OP_SOFT_MAX:
@@ -611,6 +639,11 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
 
         case GGML_OP_RMS_NORM:
             // any eps handled (NPU for 1e-6, host fallback otherwise)
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+
+        case GGML_OP_L2_NORM:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
