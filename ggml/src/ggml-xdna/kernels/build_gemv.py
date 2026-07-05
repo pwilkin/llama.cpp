@@ -16,7 +16,7 @@ from aie.iron.placers import SequentialPlacer
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def build_module(K, N, R):
+def build_module(K, N, R, wdepth=2):
     assert N % R == 0, "N must be a multiple of R"
     NB = N // R
     x_ty  = np.ndarray[(K,),     np.dtype[bfloat16]]
@@ -33,7 +33,7 @@ def build_module(K, N, R):
                             object_file_name="gemv.o", include_dirs=[HERE], compile_flags=flags)
 
     ofX = ObjectFifo(x_ty,  name="X")
-    ofW = ObjectFifo(wb_ty, name="W")
+    ofW = ObjectFifo(wb_ty, name="W", depth=wdepth)
     ofY = ObjectFifo(yb_ty, name="Y")
 
     def core_fn(x, w, y, gemv_k):
@@ -63,9 +63,10 @@ def main():
     ap.add_argument("--K", type=int, default=2560)
     ap.add_argument("--N", type=int, default=2560)
     ap.add_argument("--R", type=int, default=4)
+    ap.add_argument("--wdepth", type=int, default=2)
     ap.add_argument("--mlir", default="")
     args = ap.parse_args()
-    module = build_module(args.K, args.N, args.R)
+    module = build_module(args.K, args.N, args.R, args.wdepth)
     text = str(module)
     if args.mlir:
         os.makedirs(os.path.dirname(os.path.abspath(args.mlir)), exist_ok=True)
