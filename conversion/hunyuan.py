@@ -152,6 +152,105 @@ class HunYuanMoEModel(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("HYV3ForCausalLM")
+class HunYuanV3Model(TextModel):
+    model_arch = gguf.MODEL_ARCH.HUNYUAN_V3
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # HunYuan V3 has num_hidden_layers + 1 actual layers (including the NextN/MTP layer)
+        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+
+        assert hparams.get("moe_router_use_sigmoid", True), "only sigmoid routing is supported"
+
+        self.gguf_writer.add_rope_dimension_count(hparams["head_dim"])
+
+        if (mlp_layer_types := hparams.get("mlp_layer_types")) is not None:
+            first_k_dense = mlp_layer_types.count("dense")
+            assert all(t == "dense" for t in mlp_layer_types[:first_k_dense]), "non-leading dense layers are not supported"
+        else:
+            first_k_dense = hparams.get("first_k_dense_replace", 0)
+
+        self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_count(hparams.get("num_shared_experts", 0))
+        self.gguf_writer.add_leading_dense_block_count(first_k_dense)
+
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+        self.gguf_writer.add_expert_weights_scale(hparams.get("router_scaling_factor", 1.0))
+        self.gguf_writer.add_expert_weights_norm(hparams.get("route_norm", True))
+
+        if (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
+
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith(".expert_bias"):
+            name = name.replace(".expert_bias", ".expert_bias.bias")
+            yield from super().modify_tensors(data_torch.float(), name, bid)
+            return
+
+        if name.endswith("mlp.experts.down_proj") or name.endswith("mlp.experts.down_proj.weight"):
+            mapped = f"{name}.weight" if not name.endswith(".weight") else name
+            yield from super().modify_tensors(data_torch, mapped, bid)
+            return
+
+        if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight"):
+            if data_torch.ndim < 3 or data_torch.shape[-2] % 2 != 0:
+                raise ValueError(f"Unexpected gate_up_proj shape for {name}: {tuple(data_torch.shape)}")
+            n_ff = data_torch.shape[-2] // 2
+            gate = data_torch[..., :n_ff, :].contiguous()
+            up   = data_torch[..., n_ff:, :].contiguous()
+            base_name = name.removesuffix(".weight").removesuffix(".gate_up_proj")
+            yield from super().modify_tensors(gate, f"{base_name}.gate_proj.weight", bid)
+            yield from super().modify_tensors(up,   f"{base_name}.up_proj.weight",   bid)
+            return
+
+        if name.find("mlp.experts") != -1:
+            n_experts = self.hparams["num_experts"]
+            assert bid is not None
+
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+
+            self._experts[bid][name] = data_torch
+
+            if len(self._experts[bid]) >= n_experts * 3:
+                # merge the experts into a single 3d tensor
+                for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                    datas: list[Tensor] = []
+
+                    for xid in range(n_experts):
+                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                        datas.append(self._experts[bid][ename])
+                        del self._experts[bid][ename]
+
+                    data_torch = torch.stack(datas, dim=0)
+                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+
+                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                return
+            else:
+                return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None:
+            experts = [k for d in self._experts for k in d.keys()]
+            if len(experts) > 0:
+                raise ValueError(f"Unprocessed experts: {experts}")
+
+
 @ModelBase.register("HunYuanDenseV1ForCausalLM")
 class HunYuanModel(TextModel):
     model_arch = gguf.MODEL_ARCH.HUNYUAN_DENSE
