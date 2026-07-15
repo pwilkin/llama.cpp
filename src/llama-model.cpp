@@ -22,6 +22,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <any>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -1245,6 +1246,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    const bool has_igpu = std::any_of(devices.begin(), devices.end(), [](const llama_device & d) {
+        return ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+    });
+
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1289,7 +1294,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (size_t i = 0; i < n_devices(); ++i) {
         splits[i] /= split_sum;
     }
-
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
@@ -1305,8 +1309,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // there is very little benefit to offloading the input layer, so always keep it on the CPU - unless it's an iGPU
+    if (has_igpu) {
+        auto it = std::find_if(devices.begin(), devices.end(), [](const llama_device & d) {
+            return ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        });
+        pimpl->dev_input = { it->dev, &pimpl->gpu_buft_list.at(it->dev) };
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
