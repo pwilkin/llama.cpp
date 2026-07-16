@@ -328,6 +328,9 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // set the number of tokens in the ubatch being scheduled, used to decide input tensor placement
+    GGML_API void                 ggml_backend_sched_set_n_tokens(ggml_backend_sched_t sched, int n_tokens);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 

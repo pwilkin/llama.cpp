@@ -804,6 +804,9 @@ struct ggml_backend_sched {
     int n_copies;
     int cur_copy;
     int next_copy;
+
+    // number of tokens in the ubatch currently being scheduled
+    int cur_n_tokens;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_graph_inputs;
@@ -1000,7 +1003,19 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
         }
     }
 
-    return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
+    bool supported = buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
+
+    // integrated GPUs can read inputs straight out of host memory, which avoids a copy during token
+    // generation. during prefill the same buffers are read repeatedly, so a copy into device memory pays
+    // for itself via caching - force one by rejecting host buffer types for large ubatches.
+    if (supported && (t->flags & GGML_TENSOR_FLAG_INPUT) &&
+        sched->backends[backend_id] != sched->backends[sched->n_backends - 1] &&
+        ggml_backend_buft_is_host(buft) &&
+        sched->cur_n_tokens > 8) {
+        supported = false;
+    }
+
+    return supported;
 }
 
 static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int * node_backend_id) {
@@ -1551,8 +1566,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-	ggml_backend_synchronize(split_backend);	
-
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1676,8 +1689,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-	ggml_backend_synchronize(split_backend);
-
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1753,6 +1764,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->cur_n_tokens = 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -1932,6 +1944,11 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+void ggml_backend_sched_set_n_tokens(ggml_backend_sched_t sched, int n_tokens) {
+    GGML_ASSERT(sched);
+    sched->cur_n_tokens = n_tokens;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
