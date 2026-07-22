@@ -1532,6 +1532,16 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// see ggml_cpu_set_mul_mat_id_prefetch_hook(). Installed once at model load and read from the
+// compute threads; not expected to change while a graph is running.
+static ggml_mul_mat_id_prefetch_hook g_mul_mat_id_prefetch_hook      = NULL;
+static void *                        g_mul_mat_id_prefetch_user_data = NULL;
+
+void ggml_cpu_set_mul_mat_id_prefetch_hook(ggml_mul_mat_id_prefetch_hook hook, void * user_data) {
+    g_mul_mat_id_prefetch_hook      = hook;
+    g_mul_mat_id_prefetch_user_data = user_data;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1539,6 +1549,14 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+
+    // Ask the host to start paging in this node's expert rows before we touch any of them. Issued
+    // from one thread, as early as possible: the src1 quantisation below and the whole first expert
+    // then run while those reads are in flight. The hook returns immediately; rows it does not
+    // manage to fetch in time simply fault in the usual way.
+    if (g_mul_mat_id_prefetch_hook && params->ith == 0) {
+        g_mul_mat_id_prefetch_hook(src0, ids, g_mul_mat_id_prefetch_user_data);
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
