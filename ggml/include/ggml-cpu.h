@@ -148,9 +148,10 @@ extern "C" {
     //
     // Must not block -- it runs on a compute thread, from one thread only, before the barrier.
     // Inert unless installed. Process-wide: installing again replaces the previous hook.
+    // The node is passed whole: src[0] is the expert weights (experts along ne[2]), src[1] the
+    // activations, src[2] the routed expert ids.
     typedef void (*ggml_mul_mat_id_prefetch_hook)(
-            const struct ggml_tensor * src0,   // expert weights, experts indexed along ne[2]
-            const struct ggml_tensor * ids,    // routed expert ids
+            const struct ggml_tensor * dst,
             void *                     user_data);
 
     GGML_BACKEND_API void ggml_cpu_set_mul_mat_id_prefetch_hook(ggml_mul_mat_id_prefetch_hook hook, void * user_data);
