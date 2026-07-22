@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-expert-prefetch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -1014,6 +1015,11 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // --lazy-experts: pool that faults routed expert rows in ahead of MUL_MAT_ID's serial walk.
+    // Destroyed before `mappings` (declared after it), so its workers stop touching the mapping
+    // before it is unmapped.
+    std::unique_ptr<llama_expert_prefetcher> expert_prefetcher;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -1657,6 +1663,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // With experts left to fault in on demand, MUL_MAT_ID's strictly serial walk over them means a
+    // read is only ever issued once the previous expert has finished computing, so reads and compute
+    // never overlap. Hand the routed rows to a worker pool that faults them in while the node runs.
+    if (params.lazy_experts && !pimpl->mappings.empty()) {
+        std::vector<std::pair<void *, size_t>> regions;
+        regions.reserve(pimpl->mappings.size());
+        for (const auto & mapping : pimpl->mappings) {
+            regions.emplace_back(mapping->addr(), mapping->size());
+        }
+
+        pimpl->expert_prefetcher = llama_expert_prefetcher::create(*this, regions);
+        if (pimpl->expert_prefetcher) {
+            pimpl->expert_prefetcher->install();
         }
     }
 

@@ -140,6 +140,21 @@ extern "C" {
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
+    // Optional hook, called once per MUL_MAT_ID node before any of its expert rows are read, with
+    // the expert weight tensor and the tensor of routed expert ids. It exists so a host that pages
+    // expert weights in on demand (see --lazy-experts) can start those reads while this node's work
+    // is still running: MUL_MAT_ID walks its experts strictly one at a time, so without it expert
+    // e+1's pages are not requested until expert e has finished computing.
+    //
+    // Must not block -- it runs on a compute thread, from one thread only, before the barrier.
+    // Inert unless installed. Process-wide: installing again replaces the previous hook.
+    typedef void (*ggml_mul_mat_id_prefetch_hook)(
+            const struct ggml_tensor * src0,   // expert weights, experts indexed along ne[2]
+            const struct ggml_tensor * ids,    // routed expert ids
+            void *                     user_data);
+
+    GGML_BACKEND_API void ggml_cpu_set_mul_mat_id_prefetch_hook(ggml_mul_mat_id_prefetch_hook hook, void * user_data);
+
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);
