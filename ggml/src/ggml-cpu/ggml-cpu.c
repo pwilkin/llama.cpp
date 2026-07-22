@@ -1555,7 +1555,7 @@ static void ggml_compute_forward_mul_mat_id(
     // then run while those reads are in flight. The hook returns immediately; rows it does not
     // manage to fetch in time simply fault in the usual way.
     if (g_mul_mat_id_prefetch_hook && params->ith == 0) {
-        g_mul_mat_id_prefetch_hook(src0, ids, g_mul_mat_id_prefetch_user_data);
+        g_mul_mat_id_prefetch_hook(dst, g_mul_mat_id_prefetch_user_data);
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS

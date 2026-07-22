@@ -3,8 +3,13 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+
+#include <algorithm>
+#include <cmath>
+#include <numeric>
 
 #include <atomic>
 #include <cinttypes>
@@ -48,7 +53,114 @@ struct llama_expert_prefetcher::impl {
         int                 n    = 0;
         uint64_t            last_ids = 0;   // fingerprint of the routing this group was last queued for
         bool                seeded   = false;
+        int                 il       = -1;  // layer index (prediction study only)
+        uint64_t            last_obs = 0;   // separate fingerprint for the prediction study
+        bool                obs_seeded = false;
     };
+
+    // ---- prediction study (LLAMA_EXPERT_PREDICT_STATS=1) ------------------------------------
+    // Tests whether layer L+1's routing can be computed early from layer L's activations -- the
+    // residual stream changes only incrementally between layers, so running L+1's *real* router on
+    // a stale input may pick mostly the same experts. If it does, the prefetch can be issued a full
+    // layer ahead (covering the GPU-attention gap) instead of having ~no lead time.
+    //
+    // Two figures are collected per layer:
+    //   self : route(gate_inp[L], act[L])   vs actual ids[L]  -- CONTROL. Must be ~100%, otherwise
+    //                                                            the router reimplementation below
+    //                                                            is wrong and `pred` means nothing.
+    //   pred : route(gate_inp[L], act[L-1]) vs actual ids[L]  -- the hypothesis.
+    struct predict_study {
+        bool     enabled = false;
+        int64_t  n_embd = 0, n_expert = 0, n_expert_used = 0;
+        uint32_t gating_op = 0, n_expert_groups = 0, n_group_used = 0;
+
+        std::vector<std::vector<float>> gate_w;    // [il][n_expert*n_embd] dequantised router
+        std::vector<std::vector<float>> gate_b;    // [il][n_expert] pre-gating bias (may be empty)
+        std::vector<std::vector<float>> probs_b;   // [il][n_expert] DeepSeek-V3 selection bias
+
+        std::vector<float> prev_act;               // activations of the previously seen MoE layer
+        bool               prev_valid = false;
+
+        struct stat { uint64_t n = 0, self_hit = 0, pred_hit = 0, slots = 0; };
+        std::vector<stat> per_layer;
+        uint64_t          n_since_dump = 0;
+
+        // scratch (single-threaded: only ever touched from the ith==0 hook)
+        std::vector<float>   logits, sel;
+        std::vector<int32_t> pick;
+    } ps;
+
+    // route() -- faithful CPU reimplementation of build_moe_ffn()'s expert selection:
+    //   logits -> (+gate_inp_b) -> gating_op -> (+exp_probs_b) -> group mask -> top_k
+    void route(const float * act, int il, std::vector<int32_t> & out) {
+        const int64_t ne = ps.n_expert;
+        const int64_t nx = ps.n_embd;
+
+        ps.logits.assign(ne, 0.0f);
+        const float * W = ps.gate_w[il].data();
+        for (int64_t e = 0; e < ne; ++e) {
+            const float * w = W + e*nx;
+            float s = 0.0f;
+            for (int64_t i = 0; i < nx; ++i) {
+                s += w[i]*act[i];
+            }
+            ps.logits[e] = s + (ps.gate_b[il].empty() ? 0.0f : ps.gate_b[il][e]);
+        }
+
+        ps.sel.assign(ne, 0.0f);
+        switch (ps.gating_op) {
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: {
+                float m = *std::max_element(ps.logits.begin(), ps.logits.end());
+                float sum = 0.0f;
+                for (int64_t e = 0; e < ne; ++e) { ps.sel[e] = expf(ps.logits[e] - m); sum += ps.sel[e]; }
+                for (int64_t e = 0; e < ne; ++e) { ps.sel[e] /= sum; }
+            } break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+                for (int64_t e = 0; e < ne; ++e) { ps.sel[e] = 1.0f/(1.0f + expf(-ps.logits[e])); }
+                break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+                for (int64_t e = 0; e < ne; ++e) { ps.sel[e] = sqrtf(log1pf(expf(ps.logits[e]))); }
+                break;
+            default: // SOFTMAX_WEIGHT / NONE: selection is on the raw logits
+                ps.sel = ps.logits;
+                break;
+        }
+
+        if (!ps.probs_b[il].empty()) {
+            for (int64_t e = 0; e < ne; ++e) { ps.sel[e] += ps.probs_b[il][e]; }
+        }
+
+        // DeepSeek-V3 group masking: score each group by the sum of its top 2, keep n_group_used
+        if (ps.n_expert_groups > 1) {
+            const int64_t per = ne / (int64_t) ps.n_expert_groups;
+            std::vector<std::pair<float,int64_t>> gs;
+            gs.reserve(ps.n_expert_groups);
+            for (uint32_t g = 0; g < ps.n_expert_groups; ++g) {
+                float a = -INFINITY, b = -INFINITY;
+                for (int64_t j = 0; j < per; ++j) {
+                    const float v = ps.sel[g*per + j];
+                    if (v > a) { b = a; a = v; } else if (v > b) { b = v; }
+                }
+                gs.emplace_back(a + b, (int64_t) g);
+            }
+            std::partial_sort(gs.begin(), gs.begin() + std::min<size_t>(ps.n_group_used, gs.size()), gs.end(),
+                    [](const auto & x, const auto & y) { return x.first > y.first; });
+            std::vector<bool> keep(ps.n_expert_groups, false);
+            for (uint32_t k = 0; k < ps.n_group_used && k < gs.size(); ++k) { keep[gs[k].second] = true; }
+            for (uint32_t g = 0; g < ps.n_expert_groups; ++g) {
+                if (!keep[g]) {
+                    for (int64_t j = 0; j < per; ++j) { ps.sel[g*per + j] = -INFINITY; }
+                }
+            }
+        }
+
+        ps.pick.resize(ne);
+        std::iota(ps.pick.begin(), ps.pick.end(), 0);
+        const size_t k = std::min<size_t>(ps.n_expert_used, (size_t) ne);
+        std::partial_sort(ps.pick.begin(), ps.pick.begin() + k, ps.pick.end(),
+                [this](int32_t a, int32_t b) { return ps.sel[a] > ps.sel[b]; });
+        out.assign(ps.pick.begin(), ps.pick.begin() + k);
+    }
 
     struct range {
         char * addr;
@@ -176,7 +288,71 @@ struct llama_expert_prefetcher::impl {
         }
     }
 
-    void on_node(const ggml_tensor * src0, const ggml_tensor * ids) {
+    // Called from on_node() once per MoE layer, with that layer's router input (the gate/up node's
+    // src1 -- the down node's src1 is the post-SwiGLU activation, a different thing) and its actual
+    // routing. Compares the real router run on this layer's input (control) and on the previous
+    // layer's input (the hypothesis) against what the model actually selected.
+    void observe_prediction(int il, const float * act, const int32_t * actual, int n_used) {
+        if (il < 0 || il >= (int) ps.per_layer.size() || ps.gate_w[il].empty()) {
+            return;
+        }
+        auto & st = ps.per_layer[il];
+
+        std::vector<int32_t> got;
+        const auto overlap = [&](const std::vector<int32_t> & p) {
+            uint64_t h = 0;
+            for (int i = 0; i < n_used; ++i) {
+                if (std::find(p.begin(), p.end(), actual[i]) != p.end()) { h++; }
+            }
+            return h;
+        };
+
+        route(act, il, got);
+        st.self_hit += overlap(got);
+
+        if (ps.prev_valid) {
+            route(ps.prev_act.data(), il, got);
+            st.pred_hit += overlap(got);
+            st.n++;
+            st.slots += n_used;
+        }
+
+        ps.prev_act.assign(act, act + ps.n_embd);
+        ps.prev_valid = true;
+
+        // The server can deadlock on shutdown with a >RAM mmap'd model, so the destructor is not a
+        // reliable place to report from -- dump periodically instead.
+        if (++ps.n_since_dump >= 4000) {
+            ps.n_since_dump = 0;
+            dump_prediction_stats();
+        }
+    }
+
+    void dump_prediction_stats() const {
+        uint64_t tot_n = 0, tot_self = 0, tot_pred = 0, tot_slots = 0;
+        for (size_t il = 0; il < ps.per_layer.size(); ++il) {
+            const auto & s = ps.per_layer[il];
+            if (s.n == 0) {
+                continue;
+            }
+            LLAMA_LOG_INFO("PREDICT layer %3zu: n=%6" PRIu64 "  self=%5.1f%%  pred=%5.1f%%\n",
+                    il, s.n, 100.0*s.self_hit/s.slots, 100.0*s.pred_hit/s.slots);
+            tot_n += s.n; tot_self += s.self_hit; tot_pred += s.pred_hit; tot_slots += s.slots;
+        }
+        if (tot_slots) {
+            LLAMA_LOG_INFO("PREDICT TOTAL: n=%" PRIu64 "  self=%.1f%%  pred=%.1f%%  (self is the "
+                           "control: if it is not ~100%% the router reimplementation is wrong)\n",
+                    tot_n, 100.0*tot_self/tot_slots, 100.0*tot_pred/tot_slots);
+        }
+    }
+
+    void on_node(const ggml_tensor * dst) {
+        const ggml_tensor * src0 = dst->src[0];
+        const ggml_tensor * src1 = dst->src[1];
+        const ggml_tensor * ids  = dst->src[2];
+        if (!src0 || !src1 || !ids) {
+            return;
+        }
         const auto it = by_tensor.find(src0);
         if (it == by_tensor.end()) {
             return;
@@ -206,6 +382,18 @@ struct llama_expert_prefetcher::impl {
                 fp = (fp ^ (uint64_t) (uint32_t) e) * 1099511628211ull;
             }
         }
+        // Prediction study. Runs off the gate/up node, whose src1 IS the router input; the down
+        // node's src1 is the post-SwiGLU activation (n_ff wide), so it is skipped. Tracked with its
+        // own fingerprint so it is unaffected by the enqueue dedup below.
+        if (ps.enabled && n_tokens == 1 && src1->type == GGML_TYPE_F32 &&
+            src1->ne[0] == ps.n_embd && src1->data != nullptr &&
+            !(g.obs_seeded && g.last_obs == fp)) {
+            g.last_obs   = fp;
+            g.obs_seeded = true;
+            observe_prediction(g.il, (const float *) src1->data,
+                    (const int32_t *) ids->data, (int) n_used);
+        }
+
         if (g.seeded && g.last_ids == fp) {
             return;
         }
@@ -250,11 +438,37 @@ struct llama_expert_prefetcher::impl {
 
 static llama_expert_prefetcher::impl * g_installed = nullptr;
 
-static void llama_expert_prefetch_hook(const ggml_tensor * src0, const ggml_tensor * ids, void * user_data) {
+static void llama_expert_prefetch_hook(const ggml_tensor * dst, void * user_data) {
     auto * p = (llama_expert_prefetcher::impl *) user_data;
     if (p) {
-        p->on_node(src0, ids);
+        p->on_node(dst);
     }
+}
+
+// Pull a (possibly quantised, possibly device-resident) tensor into a host F32 buffer.
+static bool llama_load_f32(const ggml_tensor * t, std::vector<float> & out) {
+    if (!t) {
+        return false;
+    }
+    const int64_t ne0 = t->ne[0];
+    const int64_t ne1 = t->ne[1];
+
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+
+    out.assign((size_t) ne0*ne1, 0.0f);
+    if (t->type == GGML_TYPE_F32) {
+        std::memcpy(out.data(), raw.data(), out.size()*sizeof(float));
+        return true;
+    }
+    const auto * tt = ggml_get_type_traits(t->type);
+    if (!tt || !tt->to_float) {
+        return false;
+    }
+    for (int64_t r = 0; r < ne1; ++r) {
+        tt->to_float(raw.data() + r*t->nb[1], out.data() + r*ne0, ne0);
+    }
+    return true;
 }
 
 llama_expert_prefetcher::llama_expert_prefetcher() : pimpl(new impl()) {}
@@ -317,6 +531,7 @@ std::unique_ptr<llama_expert_prefetcher> llama_expert_prefetcher::create(
         }
 
         const size_t idx = p.groups.size();
+        g.il = (int) (&layer - model.layers.data());
         p.groups.push_back(g);
         for (int k = 0; k < g.n; ++k) {
             p.by_tensor[g.t[k]] = idx;
@@ -326,6 +541,45 @@ std::unique_ptr<llama_expert_prefetcher> llama_expert_prefetcher::create(
 
     if (p.groups.empty()) {
         return nullptr;
+    }
+
+    if (getenv("LLAMA_EXPERT_PREDICT_STATS")) {
+        auto & ps = p.ps;
+        const auto & hp = model.hparams;
+        ps.enabled         = true;
+        ps.n_embd          = hp.n_embd;
+        ps.n_expert        = hp.n_expert;
+        ps.n_expert_used   = hp.n_expert_used;
+        ps.gating_op       = hp.expert_gating_func;
+        ps.n_expert_groups = hp.n_expert_groups;
+        ps.n_group_used    = hp.n_group_used;
+
+        const size_t n_layers = model.layers.size();
+        ps.gate_w.resize(n_layers);
+        ps.gate_b.resize(n_layers);
+        ps.probs_b.resize(n_layers);
+        ps.per_layer.resize(n_layers);
+
+        size_t loaded = 0;
+        for (size_t il = 0; il < n_layers; ++il) {
+            const auto & l = model.layers[il];
+            if (!l.ffn_gate_inp) {
+                continue;
+            }
+            if (llama_load_f32(l.ffn_gate_inp, ps.gate_w[il])) {
+                loaded++;
+            } else {
+                ps.gate_w[il].clear();
+            }
+            llama_load_f32(l.ffn_gate_inp_b,  ps.gate_b[il]);
+            llama_load_f32(l.ffn_exp_probs_b, ps.probs_b[il]);
+        }
+        ps.prev_act.resize(ps.n_embd);
+
+        LLAMA_LOG_INFO("%s: expert PREDICT STUDY: %zu routers loaded, n_embd=%" PRId64
+                       " n_expert=%" PRId64 " n_used=%" PRId64 " gating=%u groups=%u/%u\n",
+                __func__, loaded, ps.n_embd, ps.n_expert, ps.n_expert_used,
+                ps.gating_op, ps.n_group_used, ps.n_expert_groups);
     }
 
     for (int i = 0; i < n_threads; ++i) {
@@ -350,6 +604,26 @@ void llama_expert_prefetcher::uninstall() {
 
 void llama_expert_prefetcher::print_stats() const {
     const impl & p = *pimpl;
+
+    if (p.ps.enabled) {
+        uint64_t tot_n = 0, tot_self = 0, tot_pred = 0, tot_slots = 0;
+        LLAMA_LOG_INFO("expert predict study: per-layer overlap of routing computed from the "
+                       "PREVIOUS layer's activations vs actual (self = control, must be ~100%%)\n");
+        for (size_t il = 0; il < p.ps.per_layer.size(); ++il) {
+            const auto & s = p.ps.per_layer[il];
+            if (s.n == 0) {
+                continue;
+            }
+            LLAMA_LOG_INFO("  layer %3zu: n=%6" PRIu64 "  self=%5.1f%%  pred=%5.1f%%\n",
+                    il, s.n, 100.0*s.self_hit/s.slots, 100.0*s.pred_hit/s.slots);
+            tot_n += s.n; tot_self += s.self_hit; tot_pred += s.pred_hit; tot_slots += s.slots;
+        }
+        if (tot_slots) {
+            LLAMA_LOG_INFO("expert predict study: TOTAL n=%" PRIu64 "  self=%.1f%%  pred=%.1f%%\n",
+                    tot_n, 100.0*tot_self/tot_slots, 100.0*tot_pred/tot_slots);
+        }
+    }
+
     const uint64_t enq = p.n_enqueued.load();
     if (enq == 0) {
         return;
