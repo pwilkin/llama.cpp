@@ -70,7 +70,11 @@ struct llama_expert_prefetcher::impl {
     //                                                            is wrong and `pred` means nothing.
     //   pred : route(gate_inp[L], act[L-1]) vs actual ids[L]  -- the hypothesis.
     struct predict_study {
-        bool     enabled = false;
+        bool     enabled   = false;   // routers loaded and prediction machinery usable
+        bool     stats     = false;   // also collect/report the self/pred accuracy figures
+        bool     prefetch  = false;   // actually issue prefetches from the prediction
+        int      min_layer = 0;       // only predict layers at or beyond this depth
+        std::atomic<uint64_t> n_predicted{0};
         int64_t  n_embd = 0, n_expert = 0, n_expert_used = 0;
         uint32_t gating_op = 0, n_expert_groups = 0, n_group_used = 0;
 
@@ -99,9 +103,20 @@ struct llama_expert_prefetcher::impl {
         ps.logits.assign(ne, 0.0f);
         const float * W = ps.gate_w[il].data();
         for (int64_t e = 0; e < ne; ++e) {
+            // four independent accumulators: a plain float reduction is not reassociable, so this
+            // is what lets the compiler vectorise it. This runs once per predicted layer per token
+            // on a compute thread, so it is on the critical path.
             const float * w = W + e*nx;
-            float s = 0.0f;
-            for (int64_t i = 0; i < nx; ++i) {
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            int64_t i = 0;
+            for (; i + 4 <= nx; i += 4) {
+                s0 += w[i+0]*act[i+0];
+                s1 += w[i+1]*act[i+1];
+                s2 += w[i+2]*act[i+2];
+                s3 += w[i+3]*act[i+3];
+            }
+            float s = s0 + s1 + s2 + s3;
+            for (; i < nx; ++i) {
                 s += w[i]*act[i];
             }
             ps.logits[e] = s + (ps.gate_b[il].empty() ? 0.0f : ps.gate_b[il][e]);
@@ -346,6 +361,43 @@ struct llama_expert_prefetcher::impl {
         }
     }
 
+    // queue every row this group needs for the given expert ids
+    void enqueue_experts(const group & g, const int32_t * experts, int n) {
+        for (int i = 0; i < n; ++i) {
+            const int32_t e = experts[i];
+            for (int k = 0; k < g.n; ++k) {
+                const ggml_tensor * t = g.t[k];
+                if (e < 0 || e >= t->ne[2]) {
+                    continue;
+                }
+                range r;
+                if (make_range((const char *) t->data + (size_t) e * t->nb[2], t->nb[2], r)) {
+                    push(r);
+                }
+            }
+        }
+    }
+
+    // The point of the whole exercise: run the NEXT MoE layer's real router on THIS layer's
+    // activations and start paging in the experts it selects. Those reads then have a full layer of
+    // lead -- this layer's expert compute plus the next layer's attention on the GPU, which is where
+    // the disk otherwise sits idle. Measured overlap with the true routing is ~83% beyond layer ~30
+    // and chance-level in the first few MoE layers, hence min_layer.
+    void predict_next(size_t idx, const float * act) {
+        const size_t nxt = idx + 1;
+        if (nxt >= groups.size()) {
+            return;
+        }
+        const group & g = groups[nxt];
+        if (g.il < ps.min_layer || g.il >= (int) ps.gate_w.size() || ps.gate_w[g.il].empty()) {
+            return;
+        }
+        std::vector<int32_t> pred;
+        route(act, g.il, pred);
+        enqueue_experts(g, pred.data(), (int) pred.size());
+        ps.n_predicted.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void on_node(const ggml_tensor * dst) {
         const ggml_tensor * src0 = dst->src[0];
         const ggml_tensor * src1 = dst->src[1];
@@ -382,16 +434,22 @@ struct llama_expert_prefetcher::impl {
                 fp = (fp ^ (uint64_t) (uint32_t) e) * 1099511628211ull;
             }
         }
-        // Prediction study. Runs off the gate/up node, whose src1 IS the router input; the down
-        // node's src1 is the post-SwiGLU activation (n_ff wide), so it is skipped. Tracked with its
-        // own fingerprint so it is unaffected by the enqueue dedup below.
+        // Runs off the gate/up node, whose src1 IS the router input; the down node's src1 is the
+        // post-SwiGLU activation (n_ff wide), so it is skipped. Tracked with its own fingerprint so
+        // it is unaffected by the enqueue dedup below.
         if (ps.enabled && n_tokens == 1 && src1->type == GGML_TYPE_F32 &&
             src1->ne[0] == ps.n_embd && src1->data != nullptr &&
             !(g.obs_seeded && g.last_obs == fp)) {
             g.last_obs   = fp;
             g.obs_seeded = true;
-            observe_prediction(g.il, (const float *) src1->data,
-                    (const int32_t *) ids->data, (int) n_used);
+            const float * act = (const float *) src1->data;
+
+            if (ps.prefetch) {
+                predict_next(it->second, act);
+            }
+            if (ps.stats) {
+                observe_prediction(g.il, act, (const int32_t *) ids->data, (int) n_used);
+            }
         }
 
         if (g.seeded && g.last_ids == fp) {
@@ -543,10 +601,29 @@ std::unique_ptr<llama_expert_prefetcher> llama_expert_prefetcher::create(
         return nullptr;
     }
 
-    if (getenv("LLAMA_EXPERT_PREDICT_STATS")) {
+    // Speculative cross-layer prefetch: OFF by default (LLAMA_EXPERT_PREDICT=1 enables), because on
+    // a working set larger than RAM it measured net NEGATIVE -- see below. Kept because it is a
+    // clean win for any placement where the extra reads are free rather than displacing cache.
+    //
+    // The prediction itself works: running layer L+1's real router on layer L's activations picks
+    // 76.8% of the true experts overall, ~83% beyond layer 30. But throughput = disk_bandwidth /
+    // bytes_per_token when the model does not fit, so the ~23% mispredictions are pure cost:
+    //   min_layer=15: 1.740 t/s (-6.8% vs 1.867), read +22.0%
+    //   min_layer=30: 1.820 t/s (-2.5% vs 1.867), read +16.5%
+    // Restricting to the high-accuracy layers cuts both the waste and the loss, monotonically -- but
+    // the line does not cross zero. Break-even needs accuracy near 100%, which staleness cannot give.
+    {
+        const char * e_pred  = getenv("LLAMA_EXPERT_PREDICT");
+        const char * e_min   = getenv("LLAMA_EXPERT_PREDICT_MIN_LAYER");
+        const bool   want_pf = e_pred && atoi(e_pred) != 0;
+        const bool   want_st = getenv("LLAMA_EXPERT_PREDICT_STATS") != nullptr;
+
         auto & ps = p.ps;
         const auto & hp = model.hparams;
-        ps.enabled         = true;
+        ps.prefetch        = want_pf;
+        ps.stats           = want_st;
+        ps.min_layer       = e_min ? atoi(e_min) : 15;
+        ps.enabled         = want_pf || want_st;
         ps.n_embd          = hp.n_embd;
         ps.n_expert        = hp.n_expert;
         ps.n_expert_used   = hp.n_expert_used;
@@ -560,14 +637,21 @@ std::unique_ptr<llama_expert_prefetcher> llama_expert_prefetcher::create(
         ps.probs_b.resize(n_layers);
         ps.per_layer.resize(n_layers);
 
-        size_t loaded = 0;
+        size_t loaded = 0, bytes = 0;
         for (size_t il = 0; il < n_layers; ++il) {
             const auto & l = model.layers[il];
             if (!l.ffn_gate_inp) {
                 continue;
             }
+            // The stats mode needs every layer to report the depth profile; prefetching only ever
+            // predicts layers >= min_layer, and each router is n_expert*n_embd floats (6 MiB here),
+            // so skipping the shallow ones keeps that much RAM in the page cache instead.
+            if (!ps.stats && (int) il < ps.min_layer) {
+                continue;
+            }
             if (llama_load_f32(l.ffn_gate_inp, ps.gate_w[il])) {
                 loaded++;
+                bytes += ps.gate_w[il].size()*sizeof(float);
             } else {
                 ps.gate_w[il].clear();
             }
@@ -575,11 +659,16 @@ std::unique_ptr<llama_expert_prefetcher> llama_expert_prefetcher::create(
             llama_load_f32(l.ffn_exp_probs_b, ps.probs_b[il]);
         }
         ps.prev_act.resize(ps.n_embd);
+        if (loaded == 0) {
+            ps.enabled = ps.prefetch = ps.stats = false;
+        }
 
-        LLAMA_LOG_INFO("%s: expert PREDICT STUDY: %zu routers loaded, n_embd=%" PRId64
-                       " n_expert=%" PRId64 " n_used=%" PRId64 " gating=%u groups=%u/%u\n",
-                __func__, loaded, ps.n_embd, ps.n_expert, ps.n_expert_used,
-                ps.gating_op, ps.n_group_used, ps.n_expert_groups);
+        LLAMA_LOG_INFO("%s: expert predict: %s%s, %zu routers (%.0f MiB), min_layer=%d, "
+                       "n_embd=%" PRId64 " n_expert=%" PRId64 " n_used=%" PRId64
+                       " gating=%u groups=%u/%u\n",
+                __func__, ps.prefetch ? "prefetch" : "off", ps.stats ? "+stats" : "",
+                loaded, bytes/(1024.0*1024.0), ps.min_layer, ps.n_embd, ps.n_expert,
+                ps.n_expert_used, ps.gating_op, ps.n_group_used, ps.n_expert_groups);
     }
 
     for (int i = 0; i < n_threads; ++i) {
@@ -629,9 +718,9 @@ void llama_expert_prefetcher::print_stats() const {
         return;
     }
     LLAMA_LOG_INFO("%s: expert prefetch: %" PRIu64 " queued, %" PRIu64 " completed, %" PRIu64
-                   " dropped, %" PRIu64 " failed, %.1f GiB populated%s\n",
+                   " dropped, %" PRIu64 " failed, %.1f GiB populated, %" PRIu64 " layers predicted%s\n",
             __func__, enq, p.n_done.load(), p.n_dropped.load(), p.n_failed.load(),
-            p.bytes.load() / (1024.0*1024.0*1024.0),
+            p.bytes.load() / (1024.0*1024.0*1024.0), p.ps.n_predicted.load(),
             p.use_populate.load() ? "" : " (MADV_POPULATE_READ unavailable, used page touch)");
 }
 
