@@ -2620,7 +2620,13 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
-#if defined (__AVX__) || defined (__AVX2__)
+// AVX-512 VBMI + GFNI replace the IQ2_XXS / IQ3_XXS codebook and sign tables
+// outright (see the block below), which leaves keven_signs_q2xs with no users.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VBMI__) && defined(__GFNI__)
+#define GGML_IQ_XXS_VBMI
+#endif
+
+#if (defined (__AVX__) || defined (__AVX2__)) && !defined(GGML_IQ_XXS_VBMI)
 static const int8_t keven_signs_q2xs[1024] = {
      1,  1,  1,  1,  1,  1,  1,  1, -1,  1,  1,  1,  1,  1,  1, -1,  1, -1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1,  1,
      1,  1, -1,  1,  1,  1,  1, -1, -1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1, -1,
@@ -2657,6 +2663,140 @@ static const int8_t keven_signs_q2xs[1024] = {
 };
 #endif
 
+// ============================================================================
+// AVX-512 (VBMI + GFNI) fast paths for the IQ2_XXS / IQ3_XXS codebook quants.
+//
+// The AVX2 kernels below spend most of their time assembling operands rather
+// than multiplying them: they derive grid/sign indices with scalar bit-twiddling
+// and then build 256-bit vectors one table entry at a time (vmovd / vpinsrd /
+// vpunpcklqdq / vinserti32x4). Three properties of the tables remove that work
+// entirely (the packed tables below are derived from the originals, so the
+// derivation is checked by the usual quant round-trip / vec_dot tests):
+//
+//  1. iq3xxs_grid: every entry is 4 bytes drawn from an 8-value alphabet, so an
+//     entry carries only 12 bits. iq2xxs_grid: 8 bytes from a 3-value alphabet,
+//     i.e. 16 bits. Both tables therefore compress to 512 bytes, which fits in
+//     8 zmm registers -- the lookup becomes vpermi2w, with no memory traffic and
+//     no per-element inserts. The packed selectors are expanded back to bytes
+//     with one vpmultishiftqb (bit-field extract) plus one vpshufb (alphabet).
+//
+//  2. keven_signs_q2xs is not really data: entry v has byte i = 1 - 2*bit_i(v)
+//     for i < 7, and byte 7 carries even parity. So the eight sign bytes of a
+//     group are just the bits of (v | parity(v) << 7); parity is one GFNI
+//     vgf2p8affineqb.
+//
+//  3. Consequently the eight sign-pattern bytes covering 64 elements, read as a
+//     little-endian u64, *are* the negate-mask for those elements: bit 8*j+i is
+//     bit i of byte j. So sign application is a single masked vpsubb.
+//
+// The integer arithmetic is unchanged and the int32 lanes are folded back to the
+// AVX2 kernel's 8-lane layout before the float accumulate, so results are
+// bit-identical to the AVX2 path (not merely close).
+// ============================================================================
+
+#if defined(GGML_IQ_XXS_VBMI)
+
+// iq3xxs_grid[i] packed as 4 x 3-bit selectors into iq3xxs_values
+static const uint16_t iq3xxs_grid_bits12[256] = {
+    0x0000, 0x0002, 0x0004, 0x0009, 0x000b, 0x000f, 0x0010, 0x0012, 0x0019, 0x0022, 0x003b, 0x003d, 0x0041, 0x0043, 0x0048, 0x004a,
+    0x0051, 0x0055, 0x0058, 0x005a, 0x0061, 0x006c, 0x0078, 0x0080, 0x0082, 0x0084, 0x0089, 0x0090, 0x0092, 0x0099, 0x009b, 0x009f,
+    0x00a9, 0x00af, 0x00bd, 0x00c1, 0x00c7, 0x00c8, 0x00ca, 0x00d5, 0x00f8, 0x010b, 0x011f, 0x0124, 0x012f, 0x013b, 0x013d, 0x0141,
+    0x0147, 0x015a, 0x016a, 0x019d, 0x01b4, 0x01c8, 0x01cc, 0x01ce, 0x01e3, 0x01f1, 0x0201, 0x0203, 0x0208, 0x020a, 0x0211, 0x0213,
+    0x0218, 0x021a, 0x021c, 0x0227, 0x0228, 0x0240, 0x0242, 0x0249, 0x0250, 0x0252, 0x0281, 0x0283, 0x0288, 0x028a, 0x0291, 0x0298,
+    0x02ba, 0x02c0, 0x02c2, 0x02d0, 0x02d9, 0x02e6, 0x02f6, 0x0301, 0x0305, 0x0328, 0x0350, 0x0354, 0x0366, 0x0379, 0x0385, 0x03d2,
+    0x03e0, 0x0400, 0x0402, 0x0409, 0x040b, 0x0410, 0x0412, 0x0416, 0x0419, 0x0422, 0x0441, 0x0443, 0x0445, 0x0448, 0x044a, 0x0451,
+    0x0458, 0x0473, 0x0477, 0x0478, 0x0480, 0x0482, 0x0489, 0x048f, 0x0490, 0x0492, 0x049f, 0x04a0, 0x04ad, 0x04c1, 0x04c8, 0x04cc,
+    0x04f8, 0x04fc, 0x051d, 0x052b, 0x0543, 0x0557, 0x0561, 0x057c, 0x05c1, 0x05c3, 0x05ce, 0x05e5, 0x0601, 0x0608, 0x060a, 0x0611,
+    0x0613, 0x0628, 0x0635, 0x063a, 0x0640, 0x0642, 0x0650, 0x0659, 0x0664, 0x0666, 0x0681, 0x0683, 0x0688, 0x0695, 0x06aa, 0x06ba,
+    0x06c9, 0x06db, 0x0718, 0x0727, 0x073a, 0x0740, 0x0746, 0x0752, 0x076d, 0x078c, 0x079e, 0x07b3, 0x07db, 0x07f0, 0x0804, 0x080f,
+    0x081d, 0x081f, 0x082b, 0x082f, 0x087c, 0x0890, 0x089f, 0x08a0, 0x08b0, 0x08b6, 0x08c7, 0x08e5, 0x0904, 0x0929, 0x0934, 0x0955,
+    0x0963, 0x0978, 0x09c5, 0x09c8, 0x09ca, 0x09d8, 0x0a0a, 0x0a21, 0x0a38, 0x0a40, 0x0a46, 0x0a56, 0x0a6d, 0x0a8c, 0x0a9a, 0x0aba,
+    0x0ac2, 0x0aeb, 0x0b08, 0x0b13, 0x0b17, 0x0b3a, 0x0b42, 0x0b59, 0x0ba8, 0x0bd4, 0x0be2, 0x0c14, 0x0c24, 0x0c26, 0x0c34, 0x0c51,
+    0x0c71, 0x0c8f, 0x0cb4, 0x0cd8, 0x0cde, 0x0d24, 0x0d45, 0x0d6a, 0x0d9b, 0x0dc3, 0x0dd1, 0x0e03, 0x0e05, 0x0e07, 0x0e08, 0x0e1a,
+    0x0e2a, 0x0e56, 0x0e60, 0x0e8a, 0x0ea5, 0x0eaa, 0x0ec0, 0x0ecd, 0x0edb, 0x0ef0, 0x0f11, 0x0f21, 0x0f40, 0x0f42, 0x0f54, 0x0f98,
+};
+static const uint8_t iq3xxs_values[16] = { 4, 12, 20, 28, 36, 44, 52, 62, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+// iq2xxs_grid[i] packed as 8 x 2-bit selectors into iq2xxs_values
+static const uint16_t iq2xxs_grid_bits16[256] = {
+    0x0000, 0x0002, 0x0005, 0x0008, 0x000a, 0x0011, 0x0014, 0x0020, 0x0022, 0x0028, 0x002a, 0x0041, 0x0044, 0x0050, 0x0058, 0x0061,
+    0x0064, 0x0080, 0x0082, 0x008a, 0x00a2, 0x0101, 0x0104, 0x0110, 0x0115, 0x0140, 0x0184, 0x0198, 0x0200, 0x0202, 0x0222, 0x0282,
+    0x0401, 0x0404, 0x0410, 0x0421, 0x0424, 0x0440, 0x0442, 0x0448, 0x0460, 0x0481, 0x0484, 0x0490, 0x04a4, 0x0500, 0x0502, 0x0508,
+    0x0520, 0x0546, 0x0569, 0x0580, 0x0591, 0x0609, 0x0610, 0x0640, 0x0684, 0x06a4, 0x0800, 0x0805, 0x0808, 0x0814, 0x0828, 0x0841,
+    0x0844, 0x0850, 0x0852, 0x0888, 0x0904, 0x0940, 0x0a02, 0x0a14, 0x1001, 0x1004, 0x1010, 0x1021, 0x1040, 0x1060, 0x1084, 0x1090,
+    0x1095, 0x1100, 0x1108, 0x1120, 0x1150, 0x115a, 0x1180, 0x1224, 0x1245, 0x1400, 0x1408, 0x1420, 0x1425, 0x1449, 0x1480, 0x1518,
+    0x1562, 0x1600, 0x1616, 0x1801, 0x1804, 0x1810, 0x1840, 0x1881, 0x1900, 0x1905, 0x19a0, 0x1a51, 0x2000, 0x2002, 0x200a, 0x2044,
+    0x2061, 0x2080, 0x2082, 0x2129, 0x2148, 0x2200, 0x2202, 0x2401, 0x2404, 0x2410, 0x2440, 0x2456, 0x2500, 0x2541, 0x2564, 0x2690,
+    0x2808, 0x2820, 0x2894, 0x2a44, 0x4001, 0x4004, 0x4010, 0x4018, 0x4021, 0x4024, 0x4040, 0x4048, 0x4056, 0x4060, 0x4081, 0x4084,
+    0x4090, 0x4100, 0x4120, 0x4161, 0x4180, 0x4185, 0x4201, 0x4210, 0x4248, 0x4256, 0x4268, 0x4400, 0x4408, 0x4420, 0x4480, 0x4499,
+    0x4512, 0x4524, 0x4600, 0x4801, 0x4804, 0x4810, 0x4840, 0x4845, 0x4900, 0x4958, 0x4961, 0x4982, 0x4a45, 0x4a90, 0x5000, 0x5008,
+    0x5011, 0x5019, 0x5020, 0x5080, 0x5088, 0x5104, 0x5142, 0x51a4, 0x5291, 0x5490, 0x5492, 0x550a, 0x5601, 0x5654, 0x5800, 0x5811,
+    0x5819, 0x5864, 0x5940, 0x5a08, 0x6004, 0x6010, 0x6040, 0x6068, 0x6100, 0x6155, 0x6218, 0x6260, 0x6400, 0x6405, 0x6510, 0x6512,
+    0x6584, 0x6842, 0x8000, 0x8002, 0x800a, 0x8041, 0x8082, 0x8104, 0x8118, 0x8140, 0x8211, 0x8401, 0x8404, 0x8410, 0x8415, 0x8440,
+    0x8460, 0x8500, 0x8546, 0x8594, 0x8609, 0x8640, 0x8660, 0x8802, 0x8904, 0x8a11, 0x9004, 0x9010, 0x9024, 0x9040, 0x90a1, 0x9116,
+    0x9180, 0x9245, 0x9400, 0x9422, 0x9444, 0x9551, 0x9881, 0x9920, 0xa002, 0xa050, 0xa085, 0xa109, 0xa200, 0xa418, 0xa850, 0xa904,
+};
+static const uint8_t iq2xxs_values[16] = { 8, 25, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+// per 64-element chunk: words 0-15 take subblock 2c's scale, words 16-31 take 2c+1's
+static const uint16_t iq_xxs_scale_perm[4][32] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+    { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 },
+    { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 },
+    { 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
+};
+
+// eight byte-offsets packed into the vpmultishiftqb control operand
+#define IQ_XXS_MS8(a, b, c, d, e, f, g, h)                                                    \
+    ((uint64_t)(a) | ((uint64_t)(b) << 8) | ((uint64_t)(c) << 16) | ((uint64_t)(d) << 24) |   \
+     ((uint64_t)(e) << 32) | ((uint64_t)(f) << 40) | ((uint64_t)(g) << 48) | ((uint64_t)(h) << 56))
+
+// 32 lookups into a 256-entry uint16 table held entirely in registers
+static inline __m512i iq_xxs_lut256(const __m512i idx, const __m512i * T) {
+    const __m512i p0 = _mm512_permutex2var_epi16(T[0], idx, T[1]);
+    const __m512i p1 = _mm512_permutex2var_epi16(T[2], idx, T[3]);
+    const __m512i p2 = _mm512_permutex2var_epi16(T[4], idx, T[5]);
+    const __m512i p3 = _mm512_permutex2var_epi16(T[6], idx, T[7]);
+    const __mmask32 m6 = _mm512_test_epi16_mask(idx, _mm512_set1_epi16(64));
+    const __mmask32 m7 = _mm512_test_epi16_mask(idx, _mm512_set1_epi16(128));
+    return _mm512_mask_blend_epi16(m7, _mm512_mask_blend_epi16(m6, p0, p1),
+                                       _mm512_mask_blend_epi16(m6, p2, p3));
+}
+
+// 8 sign/scale words -> 32 sign-pattern bytes (7-bit index | parity << 7)
+static inline __m512i iq_xxs_sign_patterns(const __m512i gasv) {
+    const __m512i sh   = _mm512_set1_epi64(IQ_XXS_MS8(0, 7, 14, 21, 32, 39, 46, 53));
+    const __m512i idx7 = _mm512_and_si512(_mm512_multishift_epi64_epi8(sh, gasv), _mm512_set1_epi8(0x7f));
+    const __m512i par  = _mm512_gf2p8affine_epi64_epi8(idx7, _mm512_set1_epi64(0xffULL), 0);
+    return _mm512_or_si512(idx7, par);
+}
+
+// 8 sign/scale words -> the eight (2*ls + 1) factors as int16 in the low lane
+static inline __m512i iq_xxs_scale_words(const __m256i gas8) {
+    const __m256i ls = _mm256_srli_epi32(gas8, 28);
+    return _mm512_castsi128_si512(_mm256_cvtepi32_epi16(
+               _mm256_add_epi32(_mm256_add_epi32(ls, ls), _mm256_set1_epi32(1))));
+}
+
+// int32 lanes k and k+8 hold exactly what the AVX2 kernel keeps in sumi1/sumi2,
+// so folding them here reproduces its float rounding bit for bit
+static inline __m256i iq_xxs_fold(const __m512i sumi) {
+    return _mm256_add_epi32(_mm512_castsi512_si256(sumi), _mm512_extracti64x4_epi64(sumi, 1));
+}
+
+// one 64-element chunk: apply signs, multiply, scale, accumulate
+#define IQ_XXS_ACCUM(c, g)                                                                     \
+    {                                                                                          \
+        const __m512i q8v = _mm512_loadu_si512(q8); q8 += 64;                                  \
+        const __m512i q8s = _mm512_mask_sub_epi8(q8v, (__mmask64) patq[c], zero, q8v);         \
+        const __m512i dot = _mm512_maddubs_epi16(g, q8s);                                      \
+        const __m512i sc  = _mm512_permutexvar_epi16(                                          \
+                                _mm512_loadu_si512(iq_xxs_scale_perm[c]), lsz);                \
+        sumi = _mm512_add_epi32(sumi, _mm512_madd_epi16(dot, sc));                             \
+    }
+
+#endif // AVX-512 VBMI + GFNI
+
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -2670,7 +2810,49 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     const int nb = n / QK_K;
 
-#if defined(__AVX2__)
+#if defined(GGML_IQ_XXS_VBMI)
+
+    __m512i T[8];
+    for (int k = 0; k < 8; ++k) T[k] = _mm512_loadu_si512((const char *)iq2xxs_grid_bits16 + 64*k);
+    const __m512i lut     = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)iq2xxs_values));
+    const __m512i ms_grid = _mm512_set1_epi64(IQ_XXS_MS8(0, 2, 4, 6, 8, 10, 12, 14));
+    const __m512i zero    = _mm512_setzero_si512();
+    const __m512i sel2    = _mm512_set1_epi8(0x03);
+
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        const int8_t * GGML_RESTRICT q8 = y[i].qs;
+
+        // even dwords hold the 32 grid indices, odd dwords the 8 sign/scale words
+        const __m512i qsv  = _mm512_loadu_si512(x[i].qs);
+        const __m256i idxb = _mm512_cvtepi64_epi32(qsv);
+        const __m256i gas8 = _mm512_cvtepi64_epi32(_mm512_srli_epi64(qsv, 32));
+
+        const __m512i v16 = iq_xxs_lut256(_mm512_cvtepu8_epi16(idxb), T);
+        const __m512i lsz = iq_xxs_scale_words(gas8);
+
+        uint64_t patq[4];
+        _mm256_storeu_si256((__m256i *)patq,
+            _mm512_castsi512_si256(iq_xxs_sign_patterns(_mm512_castsi256_si512(gas8))));
+
+        __m512i sumi = _mm512_setzero_si512();
+#define IQ2XXS_CHUNK(c)                                                                        \
+        {                                                                                      \
+            const __m512i g = _mm512_shuffle_epi8(lut, _mm512_and_si512(                       \
+                _mm512_multishift_epi64_epi8(ms_grid,                                          \
+                    _mm512_cvtepu16_epi64(_mm512_extracti32x4_epi32(v16, c))), sel2));         \
+            IQ_XXS_ACCUM(c, g);                                                                \
+        }
+        IQ2XXS_CHUNK(0); IQ2XXS_CHUNK(1); IQ2XXS_CHUNK(2); IQ2XXS_CHUNK(3);
+#undef IQ2XXS_CHUNK
+
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(iq_xxs_fold(sumi)), accumf);
+    }
+
+    *s = 0.125f * hsum_float_8(accumf);
+
+#elif defined(__AVX2__)
 
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
 
@@ -3270,7 +3452,50 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     const int nb = n / QK_K;
 
-#if defined(__AVX2__)
+#if defined(GGML_IQ_XXS_VBMI)
+
+    __m512i T[8];
+    for (int k = 0; k < 8; ++k) T[k] = _mm512_loadu_si512((const char *)iq3xxs_grid_bits12 + 64*k);
+    const __m512i lut     = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)iq3xxs_values));
+    const __m512i ms_grid = _mm512_set1_epi64(IQ_XXS_MS8(0, 3, 6, 9, 32, 35, 38, 41));
+    const __m512i zero    = _mm512_setzero_si512();
+    const __m512i sel3    = _mm512_set1_epi8(0x07);
+
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        const int8_t * GGML_RESTRICT q8 = y[i].qs;
+
+        const __m512i idxb = _mm512_loadu_si512(x[i].qs);                              // 64 grid indices
+        const __m256i gas8 = _mm256_loadu_si256((const __m256i *)(x[i].qs + QK_K/4));  // 8 sign/scale words
+
+        const __m512i v12lo = iq_xxs_lut256(_mm512_cvtepu8_epi16(_mm512_castsi512_si256(idxb)), T);
+        const __m512i v12hi = iq_xxs_lut256(_mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(idxb, 1)), T);
+        const __m512i lsz   = iq_xxs_scale_words(gas8);
+
+        uint64_t patq[4];
+        _mm256_storeu_si256((__m256i *)patq,
+            _mm512_castsi512_si256(iq_xxs_sign_patterns(_mm512_castsi256_si512(gas8))));
+
+        __m512i sumi = _mm512_setzero_si512();
+#define IQ3XXS_CHUNK(c, v, half)                                                               \
+        {                                                                                      \
+            const __m256i w16 = (half) ? _mm512_extracti64x4_epi64(v, 1)                       \
+                                       : _mm512_castsi512_si256(v);                            \
+            const __m512i g = _mm512_shuffle_epi8(lut, _mm512_and_si512(                       \
+                _mm512_multishift_epi64_epi8(ms_grid, _mm512_cvtepu16_epi32(w16)), sel3));     \
+            IQ_XXS_ACCUM(c, g);                                                                \
+        }
+        IQ3XXS_CHUNK(0, v12lo, 0); IQ3XXS_CHUNK(1, v12lo, 1);
+        IQ3XXS_CHUNK(2, v12hi, 0); IQ3XXS_CHUNK(3, v12hi, 1);
+#undef IQ3XXS_CHUNK
+
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(iq_xxs_fold(sumi)), accumf);
+    }
+
+    *s = 0.25f * hsum_float_8(accumf);
+
+#elif defined(__AVX2__)
 
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
 
