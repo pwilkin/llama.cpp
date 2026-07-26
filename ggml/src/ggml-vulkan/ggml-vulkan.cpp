@@ -3431,6 +3431,7 @@ static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const 
 }
 
 static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
+
     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
 
     const bool transfer_queue = subctx->p->q->transfer_only;
@@ -16601,6 +16602,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
+        // Under backend splitting (e.g. --cpu-moe / partial offload), the scheduler batches this
+        // split's input copies into a compute context via set_tensor/cpy_tensor without submitting
+        // it. The profiled path funnels every node into a single command buffer with its own
+        // timestamp query sequence, so it needs a clean context: flush any pending one first.
+        if (!ctx->compute_ctx.expired()) {
+            ggml_vk_synchronize(ctx);
+        }
         GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
