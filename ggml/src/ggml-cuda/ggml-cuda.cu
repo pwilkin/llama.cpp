@@ -4806,7 +4806,26 @@ static bool ggml_backend_cuda_host_buffer_supported() {
 static bool ggml_backend_cuda_device_supports_cuda_host_buft(int device) {
 #if defined(GGML_USE_HIP)
     if (ggml_cuda_info().devices[device].integrated) {
-        return false;
+        // EXPERIMENTAL (GGML_CUDA_ALLOW_HOST_BUFT=1): restore pre-#25863 behaviour.
+        //
+        // Refusing cuda_host here stops the iGPU reading pinned host memory directly,
+        // so the scheduler must stage every split input through a device copy instead.
+        // Measured on gfx1151 + GLM-5.2 --cpu-moe (cross-profiler, 39 tokens):
+        // 2560 copy_H2D totalling 2.32 s at 0.20 GB/s, against Vulkan's 0.03 s at
+        // 17.7 GB/s for byte-identical tensors. The bulk is 2326 copies of 192 KB:
+        // 75 distinct ffn_moe_down-N (one per layer), each staged back H2D once per
+        // decode token -- i.e. the --cpu-moe boundary itself. Allowing the iGPU to
+        // read the pinned host buffer directly removes these copies outright rather
+        // than making them faster. That copy traffic is the whole of the
+        // measured 1.68x ROCm-vs-Vulkan decode deficit; ROCm's MUL_MAT is actually
+        // 0.71x (faster than Vulkan's).
+        //
+        // Zero-copy is the point of unified memory on an APU. The upstream change is
+        // right for compute-heavy ops over host memory and wrong for small per-layer
+        // inputs; this env var lets us measure which dominates for a given config.
+        if (getenv("GGML_CUDA_ALLOW_HOST_BUFT") == nullptr) {
+            return false;
+        }
     }
 #else
     GGML_UNUSED(device);
