@@ -318,6 +318,12 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_SSM_DT_B_C_RMS,                    hparams.ssm_dt_b_c_rms);
 
     add_kv(LLM_KV_KDA_HEAD_DIM,                      hparams.n_embd_head_kda);
+    add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,              hparams.kda_gate_lower_bound);
+
+    add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,               hparams.attn_res_block_size);
+    add_kv(LLM_KV_ACTIVATION_SITU_BETA,              hparams.situ_beta);
+    add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA,       hparams.situ_linear_beta);
+    add_kv(LLM_KV_EXPERT_LATENT_LENGTH,              hparams.n_expert_latent);
 
     add_kv(LLM_KV_WKV_HEAD_SIZE,                     hparams.wkv_head_size);
 
@@ -402,6 +408,7 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->output_norm_enc);
     add_tensor(model->output_s);
     add_tensor(model->output_in_s);
+    add_tensor(model->output_res_score);
     add_tensor(model->cls);
     add_tensor(model->cls_b);
     add_tensor(model->cls_out);

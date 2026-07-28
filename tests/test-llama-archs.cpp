@@ -105,11 +105,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
-            || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_MISTRAL4) {
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
+    } else if (arch == LLM_ARCH_KIMI_K3) {
+        n_embd  = 128;
+        n_head  = 1;
+        n_ff    = 192;
+        n_layer = 5; // enough to exercise the hybrid KDA/MLA schedule incl. the consecutive-MLA ending
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -143,8 +147,21 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_TIME_DECAY_EXTRA_DIM,    uint32_t(128));
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(2));
 
-    if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
-            arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_KIMI_K3) {
+    if (arch == LLM_ARCH_KIMI_K3) {
+        // n_head_kv == 0 marks a KDA (recurrent) layer; n_head stays uniform,
+        // matching the conversion script's output. Mirror the released model's
+        // schedule shape: MLA every 4th layer plus an extra MLA on the final
+        // layer (i.e. the last two layers are consecutively MLA).
+        GGML_ASSERT(n_layer >= 5);
+        std::vector<uint32_t> n_head_kv_per_layer;
+        n_head_kv_per_layer.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            n_head_kv_per_layer.push_back(il == 3 || il == n_layer - 1 ? n_head : 0);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
+    } else if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
+            arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
@@ -173,6 +190,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
+    }
+    if (arch == LLM_ARCH_KIMI_K3) {
+        ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(2)); // 2 block boundaries within 5 layers
+        ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);  // released model's values
+        ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
+        ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,        uint32_t(64)); // < n_embd to exercise the latent projections
+        ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
     }
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
