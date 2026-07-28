@@ -537,6 +537,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 - [Running on Docker](docs/docker.md)
 - [Build on Android](docs/android.md)
 - [Multi-GPU usage](docs/multi-gpu.md)
+- [Profiling MoE expert routing predictability](docs/moe-expert-routing-profiling.md)
 - [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
 - [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
 
