@@ -141,6 +141,11 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
+    // glm5-next, complete pools of kpool consecutive positions per sequence, scored as whole pools
+    uint32_t get_n_kpool(uint32_t kpool) const; // padded pool count, the last pool is always unused
+    void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs, ggml_tensor * cell_pool,
+                         const llama_ubatch * ubatch, uint32_t kpool) const;
+
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
