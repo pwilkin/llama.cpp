@@ -17972,7 +17972,7 @@ static void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_back
     for (size_t i = 0; i < n_backends; i++) {
         comm->vkctx[i]  = (ggml_backend_vk_context *) backends[i]->context;
         comm->device[i] = comm->vkctx[i]->device;
-        ok = ok && comm->device[i]->external_memory_host && comm->device[i]->external_semaphore;
+        ok = ok && comm->device[i]->external_memory_host;
         comm->align = std::max(comm->align, (size_t) comm->device[i]->min_imported_host_pointer_alignment);
     }
     comm->fast = ok;
@@ -17994,7 +17994,8 @@ static void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_back
     if (comm->fast) {
         comm->pGetSemFd    = (PFN_vkGetSemaphoreFdKHR)    comm->device[0]->device.getProcAddr("vkGetSemaphoreFdKHR");
         comm->pImportSemFd = (PFN_vkImportSemaphoreFdKHR) comm->device[0]->device.getProcAddr("vkImportSemaphoreFdKHR");
-        comm->fast = comm->pGetSemFd && comm->pImportSemFd;
+        // Local timeline semaphores suffice for the portable proxy path.
+        comm->proxy = !comm->pGetSemFd || !comm->pImportSemFd;
     }
     if (comm->fast) {
         comm->prog.resize(n_backends);
@@ -18020,7 +18021,7 @@ static void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_back
         // signals/reads them locally, so it must not request exportable handles. Some devices (e.g. llvmpipe, or
         // RADV on older Mesa) cannot create exportable timeline semaphores at all, which would otherwise abort
         // init here instead of falling back to the proxy.
-        comm->proxy = getenv("GGML_VK_COMM_PROXY") != nullptr;
+        comm->proxy = comm->proxy || getenv("GGML_VK_COMM_PROXY") != nullptr;
         if (!comm->proxy && !ggml_vk_comm_opaque_fd_supported(comm)) {
             comm->proxy = true;
             GGML_LOG_INFO("ggml_vulkan: cross-device OPAQUE_FD timeline import unsupported; using portable CPU-proxy sync\n");
