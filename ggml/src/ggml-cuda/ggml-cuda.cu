@@ -1,3 +1,4 @@
+#include "mmb.cuh"
 #include "expand.cuh"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
@@ -34,6 +35,10 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+// the 5-argument form lives in this backend's own moe-weighted-reduction.cu (shared-expert merge folded in)
+void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
+                                         const ggml_tensor * expert_scale, const ggml_tensor * weights,
+                                         ggml_tensor * dst, const ggml_tensor * merge);
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1867,6 +1872,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
+        ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -1935,6 +1944,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
+        if (ggml_cuda_mmb_supported_mmid(src0, src1, ids, dst)) {
+            ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
+            return;
+        }
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -2063,6 +2076,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    if (ggml_cuda_mmb_marks_count() > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
+            dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE && dst->op != GGML_OP_NONE) {
+        for (int s = 0; s < GGML_MAX_SRC && dst->src[s]; ++s) {
+            const ggml_tensor * src = dst->src[s];
+            if (ggml_cuda_mmb_is_bf16_only(src) || (src->view_src && ggml_cuda_mmb_is_bf16_only(src->view_src))) {
+                GGML_ABORT("MMB: %s(%s) reads BF16-only tensor %s through the unfused path", ggml_op_name(dst->op), dst->name, src->name);
+            }
+        }
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2434,6 +2456,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
+    ggml_cuda_mmb_release_all();   // release cached BF16 conversions before the pool is destroyed (pool leak assert)
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     delete cuda_ctx;
@@ -3556,6 +3579,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
+        if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+            int count = match.node_count;
+            const ggml_tensor * merge = nullptr;
+            {   // shared-expert merge: ADD(reduction, ffn_shexp_gated) right after, with the reduction used only there
+                const int nadd = i + match.node_count;
+                if (ggml_cuda_mmb_blk16() && nadd < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + match.node_count - 1, 1)) {
+                    const ggml_tensor * add = cgraph->nodes[nadd];
+                    if (add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
+                            ggml_are_same_shape(add, match.dst) && ggml_cuda_mmb_is_bf16_only(add)) {
+                        const ggml_tensor * o = add->src[0] == match.dst ? add->src[1] : (add->src[1] == match.dst ? add->src[0] : nullptr);
+                        if (o && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) && ggml_are_same_shape(o, match.dst)) {
+                            merge = o; match.dst = const_cast<ggml_tensor *>(add); count = match.node_count + 1;
+                        }
+                    }
+                }
+            }
+            const int output_idx = i + count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1)) {
+                ggml_cuda_op_moe_weighted_reduction(
+                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst, merge);
+                return count - 1;
+            }
+        }
     }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -3988,6 +4034,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src0 = up->src[0];
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
+
+            if (op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmb_supported_glu(gate->src[0], up->src[0], src1, ids, glu)) {
+                ggml_cuda_mul_mat_id_mmb_glu(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -4464,6 +4517,7 @@ static bool graph_timing_enabled() { static const bool e = getenv("LLAMA_GRAPH_T
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     const int64_t gt_t0 = ggml_time_us();
+    ggml_cuda_mmb_begin_graph();
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -4574,6 +4628,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     const int64_t gt_t0 = ggml_time_us();
     {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
+        if (g_gt_after_compute || g_gt_first_split == nullptr || key == g_gt_first_split) { ggml_cuda_mmb_marks_clear(); g_gt_first_split = key; g_gt_after_compute = false; }
     }
 
 
@@ -4585,6 +4640,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     if (graph_timing_enabled()) {
         const ggml_tensor * f = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
+        fprintf(stderr, "GT optimize n=%d first=%s(%lld) took=%.1fms marks=%zu\n", cgraph->n_nodes, f ? f->name : "-", f ? (long long) ggml_nrows(f) : 0, (ggml_time_us() - gt_t0) / 1000.0, ggml_cuda_mmb_marks_count());
     }
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
