@@ -1,3 +1,4 @@
+#include "hc-mix.cuh"
 #include "mmb.cuh"
 #include "expand.cuh"
 #include <array>
@@ -3425,6 +3426,7 @@ static bool ggml_cuda_hc_combine_norm_alias_ok(const ggml_cuda_hc_combine_norm_a
     return !overlap(args.out_res, args.out_xn);
 }
 
+#include "hc-match.inc"
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -3688,6 +3690,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: run GEMM + sigmoid + mix in one kernel
+        const ggml_tensor * w = node->src[0], * lo = node->src[1];
+        if (w->type == GGML_TYPE_IQ4_NL && w->ne[0] == 320 && w->ne[1] == 10240 && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
+            ggml_cuda_hc_mix_args ma;
+            const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
+            if (count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
+        }
+    }
+
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_cuda_hc_mix_args args;
+        const int count=ggml_cuda_hc_mix_closed(cgraph,i,args);
+        if (count>0) {
+            ggml_cuda_op_hc_mix_reduce(*cuda_ctx,args);
+            return count-1;
+        }
+    }
 
     if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_qsa_expand_args args;
@@ -4807,6 +4828,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                ggml_cuda_hc_mix_args args;
+                const int count=ggml_cuda_hc_mix_closed(cgraph,i,args);
+                if (count>0) {
+                    params->add_alloc_dep(params->user_data,const_cast<ggml_tensor *>(args.xn),args.dst);
+                    params->add_alloc_dep(params->user_data,const_cast<ggml_tensor *>(args.gate),args.dst);
+                    i+=count-1;
+                    continue;
+                }
+            }
             if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                 ggml_cuda_qsa_expand_args args;
                 const int skip = ggml_cuda_match_qsa_expand(cgraph,i,args);
