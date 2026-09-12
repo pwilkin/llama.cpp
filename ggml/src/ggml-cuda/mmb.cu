@@ -642,7 +642,18 @@ size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
 void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
-void ggml_cuda_mmb_release_all() { ggml_cuda_mmb_begin_graph(); for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; } }
+void ggml_cuda_mmb_release_all() {
+    ggml_cuda_mmb_begin_graph();
+    for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
+    // the shadow weights are raw cudaMalloc, keyed by data pointer and held for the life of the
+    // process. A model has finitely many weights so this never mattered, but a long-lived process
+    // that sees many distinct tensors (test-backend-ops) keeps every one of them.
+    for (auto & e : g_mmb_shadow)      { if (e.second) cudaFree(e.second); }
+    for (auto & e : g_mmb_shadow_pair) { if (e.second) cudaFree(e.second); }
+    g_mmb_shadow.clear();
+    g_mmb_shadow_pair.clear();
+    g_mmb_shadow_bytes = 0;
+}
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
     if (!mmb_enabled() || ggml_nrows(t) < mmb_min_t()) return nullptr;
     return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
@@ -651,7 +662,8 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
 bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled()) return false;
     const bool quant = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q8_0 ||
-                       (src0->type == GGML_TYPE_Q6_K && mmb_shadow_q6k() && mmb_is_resident_q6k(src0));
+                       (src0->type == GGML_TYPE_Q6_K && mmb_shadow_q6k() && mmb_is_resident_q6k(src0) &&
+                        mmb_shadow_lookup(src0) != nullptr);
     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
     const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
     if ((!quant && !bf16w && !f32w) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
