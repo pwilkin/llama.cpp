@@ -86,8 +86,15 @@ public:
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
+    void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                             ggml_tensor * bias, ggml_tensor * tail_idxs,
+                             const llama_ubatch * ubatch, uint32_t ratio) const;
 
 private:
+    void set_input_qsa_impl(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                            ggml_tensor * bias, ggml_tensor * tail_idxs,
+                            const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -140,10 +147,15 @@ public:
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
+    bool qsa_scalar_visibility(const llama_ubatch & ubatch) const;
+    bool qsa_position_prefix(const llama_ubatch & ubatch) const;
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
+    void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                             ggml_tensor * bias, ggml_tensor * tail_idxs,
+                             const llama_ubatch * ubatch, uint32_t ratio) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

@@ -152,7 +152,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -232,6 +232,12 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
+    if (const char * e = getenv("LLAMA_GDN_CHUNKED")) {
+        if (atoi(e) != 0) {
+            cparams.fused_gdn_ch = false;
+            LLAMA_LOG_INFO("%s: LLAMA_GDN_CHUNKED: using build_delta_net_chunking (solve_tri) instead of the fused recurrence\n", __func__);
+        }
+    }
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;
@@ -1120,7 +1126,6 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
     }
 }
 
-
 void llama_context::attach_threadpool(
            ggml_threadpool_t threadpool,
            ggml_threadpool_t threadpool_batch) {
@@ -1705,6 +1710,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+
+    {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
+        // posix_fadvise only, so a wrong prediction costs readahead and nothing else
+        extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
+        if (batch_inp.token && batch_inp.n_tokens >= 4096) { qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens); }
+    }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {

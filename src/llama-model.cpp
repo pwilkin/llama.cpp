@@ -28,7 +28,15 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
+#include <thread>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1855,6 +1863,66 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+#ifndef _WIN32
+const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
+    if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
+        return nullptr;
+    }
+
+    if (!t) {
+        return nullptr;
+    }
+
+    if (const auto it = lazy_readers.find(tensor_name); it != lazy_readers.end()) {
+        return it->second.get();
+    }
+
+    const auto * w = ml.get_weight(tensor_name);
+    if (!w) {
+        // e.g. synthesised from metadata, no file rows to read
+        return nullptr;
+    }
+
+    // an independently opened buffered descriptor: dup() would share the
+    // loader's open file description, whose readahead advice and O_DIRECT
+    // flag would fight the small scattered row reads
+    const int fd = ::open(ml.files[w->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s), using lazy mmap reads\n",
+                __func__, ml.files[w->idx]->name().c_str(), strerror(errno));
+        return nullptr;
+    }
+
+#ifdef __linux__
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+
+    // in-flight reads are IO queue depth, not compute; 2x cores worked well
+    // on NVMe and stays sane on smaller machines
+    int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
+    if (const char * e = getenv("LLAMA_LAZY_READ_THREADS")) {   // the gather is NVMe queue-depth bound, not CPU bound
+        const int v = atoi(e);
+        if (v > 0 && v <= 4096) { n_threads = v; }
+    }
+
+    auto reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
+            ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
+
+    LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
+            __func__, tensor_name, reader->n_rows, reader->row_size, w->offs, n_threads);
+
+    lazy_readers[tensor_name] = std::move(reader);
+    return lazy_readers.at(tensor_name).get();
+}
+#else
+const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
+        LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
+    }
+    return nullptr;
+}
+#endif
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
@@ -2509,10 +2577,46 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // Halogen prefills the qwen4exp draft head with the SAME sparse attention as the trunk (one
+                // k_attn_qs_bt4x call per target chunk for the nextn layer), so with LLAMA_MTP_QSA=1 the MTP context
+                // gets an indexer cache instead of a plain KV cache.
+                static const bool mtp_qsa = getenv("LLAMA_MTP_QSA") && atoi(getenv("LLAMA_MTP_QSA")) != 0;
+
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 ||
+                     (arch == LLM_ARCH_QWEN4EXP && !(mtp_qsa && hparams.indexer_head_size > 0)));
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                        mtp_qsa && hparams.indexer_head_size > 0) {
+                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
+                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
+                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    return new llama_memory_hybrid_idx(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_pad        */ 1,
+                        /* attn_n_swa        */ hparams.n_swa,
+                        /* attn_swa_type     */ hparams.swa_type,
+                        /* recurrent_type_k  */ GGML_TYPE_F32,
+                        /* recurrent_type_v  */ GGML_TYPE_F32,
+                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(f_attn),
+                        /* filter_recr       */ std::move(f_recr),
+                        /* filter_idx        */ std::move(f_idx));
+                }
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2752,7 +2856,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     return llm->res->get_gf();
 }
 
-
 //
 // interface implementation
 //
@@ -2837,7 +2940,6 @@ int32_t llama_model_n_swa(const llama_model * model) {
     }
     return model->hparams.n_swa;
 }
-
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;
