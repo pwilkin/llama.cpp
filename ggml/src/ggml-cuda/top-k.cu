@@ -409,6 +409,40 @@ static __global__ void top_k_one_last_cuda(const int2 * __restrict__ src_pairs,
 }
 
 template<int BLOCK_SIZE>
+static __device__ void top_k_gather_equal(
+        const float * src, int * dst, int ncols, uint32_t threshold, int limit, int offset) {
+    const int tid = threadIdx.x;
+    const int lane = tid % warpSize;
+    const int warp = tid / warpSize;
+    const int nwarps = BLOCK_SIZE / warpSize;
+    __shared__ int warp_counts[32];
+    int count = 0;
+
+    for (int base = 0; base < ncols && count < limit; base += BLOCK_SIZE) {
+        const int col = base + tid;
+        const bool equal = col < ncols && top_k_float_to_ordered(src[col]) == threshold;
+        const unsigned long long mask = __ballot(equal);
+        if (lane == 0) {
+            warp_counts[warp] = __popcll(mask);
+        }
+        __syncthreads();
+        int before = count;
+        for (int w = 0; w < nwarps; ++w) {
+            if (w < warp) {
+                before += warp_counts[w];
+            }
+            count += warp_counts[w];
+        }
+        const unsigned long long lane_mask = (1ULL << lane) - 1;
+        const int pos = before + __popcll(mask & lane_mask);
+        if (equal && pos < limit) {
+            dst[offset + pos] = col;
+        }
+        __syncthreads();
+    }
+}
+
+template<int BLOCK_SIZE>
 static __global__ void top_k_radix_select_cuda(
         const float * __restrict__ src,
         int * __restrict__ dst,
@@ -480,15 +514,7 @@ static __global__ void top_k_radix_select_cuda(
         }
         __syncthreads();
 
-        for (int col = tid; col < ncols; col += BLOCK_SIZE) {
-            if (top_k_float_to_ordered(row_src[col]) == prefix) {
-                const uint32_t output = atomicAdd(&output_count, 1U);
-                if (output < (uint32_t) k) {
-                    row_dst[output] = col;
-                }
-            }
-        }
-        __syncthreads();
+        top_k_gather_equal<BLOCK_SIZE>(row_src, row_dst, ncols, prefix, desired, output_count);
     }
 }
 
@@ -884,13 +910,17 @@ static __global__ void top_k_parallel_radix_gather(
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
             row_dst[pos] = col;
-        } else if (key == state->prefix) {
-            const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
-            }
         }
     }
+}
+
+template<int BLOCK_SIZE>
+static __global__ void top_k_parallel_radix_gather_equal(
+        const float * src, int * dst, const top_k_parallel_radix_state * states, int ncols, int k) {
+    const int row = blockIdx.x;
+    const top_k_parallel_radix_state state = states[row];
+    top_k_gather_equal<BLOCK_SIZE>(src + (size_t) row*ncols, dst + (size_t) row*k,
+                                  ncols, state.prefix, state.rank, k - state.rank);
 }
 
 static void top_k_parallel_radix_cuda(
@@ -922,6 +952,8 @@ static void top_k_parallel_radix_cuda(
     top_k_parallel_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
             src, dst, states, ncols, k, blocks_per_row);
+    top_k_parallel_radix_gather_equal<BLOCK_SIZE>
+        <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 }
 
 static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
