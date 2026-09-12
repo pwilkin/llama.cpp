@@ -941,7 +941,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 }
 
-
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 template <ggml_type type, int J, bool fallback>
@@ -1231,6 +1230,100 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
+// thread per expert
+#define MMQ_ROUTED_MAX_EXPERTS 1024
+#ifndef MMQ_IQ_ID_J_MID
+#define MMQ_IQ_ID_J_MID 64
+#endif
+
+static constexpr bool mmq_rdna3_5_id_n_experts_ok(const int64_t n_experts) {
+    return n_experts >= 8 && n_experts <= MMQ_ROUTED_MAX_EXPERTS;
+}
+
+template <int J>
+static __global__ void build_mmq_routed_descriptors(
+        const int32_t * expert_bounds, uint32_t * descriptors, int n_experts, int max_descriptors) {
+    __shared__ int tile_counts[MMQ_ROUTED_MAX_EXPERTS];
+    const int expert = threadIdx.x;
+
+    for (int i = expert; i < max_descriptors; i += blockDim.x) {
+        descriptors[i] = UINT32_MAX;
+    }
+
+    if (expert < n_experts) {
+        const int count = expert_bounds[expert + 1] - expert_bounds[expert];
+        tile_counts[expert] = (count + J - 1) / J;
+    }
+    __syncthreads();
+
+    if (expert < n_experts) {
+        int descriptor = 0;
+        for (int i = 0; i < expert; ++i) {
+            descriptor += tile_counts[i];
+        }
+        for (int jt = 0; jt < tile_counts[expert]; ++jt) {
+            descriptors[descriptor + jt] = uint32_t(expert) | (uint32_t(jt) << 16);
+        }
+    }
+}
+
+template <ggml_type type, int J, bool fallback>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+static __global__ void mul_mat_q_routed_compact(
+        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const uint32_t * __restrict__ descriptors,
+        const int max_descriptors, float * __restrict__ dst, const float * __restrict__ y_scale,
+        const uint3 blocks_per_ne00, const int nrows_x, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x,
+        const uint3 sample_ratio, const int stride_sample_x) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    const int wt = blockIdx.z;
+    const int it = blockIdx.x;
+
+    extern __shared__ int ids_dst_shared[];
+    for (int descriptor_idx = blockIdx.y; descriptor_idx < max_descriptors; descriptor_idx += gridDim.y) {
+        const uint32_t descriptor = descriptors[descriptor_idx];
+        if (descriptor == UINT32_MAX) {
+            return;
+        }
+
+        const int zt = descriptor & 0xFFFF;
+        const int jt = descriptor >> 16;
+        const int col_low  = expert_bounds[zt + 0];
+        const int col_high = expert_bounds[zt + 1];
+        const int col_diff = col_high - col_low;
+
+        if (descriptor_idx != int(blockIdx.y)) {
+            __syncthreads();
+        }
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps * warp_size) {
+            const int j = j0 + threadIdx.y * warp_size + threadIdx.x;
+            if (j0 + nwarps * warp_size > J && j >= J) {
+                break;
+            }
+            ids_dst_shared[j] = jt * J + j < col_diff ? ids_dst[col_low + jt * J + j] : 0;
+        }
+        __syncthreads();
+
+        const int offset_x = fastdiv(wt, sample_ratio) * stride_sample_x +
+            fastdiv(zt, channel_ratio) * stride_channel_x + it * I * stride_row_x;
+        const int offset_y = (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
+        const int tile_x_max_i = nrows_x - it * I - 1;
+        const int tile_y_max_j = col_diff - jt * J - 1;
+        const float * y_scale_tile = y_scale ? y_scale + col_low + jt * J : nullptr;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, J, fallback, fixup>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + it * I, nullptr, y_scale_tile,
+             stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+    }
+}
+
 template <ggml_type type, int J, bool fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
@@ -1283,7 +1376,6 @@ static __global__ void mul_mat_q_stream_k_fixup(
         }
 
         any_fixup = true;
-
 
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += nwarps) {
@@ -1379,6 +1471,15 @@ struct mmq_args {
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
 };
 
+static uint64_t fork_compact_calls[129] = {};
+static bool fork_compact_supported(const mmq_args & a, bool fallback, int cc) {
+    return a.type_x == GGML_TYPE_IQ4_NL && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
+        a.ids_dst != nullptr && a.expert_bounds != nullptr && a.nchannels_x == 512 && a.nchannels_y == 512 &&
+        a.nsamples_x == 1 && a.nsamples_y == 1 && a.ncols_max >= 16 && a.ncols_max <= 32768 &&
+        a.ncols_dst == a.ncols_max * 10 &&
+        ((a.ncols_x == 2560 && a.nrows_x == 640) || (a.ncols_x == 640 && a.nrows_x == 2560));
+}
+
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
@@ -1419,6 +1520,26 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+    if (fork_compact_supported(args, fallback, cc)) {
+        GGML_ASSERT(!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc));
+        const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
+        ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
+        build_mmq_routed_descriptors<J><<<1, MMQ_ROUTED_MAX_EXPERTS, 0, stream>>>
+            (args.expert_bounds, descriptors.get(), args.nchannels_y, max_descriptors);
+        const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
+        const dim3 compact_grid(nty, descriptor_blocks, args.nsamples_y);
+        if (fork_compact_calls[J]++ == 0) {
+            fprintf(stderr, "FORK_COMPACT J=%d tokens=%ld K=%ld M=%ld rectangular_blocks_at_J=%u compact_blocks=%u\n",
+                J, args.ncols_max, args.ncols_x, args.nrows_x, block_nums_xy_tiling.x*block_nums_xy_tiling.y*block_nums_xy_tiling.z,
+                compact_grid.x*compact_grid.y*compact_grid.z);
+        }
+        mul_mat_q_routed_compact<type, J, fallback><<<compact_grid, block_dims, nbytes_shared, stream>>>
+            (args.x, args.y, args.ids_dst, args.expert_bounds, descriptors.get(), max_descriptors, args.dst, args.y_scale,
+             blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
+             channel_ratio_fd, args.stride_channel_x, sample_ratio_fd, args.stride_sample_x);
+        return;
+    }
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -1476,6 +1597,17 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
+
+    if (fork_compact_supported(args, fallback, cc)) {
+        static const int forced = getenv("FORK_COMPACT_J") ? atoi(getenv("FORK_COMPACT_J")) : 0;
+        const int64_t mean_rows = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
+        const int j = forced ? forced : mean_rows <= 12 ? 16 : mean_rows <= 32 ? 48 : mean_rows <= 64 ? 64 : 128;
+        GGML_ASSERT(j == 16 || j == 32 || j == 48 || j == 64 || j == 128);
+        const auto config = ggml_cuda_mmq_get_config(type, j, fallback, cc);
+        GGML_ASSERT(config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo);
+        J_best = j;
+        ntiles_J_best = 1;
+    }
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
