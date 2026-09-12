@@ -1,6 +1,8 @@
 #include "hc-mix.cuh"
 #include "idx-relu-sum.cuh"
 #include "mmb.cuh"
+#include "gdn-conv.cuh"
+#include "ple-conv.cuh"
 #include "norm-gated.cuh"
 #include "expand.cuh"
 #include <array>
@@ -3297,6 +3299,78 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
+struct ggml_cuda_get_rows_mean4_match {
+    const ggml_tensor * src = nullptr;
+    const ggml_tensor * ids = nullptr;
+    ggml_tensor * dst = nullptr;
+    int node_count = 14;
+};
+
+static bool ggml_cuda_match_get_rows_mean4(
+        const ggml_cgraph * graph, int i, ggml_cuda_get_rows_mean4_match & match) {
+    if (i < 0 || i + match.node_count > graph->n_nodes || graph->nodes[i]->op != GGML_OP_GET_ROWS) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(graph, i,
+            { GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+              GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_ADD,
+              GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_ADD,
+              GGML_OP_SCALE }, { i + 13 })) {
+        return false;
+    }
+    const ggml_tensor * rows = graph->nodes[i];
+    const ggml_tensor * src = rows->src[0];
+    const ggml_tensor * ids = rows->src[1];
+    const ggml_tensor * members = graph->nodes[i+1];
+    ggml_tensor * dst = graph->nodes[i+13];
+    if ((src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32) || ids->type != GGML_TYPE_I32 ||
+            src->ne[0] != 128 || src->ne[1] <= 0 || src->ne[2] <= 0 || src->nb[0] != ggml_type_size(src->type) || src->ne[3] != 1 ||
+            ids->nb[0] != sizeof(int32_t) || ids->ne[0] <= 0 || ids->ne[0] % 4 != 0 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            ids->ne[1] != src->ne[2] || ids->ne[1] > 65535 || ids->ne[0]/4 > INT32_MAX) {
+        return false;
+    }
+    if (members->src[0] != rows || members->ne[0] != 128 || members->ne[1] != 4 ||
+            members->ne[2] != ids->ne[0]/4 || members->ne[3] != ids->ne[1] ||
+            !ggml_is_contiguous(members)) {
+        return false;
+    }
+    for (int n = 0; n < match.node_count; ++n) {
+        if (graph->nodes[i+n]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int offsets[4] = { 2, 4, 7, 10 };
+    const ggml_tensor * sum = nullptr;
+    for (int n = 0; n < 4; ++n) {
+        const ggml_tensor * view = graph->nodes[i+offsets[n]];
+        const ggml_tensor * copy = graph->nodes[i+offsets[n]+1];
+        if (view->src[0] != members || view->ne[0] != 128 || view->ne[1] != members->ne[2] ||
+                view->ne[2] != members->ne[3] || view->ne[3] != 1 || view->nb[0] != sizeof(float) ||
+                view->nb[1] != members->nb[2] || view->nb[2] != members->nb[3] ||
+                view->view_offs != members->view_offs + n*members->nb[1] ||
+                copy->src[0] != view || !ggml_are_same_shape(copy, view) || !ggml_is_contiguous(copy)) {
+            return false;
+        }
+        if (n == 0) {
+            sum = copy;
+        } else {
+            const ggml_tensor * add = graph->nodes[i+offsets[n]+2];
+            if (add->src[0] != sum || add->src[1] != copy || !ggml_are_same_shape(add, copy)) {
+                return false;
+            }
+            sum = add;
+        }
+    }
+    if (dst->src[0] != sum || !ggml_are_same_shape(dst, sum) || !ggml_is_contiguous(dst) ||
+            ggml_get_op_params_f32(dst, 0) != 0.25f || ggml_get_op_params_f32(dst, 1) != 0.0f) {
+        return false;
+    }
+    match.src = src;
+    match.ids = ids;
+    match.dst = dst;
+    return true;
+}
+
 static bool ggml_cuda_mean4_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     const uintptr_t av = (uintptr_t) a->data;
     const uintptr_t bv = (uintptr_t) b->data;
@@ -3733,6 +3807,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_CONT) {
+        ggml_cuda_ple_conv_match pm;
+        if (node->op == GGML_OP_CONCAT && ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) { ggml_cuda_ple_conv_write_tail(*cuda_ctx, pm); return 1; }
+        if (node->op == GGML_OP_CONT && ggml_cuda_ple_conv_match_at_tap(cgraph, i, pm)) { ggml_cuda_ple_conv_direct(*cuda_ctx, pm); return pm.silu_idx - i; }
+    }
     if (node->op == GGML_OP_RMS_NORM) {
         ggml_cuda_norm_gated_match nm;
         int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
@@ -3742,6 +3821,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         sk = ggml_cuda_norm_rows_match_at(cgraph, i, nm);
         if (sk > 0) { ggml_cuda_op_norm_gated(*cuda_ctx, nm); return sk; }
+    }
+    if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_SSM_CONV) {
+        ggml_cuda_gdn_conv_match gm;
+        if (node->op == GGML_OP_CONCAT && ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+            ggml_cuda_gdn_conv_write_tail(*cuda_ctx, gm);
+            return 1;
+        }
+        if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+            ggml_cuda_gdn_conv_direct(*cuda_ctx, gm);
+            return 1;
+        }
     }
 
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
@@ -3816,6 +3906,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             { static unsigned dbg = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(args.out_xn) >= 4096 && dbg++ < 8) fprintf(stderr, "HC_CN dispatch xn=%s bf16=%d store_f32=%d\n", args.out_xn->name, args.out_xn_bf16 != nullptr, (int) args.store_xn_f32); }
             ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
             return skip;
+        }
+    }
+
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_cuda_get_rows_mean4_match match;
+        if (ggml_cuda_match_get_rows_mean4(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1) &&
+                    !ggml_cuda_mean4_ranges_overlap(match.src, match.dst) &&
+                    !ggml_cuda_mean4_ranges_overlap(match.ids, match.dst)) {
+                ggml_cuda_op_get_rows_mean4(*cuda_ctx, match.src, match.ids, match.dst);
+                return match.node_count - 1;
+            }
         }
     }
 
@@ -5125,6 +5228,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 
+            if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                ggml_cuda_get_rows_mean4_match pool;
+                if (ggml_cuda_match_get_rows_mean4(cgraph, i, pool)) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(pool.src), pool.dst);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(pool.ids), pool.dst);
+                    i += pool.node_count - 1;
+                    continue;
+                }
+            }
             ggml_cuda_topk_moe_match topk;
             if (ggml_cuda_match_topk_moe(cgraph, i, topk)) {
                 if (ggml_nrows(cgraph->nodes[i]) > TOPK_MOE_ROWS_PER_BLOCK) {
@@ -5136,6 +5248,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(topk.bias), topk.weights);
                 }
                 i += topk.node_count - 1;
+                continue;
+            }
+            if (cgraph->nodes[i]->op == GGML_OP_CONCAT) {
+                ggml_cuda_ple_conv_match pm;
+                if (ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(pm.x), pm.out);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(pm.state), pm.out);
+                    continue;
+                }
+                ggml_cuda_gdn_conv_match gm;
+                if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.x), cgraph->nodes[gm.conv_idx]);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.state), cgraph->nodes[gm.conv_idx]);
+                }
                 continue;
             }
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
