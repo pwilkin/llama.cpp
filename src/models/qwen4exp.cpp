@@ -1366,7 +1366,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         const int64_t r     = hparams.dsv4_compress_ratios[il];
         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
-        if (n_kv <= width) {
+        bool skip_unused_indexer = false;
+#if defined(GGML_USE_HIP)
+        static const bool decode_indexer = std::getenv("LLAMA_QSA_DECODE_INDEXER") != nullptr;
+        // HIP small-query attention ignores selected indices; retain raw keys for later prefill.
+        skip_unused_indexer = !decode_indexer && n_tokens <= 8 && mctx_hyb->get_n_stream() == 1 &&
+            cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
+#endif
+        if (n_kv <= width || skip_unused_indexer) {
             build_qsa_store_k(mctx_hyb, cur, il);
         } else {
             top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
