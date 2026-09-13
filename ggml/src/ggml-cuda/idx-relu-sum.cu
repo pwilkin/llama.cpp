@@ -18,8 +18,7 @@ static __global__ void idx_relu_sum_f32(const float * __restrict__ src, float * 
 }
 
 bool ggml_cuda_idx_relu_sum_enabled() {
-    static const int v = getenv("LLAMA_IDX_RELU_SUM") ? atoi(getenv("LLAMA_IDX_RELU_SUM")) : 0;
-    return v != 0;
+    return true;
 }
 
 void ggml_cuda_op_idx_relu_sum(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_relu_sum_args & args) {
@@ -30,6 +29,4 @@ void ggml_cuda_op_idx_relu_sum(ggml_backend_cuda_context & ctx, const ggml_cuda_
     const dim3 grid((n_blocks + threads - 1) / threads, (unsigned) rows, 1);
     idx_relu_sum_f32<<<grid, threads, 0, ctx.stream()>>>((const float *) s->data, (float *) args.dst->data, n_blocks, args.heads);
     CUDA_CHECK(cudaGetLastError());
-    static unsigned hits = 0;
-    if (hits++ < 2) fprintf(stderr, "IDX_RELU_SUM blocks=%d heads=%d rows=%lld\n", n_blocks, args.heads, (long long) rows);
 }

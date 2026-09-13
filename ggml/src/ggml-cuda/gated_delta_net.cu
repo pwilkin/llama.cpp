@@ -386,8 +386,6 @@ static void launch_gated_delta_net(
             const dim3 tiled_grid(H, n_seqs, 2);
             const dim3 tiled_block(warp_size, 8, 1);
             const ggml_cuda_kernel_launch_params tiled_params(tiled_grid, tiled_block, 0, stream);
-            static unsigned hits = 0;
-            if (hits++ == 0) fprintf(stderr, "FORK_GDN_TILE tokens=%ld snapshots=%d keep=%d\n", n_tokens, K, int(keep_rs_t));
             ggml_cuda_kernel_launch(gated_delta_net_tiled_cuda<128, 8, 8, 16, keep_rs_t>, tiled_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                 sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,

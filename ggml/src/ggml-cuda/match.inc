@@ -1,14 +1,7 @@
 static int ggml_cuda_match_qsa_expand(const ggml_cgraph * graph, int first, ggml_cuda_qsa_expand_args & args) {
-    const char * enabled = getenv("LLAMA_QSA_FUSE_EXPAND");
-    if (!enabled || atoi(enabled) == 0 || first + 19 >= graph->n_nodes) return 0;
+    if (first + 19 >= graph->n_nodes) return 0;
     if (graph->nodes[first]->op != GGML_OP_CONT || !graph->nodes[first]->src[0] || graph->nodes[first]->src[0]->op != GGML_OP_TOP_K) return 0;
-    const bool debug = getenv("QSA_EXPAND_MATCH_DEBUG") != nullptr;
-    auto reject = [&](int line) { if (debug) fprintf(stderr,"QSA_EXPAND_REJECT first=%d line=%d\n",first,line);return 0; };
-    if (debug) {
-        fprintf(stderr,"QSA_EXPAND_CANDIDATE first=%d:",first);
-        for(int j=0;j<21 && first+j<graph->n_nodes;++j)fprintf(stderr," %s",ggml_op_name(graph->nodes[first+j]->op));
-        fputc('\n',stderr);
-    }
+    auto reject = [](int) { return 0; };
     const ggml_op expected[] = {GGML_OP_CONT, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_ARGSORT,
         GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
         GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_SCALE, GGML_OP_UNARY,

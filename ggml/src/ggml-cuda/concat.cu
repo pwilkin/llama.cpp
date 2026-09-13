@@ -203,7 +203,6 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         const int tile_y = concat_transposed_tile_y(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
         const dim3 block_dims(tile, tile_y, 1);
         const dim3 block_nums((src1->ne[1] + tile - 1) / tile, (src1->ne[0] + tile - 1) / tile, src1->ne[2]);
-        static unsigned hits = 0; if (hits++ == 0) fprintf(stderr, "FORK_CONCAT transpose path reached\n");
         concat_transposed_src1_dim0<T><<<block_nums, block_dims, 0, stream>>>(
             (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
             src0->ne[0], src1->ne[0], src1->ne[1],

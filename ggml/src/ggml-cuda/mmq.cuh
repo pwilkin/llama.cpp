@@ -1471,7 +1471,6 @@ struct mmq_args {
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
 };
 
-static uint64_t fork_compact_calls[129] = {};
 static bool fork_compact_supported(const mmq_args & a, bool fallback, int cc) {
     return a.type_x == GGML_TYPE_IQ4_NL && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
         a.ids_dst != nullptr && a.expert_bounds != nullptr && a.nchannels_x == 512 && a.nchannels_y == 512 &&
@@ -1529,11 +1528,6 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             (args.expert_bounds, descriptors.get(), args.nchannels_y, max_descriptors);
         const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
         const dim3 compact_grid(nty, descriptor_blocks, args.nsamples_y);
-        if (fork_compact_calls[J]++ == 0) {
-            fprintf(stderr, "FORK_COMPACT J=%d tokens=%ld K=%ld M=%ld rectangular_blocks_at_J=%u compact_blocks=%u\n",
-                J, args.ncols_max, args.ncols_x, args.nrows_x, block_nums_xy_tiling.x*block_nums_xy_tiling.y*block_nums_xy_tiling.z,
-                compact_grid.x*compact_grid.y*compact_grid.z);
-        }
         mul_mat_q_routed_compact<type, J, fallback><<<compact_grid, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, descriptors.get(), max_descriptors, args.dst, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1599,9 +1593,8 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int ntiles_J_best = INT_MAX;
 
     if (fork_compact_supported(args, fallback, cc)) {
-        static const int forced = getenv("FORK_COMPACT_J") ? atoi(getenv("FORK_COMPACT_J")) : 0;
         const int64_t mean_rows = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
-        const int j = forced ? forced : mean_rows <= 12 ? 16 : mean_rows <= 32 ? 48 : mean_rows <= 64 ? 64 : 128;
+        const int j = mean_rows <= 12 ? 16 : mean_rows <= 32 ? 48 : mean_rows <= 64 ? 64 : 128;
         GGML_ASSERT(j == 16 || j == 32 || j == 48 || j == 64 || j == 128);
         const auto config = ggml_cuda_mmq_get_config(type, j, fallback, cc);
         GGML_ASSERT(config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo);
@@ -1677,8 +1670,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
             break;
         default:
-            fprintf(stderr, "J_best=%d\n", J_best);
-            GGML_ABORT("fatal error");
+            GGML_ABORT("unsupported J_best=%d", J_best);
             break;
     }
 }

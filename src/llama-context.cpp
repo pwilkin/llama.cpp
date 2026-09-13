@@ -232,12 +232,6 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
-    if (const char * e = getenv("LLAMA_GDN_CHUNKED")) {
-        if (atoi(e) != 0) {
-            cparams.fused_gdn_ch = false;
-            LLAMA_LOG_INFO("%s: LLAMA_GDN_CHUNKED: using build_delta_net_chunking (solve_tri) instead of the fused recurrence\n", __func__);
-        }
-    }
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;

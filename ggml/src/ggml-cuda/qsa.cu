@@ -392,14 +392,12 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     }
 }
 
-static bool enabled(const char * name) { const char * value = getenv(name); return value && atoi(value) != 0; }
-
 bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
     const auto * packed = dst->src[6], * pv = dst->src[7];
-    if (!enabled("LLAMA_QSA_FA_V3") || !q || !k || !v || !ids || dst->src[4] || !packed || !pv ||
+    if (!q || !k || !v || !ids || dst->src[4] || !packed || !pv ||
         !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) { return false; }
-    if (q->ne[1] < 128 && !enabled("QSA3_FORCE")) { return false; }
+    if (q->ne[1] < 128) { return false; }
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params + 4, 4); memcpy(&softcap, (const char *) dst->op_params + 8, 4);
     if (bias != 0 || softcap != 0 || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 ||

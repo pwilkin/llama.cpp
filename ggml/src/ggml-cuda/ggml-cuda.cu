@@ -3792,7 +3792,7 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     if (src->data && prev->data) {
         const uintptr_t av = (uintptr_t) src->data, bv = (uintptr_t) prev->data;
         const bool overlap = av <= bv ? bv - av < ggml_nbytes(src) : av - bv < ggml_nbytes(prev);
-        if (overlap) { static unsigned w = 0; if (w++ < 2) fprintf(stderr, "IDX_RELU_SUM: skipped, score and output overlap\n"); return 0; }
+        if (overlap) { return 0; }
     }
     a.score = src; a.dst = (ggml_tensor *) prev; a.heads = (int) H;
     return count;
@@ -3864,8 +3864,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int skip = ggml_cuda_match_qsa_expand(cgraph,i,args);
         if (skip) {
             const bool alias_ok = ggml_cuda_qsa_expand_alias_ok(args);
-            if (getenv("QSA_EXPAND_MATCH_DEBUG")) fprintf(stderr,"QSA_EXPAND_MEMORY explicit_rw_disjoint=%d cast_self=%d,%d,%d\n",alias_ok,
-                args.cast_blocks->src[1]==args.cast_blocks,args.cast_cells->src[1]==args.cast_cells,args.expanded->src[1]==args.expanded);
             if (alias_ok) {
                 ggml_cuda_op_qsa_expand(*cuda_ctx,args);
                 return skip;
@@ -3897,13 +3895,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                  ? (const uint16_t *) args.block_out->data : nullptr;
                 args.res_in_bf16  = in16  ? (const uint16_t *) args.residual->data : nullptr;
                 args.res_out_bf16 = out16 ? (uint16_t *) args.out_res->data : nullptr;
-                static unsigned dbg = 0;
-                if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(args.out_res) >= 512 && dbg++ < 40)
-                    fprintf(stderr, "HC_RES16 out=%s in=%s(root %s) in16=%d out16=%d inplace=%d\n", args.out_res->name,
-                        args.residual->name, rin->name, (int) in16, (int) out16,
-                        (int) (args.out_res->data == args.residual->data));
             }
-            { static unsigned dbg = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(args.out_xn) >= 4096 && dbg++ < 8) fprintf(stderr, "HC_CN dispatch xn=%s bf16=%d store_f32=%d\n", args.out_xn->name, args.out_xn_bf16 != nullptr, (int) args.store_xn_f32); }
             ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
             return skip;
         }
@@ -4854,14 +4846,11 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
-// graph timing / mark-lifetime instrumentation (LLAMA_GRAPH_TIMING=1)
-static int64_t      g_gt_prev_return   = 0;
+// tracks when a new split sequence starts, so the mmb marks are cleared once per sequence
 static bool         g_gt_after_compute = true;
 static const void * g_gt_first_split   = nullptr;
-static bool graph_timing_enabled() { static const bool e = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")); return e; }
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    const int64_t gt_t0 = ggml_time_us();
     ggml_cuda_mmb_begin_graph();
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4877,25 +4866,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    // [GRAPH_DIAG] one-shot report for the big prefill graphs: why HIP graphs do or do not engage
-    const bool graph_diag = getenv("LLAMA_GRAPH_DIAG") && atoi(getenv("LLAMA_GRAPH_DIAG")) != 0 && cgraph->n_nodes > 1000;
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        if (graph_diag) {
-            static unsigned n = 0;
-            if (n++ < 12) {
-                fprintf(stderr, "GRAPH_DIAG nodes=%d key=%p enabled=1 compatible=%d warmup_complete=%d uid=%llu\n",
-                        cgraph->n_nodes, (const void *) graph_key, (int) graph_compatible, (int) graph->warmup_complete,
-                        (unsigned long long) cgraph->uid);
-            }
-        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (graph_diag) { static unsigned m = 0; if (m++ < 12) {
-                    fprintf(stderr, "GRAPH_DIAG   warmup: properties_changed=%d\n", (int) properties_changed); } }
                 if (!properties_changed) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
@@ -4930,16 +4907,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
-    if (graph_timing_enabled()) {
-        const int64_t gt_t1 = ggml_time_us();
-        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-        const int64_t gt_t2 = ggml_time_us();
-        const ggml_tensor * f = cgraph->n_nodes ? cgraph->nodes[0] : nullptr; const ggml_tensor * l = cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr;
-        fprintf(stderr, "GT compute n=%d first=%s(%lld) last=%s graph=%d upd=%d hostgap=%.1fms submit=%.1fms gpu_wait=%.1fms\n", cgraph->n_nodes,
-            f ? f->name : "-", f ? (long long) ggml_nrows(f) : 0, l ? l->name : "-", (int) use_cuda_graph, (int) cuda_graph_update_required,
-            (g_gt_prev_return ? (gt_t0 - g_gt_prev_return) : 0) / 1000.0, (gt_t1 - gt_t0) / 1000.0, (gt_t2 - gt_t1) / 1000.0);
-    }
-    g_gt_prev_return = ggml_time_us(); g_gt_after_compute = true;
+    g_gt_after_compute = true;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -4970,13 +4938,12 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    const int64_t gt_t0 = ggml_time_us();
     {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
         if (g_gt_after_compute || g_gt_first_split == nullptr || key == g_gt_first_split) { ggml_cuda_mmb_marks_clear(); g_gt_first_split = key; g_gt_after_compute = false; }
     }
     {   // HC16 step 2: mark HC normalized-stream (xn) and gate tensors whose consumers all read the BF16 copies
-        static const int hc16 = getenv("LLAMA_MMB_HC16") ? atoi(getenv("LLAMA_MMB_HC16")) : 0;
+        static const int hc16 = 2;
         if (hc16 >= 2 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             auto reads = [](const ggml_tensor * t, const ggml_tensor * x) { for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true; return false; };
             for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -4993,10 +4960,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                     if (t->op == GGML_OP_MUL && n >= 1) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn)) continue; }
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
-                    { static unsigned dbg = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(xn) >= 4096 && dbg++ < 12) fprintf(stderr, "HC16 xn=%s blocked by consumer %s(%s) src0=%s\n", xn->name, ggml_op_name(t->op), t->name, t->src[0] ? t->src[0]->name : "-"); }
                     ok = false;
                 }
-                { static unsigned dbg2 = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(xn) >= 4096 && dbg2++ < 12) fprintf(stderr, "HC16 xn=%s rows=%lld consumers=%d ok=%d\n", xn->name, (long long) ggml_nrows(xn), nread, (int) ok); }
                 if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(xn);
             }
             if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
@@ -5024,7 +4989,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                                      (b->src[0] == mm.dst || b->src[1] == mm.dst)) producer_ok = true;
                         }
                     }
-                    if (!producer_ok) { static unsigned w = 0; if (getenv("LLAMA_HC16_DEBUG") && w++ < 6) fprintf(stderr, "HC_BLK16 %s not marked: producer %s does not honour BF16\n", b->name, ggml_op_name(b->op)); continue; }
+                    if (!producer_ok) { continue; }
                     int bi = -1;
                     for (int k = 0; k < cgraph->n_nodes; ++k) if (cgraph->nodes[k] == b) { bi = k; break; }
                     if (bi < 0) continue;
@@ -5035,7 +5000,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         ++nread;
                         if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_REPEAT) continue;
                         if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) continue;
-                        { static unsigned w = 0; if (getenv("LLAMA_HC16_DEBUG") && w++ < 6) fprintf(stderr, "HC_BLK16 %s blocked by %s(%s)\n", b->name, ggml_op_name(t->op), t->name); }
                         ok = false;
                     }
                     if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(b);
@@ -5049,11 +5013,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     ggml_cuda_hc_combine_norm_args ca;
                     if (ggml_cuda_match_hc_combine_norm(cgraph, i, ws, ca) > 0) comb.emplace_back(ca.residual, ca.out_res);
                 }
-                { static unsigned t = 0; if (getenv("LLAMA_HC16_DEBUG") && t == 0) { t = 1;
-                    for (size_t z = 0; z < comb.size() && z < 6; ++z) {
-                        const ggml_tensor * dr = comb[z].first->view_src ? comb[z].first->view_src : comb[z].first;
-                        fprintf(stderr, "HC_RES16 chain[%zu]: residual=%s(root %s) -> out_res=%s\n", z, comb[z].first->name, dr->name, comb[z].second->name);
-                    } } }
                 for (const auto & c : comb) {
                     const ggml_tensor * r = c.second;
                     if (ggml_nrows(r) < 512) continue;
@@ -5073,7 +5032,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                             if (dr == r && d.second == t) { next_combine = true; break; }
                         }
                         if (next_combine) continue;
-                        { static unsigned w = 0; if (getenv("LLAMA_HC16_DEBUG") && w++ < 6) fprintf(stderr, "HC_RES16 %s blocked by %s(%s)\n", r->name, ggml_op_name(t->op), t->name); }
                         ok = false;
                     }
                     if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(r);
@@ -5187,10 +5145,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
-    if (graph_timing_enabled()) {
-        const ggml_tensor * f = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
-        fprintf(stderr, "GT optimize n=%d first=%s(%lld) took=%.1fms marks=%zu\n", cgraph->n_nodes, f ? f->name : "-", f ? (long long) ggml_nrows(f) : 0, (ggml_time_us() - gt_t0) / 1000.0, ggml_cuda_mmb_marks_count());
-    }
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {

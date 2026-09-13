@@ -1900,10 +1900,6 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     // in-flight reads are IO queue depth, not compute; 2x cores worked well
     // on NVMe and stays sane on smaller machines
     int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
-    if (const char * e = getenv("LLAMA_LAZY_READ_THREADS")) {   // the gather is NVMe queue-depth bound, not CPU bound
-        const int v = atoi(e);
-        if (v > 0 && v <= 4096) { n_threads = v; }
-    }
 
     auto reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
             ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
@@ -2578,18 +2574,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
                 // Halogen prefills the qwen4exp draft head with the SAME sparse attention as the trunk (one
-                // k_attn_qs_bt4x call per target chunk for the nextn layer), so with LLAMA_MTP_QSA=1 the MTP context
-                // gets an indexer cache instead of a plain KV cache.
-                static const bool mtp_qsa = getenv("LLAMA_MTP_QSA") && atoi(getenv("LLAMA_MTP_QSA")) != 0;
+                // k_attn_qs_bt4x call per target chunk for the nextn layer), so the MTP context gets an
+                // indexer cache instead of a plain KV cache.
 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
                      arch == LLM_ARCH_BAILINGMOE3 ||
-                     (arch == LLM_ARCH_QWEN4EXP && !(mtp_qsa && hparams.indexer_head_size > 0)));
+                     (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size == 0));
 
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
-                        mtp_qsa && hparams.indexer_head_size > 0) {
+                        hparams.indexer_head_size > 0) {
                     llama_memory_hybrid_idx::layer_filter_cb f_attn =
                         [&](uint32_t il) { return il >= hparams.n_layer(); };
                     llama_memory_hybrid_idx::layer_filter_cb f_recr =

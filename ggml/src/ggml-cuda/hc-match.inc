@@ -1,6 +1,4 @@
 static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_cuda_hc_mix_args & args, enum ggml_op * ops) {
-    const char * option = getenv("LLAMA_HC_MIX_FUSE");
-    if (!option || std::atoi(option) == 0) { return 0; }
     if (i < 0 || i >= cgraph->n_nodes) { return 0; }
     const ggml_tensor * node = cgraph->nodes[i];
     if (!(node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && node->type == GGML_TYPE_F32 &&

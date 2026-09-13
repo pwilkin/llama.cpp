@@ -186,8 +186,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens && ggml_nelements(a.gamma) == n_embd * hc &&
                 ggml_nelements(a.inject) == hc * n_tokens);
 
-    static const int shape = getenv("LLAMA_HC_CN_SHAPE") ? atoi(getenv("LLAMA_HC_CN_SHAPE")) : 0;
-    if (shape == 1) {
+    {
         const ggml_cuda_kernel_launch_params lp2(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream());
         ggml_cuda_kernel_launch(hc_combine_norm_f32_b256, lp2,
             (const float *) a.inject->data, (const float *) a.residual->data,
@@ -195,7 +194,6 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
             (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
             a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
             (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps);
-        static unsigned h2 = 0; if (h2++ < 2) fprintf(stderr, "HC_CN shape=256x4 n_embd=%lld tokens=%lld\n", (long long) n_embd, (long long) n_tokens);
         return;
     }
     const ggml_cuda_kernel_launch_params launch_params(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK, 0, ctx.stream());

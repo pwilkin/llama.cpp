@@ -2,8 +2,6 @@
 #include "expand.cuh"
 #include <cstdio>
 #include <cstdlib>
-#include <map>
-#include <mutex>
 #include <string>
 
 struct expand_layout {
@@ -53,14 +51,8 @@ __global__ __launch_bounds__(256) void qsa_expand_complete_blocks_512(
     }
 }
 
-static auto * counts = new std::map<std::string, unsigned long long>;
-static auto * counts_mutex = new std::mutex;
 void ggml_cuda_op_qsa_expand(ggml_backend_cuda_context & ctx, const ggml_cuda_qsa_expand_args & a) {
     expand_layout layout{a.blocks->nb[1], a.scores->nb[1], a.cells->nb[1], a.tail->nb[1], a.output->nb[1], a.cast_blocks->nb[1], a.cast_cells->nb[2], a.expanded->nb[2], int(a.scores->ne[0])};
-    if (getenv("QSA_EXPAND_COVERAGE")) {
-        char key[128]; snprintf(key, sizeof(key), "queries=%lld blocks=%d", (long long)a.output->ne[1], layout.n_blocks);
-        std::lock_guard<std::mutex> lock(*counts_mutex); ++(*counts)[key];
-    }
     const ggml_cuda_kernel_launch_params launch(dim3(a.output->ne[1]), dim3(256), 0, ctx.stream());
     ggml_cuda_kernel_launch(qsa_expand_complete_blocks_512, launch,
         (const char *)a.blocks->data, (const char *)a.scores->data, (const char *)a.cells->data,
@@ -69,9 +61,3 @@ void ggml_cuda_op_qsa_expand(ggml_backend_cuda_context & ctx, const ggml_cuda_qs
     CUDA_CHECK(cudaGetLastError());
 }
 
-__attribute__((destructor)) static void finish_expand() {
-    const char * path = getenv("QSA_EXPAND_COVERAGE"); if (!path) return;
-    FILE * file = fopen(path, "w"); if (!file) abort();
-    for (const auto & x : *counts) fprintf(file, "%llu\t%s\n", x.second, x.first.c_str());
-    fclose(file);
-}

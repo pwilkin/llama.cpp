@@ -529,7 +529,7 @@ static std::vector<mmb_cache_entry> g_mmb_cache;
 static mmb_cache_entry g_mmb_slots[4] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
 static std::unordered_set<const ggml_tensor *> g_mmb_bf16_only;
 
-static size_t mmb_cache_max() { static const int v = getenv("LLAMA_MMB_CACHE") ? atoi(getenv("LLAMA_MMB_CACHE")) : 4; return (size_t) v; }
+static size_t mmb_cache_max() { return 4; }
 static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
 static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const size_t n) {
     if (g_mmb_cache.size() >= mmb_cache_max()) { delete g_mmb_cache.front().buf; g_mmb_cache.erase(g_mmb_cache.begin()); }
@@ -542,8 +542,6 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
     for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
-    { static const int lg = getenv("LLAMA_MMB_CVT_LOG") ? atoi(getenv("LLAMA_MMB_CVT_LOG")) : 0; static unsigned cnt = 0;
-      if (lg && cnt++ < 200) fprintf(stderr, "MMB_CVT %s op=%s ne=[%lld,%lld,%lld,%lld] view_src=%s n=%zu\n", src1->name, ggml_op_name(src1->op), (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->view_src ? src1->view_src->name : "-", n); }
     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
     return buf;
 }
@@ -594,10 +592,10 @@ __global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_
 static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
 static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 static size_t g_mmb_shadow_bytes = 0;
-int    mmb_shadow_mode(){ static const int v = getenv("LLAMA_MMB_SHADOW") ? atoi(getenv("LLAMA_MMB_SHADOW")) : 0; return v; }
+int    mmb_shadow_mode(){ return 2; }
 bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
 bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
-size_t mmb_shadow_cap(){ static const long v = getenv("LLAMA_MMB_SHADOW_MB") ? atol(getenv("LLAMA_MMB_SHADOW_MB")) : 6144; return (size_t) v << 20; }
+size_t mmb_shadow_cap(){ return (size_t) 6144 << 20; }
 static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
 static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
 static bool mmb_is_row_concat(const ggml_tensor * w) {
@@ -609,17 +607,17 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
     auto it = g_mmb_shadow.find(w->data); return it == g_mmb_shadow.end() ? nullptr : it->second;
 }
 
-bool mmb_enabled() { static const int v = getenv("LLAMA_MMB") ? atoi(getenv("LLAMA_MMB")) : 0; return v != 0; }
-int  mmb_min_t()   { static const int v = getenv("LLAMA_MMB_MIN_T") ? atoi(getenv("LLAMA_MMB_MIN_T")) : 512; return v; }
-int  mmb_f32split_mode(){ static const int v = getenv("LLAMA_MMB_F32SPLIT") ? atoi(getenv("LLAMA_MMB_F32SPLIT")) : 0; return v; }
-bool mmb_f32split() { static const int v = getenv("LLAMA_MMB_F32SPLIT") ? atoi(getenv("LLAMA_MMB_F32SPLIT")) : 0; return v != 0; }
-bool mmb_bf16w()    { static const int v = getenv("LLAMA_MMB_BF16W") ? atoi(getenv("LLAMA_MMB_BF16W")) : 0; return v != 0; }
-bool mmb_hc16()    { static const int v = getenv("LLAMA_MMB_HC16") ? atoi(getenv("LLAMA_MMB_HC16")) : 0; return v != 0; }
-int  mmb_tall_mode(){ static const int v = getenv("LLAMA_MMB_TALL") ? atoi(getenv("LLAMA_MMB_TALL")) : 0; return v; }
+bool mmb_enabled() { return true; }
+int  mmb_min_t()   { return 512; }
+int  mmb_f32split_mode(){ return 2; }
+bool mmb_f32split() { return true; }
+bool mmb_bf16w()    { return true; }
+bool mmb_hc16()    { return true; }
+int  mmb_tall_mode(){ return 2; }
 bool mmb_tall()    { return mmb_tall_mode() != 0; }
-bool mmb_gatemix_flag() { static const int v = getenv("LLAMA_HC_GATEMIX") ? atoi(getenv("LLAMA_HC_GATEMIX")) : 0; return v != 0; }
-bool mmb_down16_flag() { static const int v = getenv("LLAMA_MMB_DOWN16") ? atoi(getenv("LLAMA_MMB_DOWN16")) : 0; return v != 0; }
-bool mmb_glu()     { static const int v = getenv("LLAMA_MMB_GLU") ? atoi(getenv("LLAMA_MMB_GLU")) : 0; return v != 0; }
+bool mmb_gatemix_flag() { return true; }
+bool mmb_down16_flag() { return true; }
+bool mmb_glu()     { return true; }
 
 } // namespace
 
@@ -697,7 +695,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
     if (src0->type == GGML_TYPE_F32) {
         dim3 grid((M + 127) / 128, (T + 127) / 128);
-        static const bool two = getenv("LLAMA_MMB_F32SPLIT") && atoi(getenv("LLAMA_MMB_F32SPLIT")) >= 2;
+        static const bool two = true;
         if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
         else     mmb_f32split_kernel<128, 128, 32, 64, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
         CUDA_CHECK(cudaGetLastError()); return;
@@ -709,7 +707,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
         else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
         CUDA_CHECK(cudaGetLastError());
-        static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_TALL%s dense M=%d K=%d T=%d\n", wide ? "(wide 384x64)" : "(384x32)", M, K, T);
         return;
     }
     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
@@ -718,7 +715,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
-        static unsigned h = 0; if (h++ < 2) fprintf(stderr, "MMB_BLK16 dense BF16 in place: M=%d K=%d T=%d\n", M, K, T);
     }
     dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
     const uint16_t * shadow = shadow_pre;
@@ -741,8 +737,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 
 bool ggml_cuda_mmb_gatemix() { return mmb_gatemix_flag(); }
 bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
-bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : 0; return v != 0; }
-bool ggml_cuda_mmb_res16()  { static const int v = getenv("LLAMA_HC_RES16") ? atoi(getenv("LLAMA_HC_RES16")) : 0; return v != 0; }
+bool ggml_cuda_mmb_blk16() { return true; }
+bool ggml_cuda_mmb_res16()  { return true; }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
     if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
@@ -757,7 +753,6 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     dim3 grid(E / 32, (T + 127) / 128);
     hc_gate_mix_kernel<4><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
     CUDA_CHECK(cudaGetLastError());
-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "HC_GATEMIX fused gate GEMM + sigmoid + mix: E=%d K=%d T=%d\n", E, K, T);
     return true;
 }
 
@@ -790,7 +785,6 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
     uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(dst)) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
-    if (Dh) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_DOWN16 routed down BF16 in place: M=%d K=%d rows=%d\n", M, K, n_rows); }
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_routed_kernel<128, BN, 32, 64><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
     mmb_routed_kernel<128, BN_SMALL, 32, 16><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
@@ -834,7 +828,6 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(glu);
-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_GLU fused gate/up+swiglu: M=%d K=%d rows=%d store_f32=%d\n", M, K, n_rows, (int) store_f32);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
     dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
     mmb_routed_glu_kernel<64, BN, 32, 32><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
@@ -848,13 +841,12 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     if (mmb_is_resident_q6k(w)) {
         if (!mmb_shadow_q6k() || g_mmb_shadow.count(w->data) > 0) return;
         const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
-        if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { fprintf(stderr, "MMB_SHADOW cap reached; %s stays Q6_K\n", w->name); return; }
+        if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { GGML_LOG_INFO("MMB_SHADOW cap reached; %s stays Q6_K\n", w->name); return; }
         uint16_t * buf = nullptr;
-        if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { fprintf(stderr, "MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
+        if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
         mmb_dq_q6k_bf16_kernel<<<(unsigned) ((n / 256 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 256);
         CUDA_CHECK(cudaGetLastError());
         g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
-        static unsigned q6 = 0; if (q6++ < 3) fprintf(stderr, "MMB_SHADOW Q6_K %s [%lld x %lld] -> BF16 (%.1f MB total)\n", w->name, (long long) w->ne[0], (long long) w->ne[1], g_mmb_shadow_bytes / 1048576.0);
         return;
     }
     if (mmb_shadow_mode() != 1) return;               // mode 2: Q6_K only
@@ -863,9 +855,9 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     if (concat ? g_mmb_shadow_pair.count({w->src[0]->data, w->src[1]->data}) > 0 : g_mmb_shadow.count(w->data) > 0) return;
     const size_t n = (size_t) w->ne[0] * w->ne[1];
     const size_t bytes = n * 2;
-    if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { static bool warned = false; if (!warned) { fprintf(stderr, "MMB_SHADOW cap reached at %.1f MB; further weights stay IQ4_NL\n", g_mmb_shadow_bytes / 1048576.0); warned = true; } return; }
+    if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { static bool warned = false; if (!warned) { GGML_LOG_INFO("MMB_SHADOW cap reached at %.1f MB; further weights stay IQ4_NL\n", g_mmb_shadow_bytes / 1048576.0); warned = true; } return; }
     uint16_t * buf = nullptr;
-    if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { fprintf(stderr, "MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
+    if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
     if (concat) {
         const size_t n0 = (size_t) w->src[0]->ne[0] * w->src[0]->ne[1], n1 = (size_t) w->src[1]->ne[0] * w->src[1]->ne[1];
         mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n0 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[0]->data, buf, n0 / 32);
@@ -877,5 +869,4 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     }
     CUDA_CHECK(cudaGetLastError());
     g_mmb_shadow_bytes += bytes;
-    static unsigned hits = 0; if (hits++ < 3 || (hits % 50) == 0) fprintf(stderr, "MMB_SHADOW %s [%lld x %lld] -> BF16 (%.1f MB total)\n", w->name, (long long) w->ne[0], (long long) w->ne[1], g_mmb_shadow_bytes / 1048576.0);
 }

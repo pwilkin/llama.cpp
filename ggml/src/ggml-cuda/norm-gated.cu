@@ -46,8 +46,8 @@ static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, cons
     }
 }
 
-static bool norm_gated_enabled() { static const int v = getenv("LLAMA_NORM_GATED") ? atoi(getenv("LLAMA_NORM_GATED")) : 0; return v != 0; }
-static bool norm_rows_enabled()  { static const int v = getenv("LLAMA_NORM_ROWS")  ? atoi(getenv("LLAMA_NORM_ROWS"))  : 0; return v != 0; }
+static bool norm_gated_enabled() { return true; }
+static bool norm_rows_enabled()  { return true; }
 
 static bool rows_shape_ok(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * out) {
     if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) return false;
@@ -60,14 +60,6 @@ static bool rows_shape_ok(const ggml_tensor * x, const ggml_tensor * w, const gg
 int ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m) {
     if (!norm_gated_enabled() || i + 3 >= cgraph->n_nodes) return 0;
     const ggml_tensor * rms = cgraph->nodes[i], * mul = cgraph->nodes[i+1];
-    {   // debug: node sequence after narrow-row norms (LLAMA_NORM_GATED_DEBUG)
-        static const int dbg = getenv("LLAMA_NORM_GATED_DEBUG") ? 1 : 0; static unsigned cnt = 0;
-        if (dbg && rms->op == GGML_OP_RMS_NORM && rms->src[0]->ne[0] == 128 && cnt++ < 6) {
-            char buf[512]; int n = snprintf(buf, sizeof(buf), "NORM_GATED seq @%d (rows %lld):", i, (long long) ggml_nrows(rms->src[0]));
-            for (int k = i; k < cgraph->n_nodes && k < i + 7; ++k) n += snprintf(buf + n, sizeof(buf) - n, " %s(%s)", ggml_op_name(cgraph->nodes[k]->op), cgraph->nodes[k]->name);
-            fprintf(stderr, "%s\n", buf);
-        }
-    }
     if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) return 0;
     int k = i + 2; m.pre = -1;
     while (k + 1 < cgraph->n_nodes && k < i + 6) {
@@ -110,7 +102,6 @@ int ggml_cuda_norm_rows_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_no
 
 void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m) {
     const ggml_tensor * x = m.x;
-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "NORM_ROWS%s fused: ncols=%d rows=%lld\n", m.z ? "+GATE" : "", (int) x->ne[0], (long long) (x->ne[1]*x->ne[2]*x->ne[3]));
     const int64_t total = x->ne[1] * x->ne[2] * x->ne[3];
     const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
     const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());

@@ -2,7 +2,7 @@
 #include "unary.cuh"
 #include <cstdlib>
 
-static bool gdn_conv_enabled() { static const int v = getenv("LLAMA_GDN_CONV") ? atoi(getenv("LLAMA_GDN_CONV")) : 0; return v != 0; }
+static bool gdn_conv_enabled() { return true; }
 
 // tail-only materialization of the concat: columns [tail_from, T+3) of every channel row
 static __global__ void gdn_concat_tail(const float * __restrict__ state, const float * __restrict__ x, float * __restrict__ out,

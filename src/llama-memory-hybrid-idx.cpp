@@ -778,10 +778,7 @@ bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & u
 }
 
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch) const {
-    // see qwen4exp_qsa_embd_ok: a batch with tokens AND embeddings is the MTP draft head, not a vision batch
-    const char * embd_env = getenv("LLAMA_QSA_TOKEN_EMBD");
-    const bool embd_ok = !ubatch.embd || !embd_env || atoi(embd_env) != 0;
-    if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !embd_ok || !ubatch.pos || !ubatch.n_tokens ||
+    if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !ubatch.pos || !ubatch.n_tokens ||
             !ubatch.n_pos || !ubatch.seq_id || !ubatch.n_seq_id) { return false; }
     if (ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
     const llama_seq_id seq=ubatch.seq_id[0][0];

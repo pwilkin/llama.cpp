@@ -147,7 +147,7 @@ static void launch_moe_weighted_reduction(const float * experts,
                                           int           n_expert_used,
                                           cudaStream_t  stream) {
     constexpr int threads = 256;
-    static const bool use_v4 = !(getenv("LLAMA_MOE_RED_SCALAR") && atoi(getenv("LLAMA_MOE_RED_SCALAR")) != 0);
+    static const bool use_v4 = true;
     if (use_v4 && n_embd % 4 == 0 && ((uintptr_t) experts % 16) == 0 && ((uintptr_t) dst % 16) == 0) {
         const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
         moe_weighted_reduction_f32_v4<<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
@@ -191,7 +191,6 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
             expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data,
             (uint16_t *) dst->data, mrg, n_embd, (int) n_expert_used);
         CUDA_CHECK(cudaGetLastError());
-        static unsigned h = 0; if (h++ < 2) fprintf(stderr, "MOE_RED bf16 out (in=%s, merge=%d): n_embd=%lld tokens=%lld\n", ein ? "bf16" : "f32", (int) (mrg != nullptr), (long long) n_embd, (long long) n_tokens);
         return;
     }
     GGML_ASSERT(merge == nullptr && "shared-expert merge is only fused on the BF16 output path");
@@ -203,7 +202,6 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
             expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data,
             (float *) dst->data, n_embd, (int) n_expert_used);
         CUDA_CHECK(cudaGetLastError());
-        static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MOE_RED bf16 inputs: n_embd=%lld used=%d tokens=%lld\n", (long long) n_embd, (int) n_expert_used, (long long) n_tokens);
         return;
     }
     launch_moe_weighted_reduction((const float *) experts->data,

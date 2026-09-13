@@ -118,7 +118,7 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
     float * out = stage ? staged.alloc(n_embd * n_tokens) : (float *) dst->data;
 
     const int64_t n_items = n_embd * n_tokens;
-    static const bool hc16 = getenv("LLAMA_MMB_HC16") && atoi(getenv("LLAMA_MMB_HC16")) != 0;
+    static const bool hc16 = true;
     const uint16_t * xn16 = hc16 ? ggml_cuda_mmb_cache_lookup(xn) : nullptr;
     const uint16_t * g16  = hc16 ? ggml_cuda_mmb_cache_lookup(gate) : nullptr;
     if (xn16 && g16) {

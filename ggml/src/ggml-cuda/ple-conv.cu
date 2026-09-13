@@ -1,7 +1,7 @@
 #include "ple-conv.cuh"
 #include "unary.cuh"
 #include <cstdlib>
-static bool ple_conv_enabled() { static const int v = getenv("LLAMA_PLE_CONV") ? atoi(getenv("LLAMA_PLE_CONV")) : 0; return v != 0; }
+static bool ple_conv_enabled() { return true; }
 #if defined(__HIP_PLATFORM_AMD__)
 static __device__ __forceinline__ float ple_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
 static __device__ __forceinline__ float ple_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
