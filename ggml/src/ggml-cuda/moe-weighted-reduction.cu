@@ -55,7 +55,7 @@ static __global__ void moe_weighted_reduction_f32_v4(const float * __restrict__ 
     *(float4 *)(dst + token * n_embd + col4) = sum;
 }
 
-// BF16 expert outputs (LLAMA_MMB_DOWN16): identical arithmetic, the inputs are the BF16-rounded down-GEMM results
+// BF16 expert outputs: identical arithmetic, the inputs are the BF16-rounded down-GEMM results
 static __global__ void moe_weighted_reduction_bf16_v4(const uint16_t * __restrict__ experts,
                                                       const float * __restrict__ expert_scale,
                                                       const float * __restrict__ weights,

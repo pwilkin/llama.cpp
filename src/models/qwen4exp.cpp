@@ -84,7 +84,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 
     {   // The converted GGUF leaves the nextn/MTP layer's compress ratio at 0, but the MTP sidecar ships
         // blk.N.indexer.* and Halogen runs that layer with the same sparse attention as the trunk (one
-        // k_attn_qs_bt4x call per target chunk for it). With LLAMA_MTP_QSA=1 inherit the trunk's ratio.
+        // k_attn_qs_bt4x call per target chunk for it), so inherit the trunk's ratio.
         if (hparams.n_layer_nextn > 0 && hparams.indexer_head_size > 0) {
             int32_t trunk_r = 0;
             for (uint32_t j = 0; j < hparams.n_layer(); ++j) {
@@ -93,7 +93,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             for (uint32_t j = hparams.n_layer(); j < hparams.n_layer_all && trunk_r > 0; ++j) {
                 if (hparams.dsv4_compress_ratios[j] == 0) {
                     hparams.dsv4_compress_ratios[j] = trunk_r;
-                    LLAMA_LOG_INFO("%s: LLAMA_MTP_QSA: layer %u compress ratio 0 -> %d\n", __func__, j, trunk_r);
+                    LLAMA_LOG_INFO("%s: nextn layer %u compress ratio 0 -> %d\n", __func__, j, trunk_r);
                 }
             }
         }
@@ -594,7 +594,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // with LLAMA_MTP_QSA the MTP context is a hybrid-idx memory, so the draft head can use the same sparse
+    // the MTP context is a hybrid-idx memory, so the draft head can use the same sparse
     // attention path as the trunk (this is what Halogen does: one sparse attention call per target chunk)
     llm_graph_input_attn_kv * inp_attn = nullptr;
     const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
@@ -689,7 +689,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     if (mctx_hyb) {
         // the converted GGUF leaves compress_ratios[nextn] = 0, but the sidecar ships blk.N.indexer.* and the
         // reference runs this layer sparsely; fall back to the trunk ratio
-        const int64_t r        = hparams.dsv4_compress_ratios[il];   // patched at load when LLAMA_MTP_QSA is set
+        const int64_t r        = hparams.dsv4_compress_ratios[il];   // patched at load for the nextn layer
         const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width    = (int64_t) hparams.indexer_top_k + r - 1;
         ggml_tensor * top_k = nullptr;
@@ -805,7 +805,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // impl fills batch.token and batch.embd together (the head consumes the target's h_nextn row per token).
 // The original `!ubatch.embd` guard was aimed at pure-embedding (vision) batches, which are already
 // excluded by requiring ubatch.token; keeping it shut the draft out of block selection, and with it out of
-// the maskless/packed-key layout and the qsa3 attention kernel. Set LLAMA_QSA_TOKEN_EMBD=0 to restore it.
+// the maskless/packed-key layout and the qsa3 attention kernel.
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
     return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
