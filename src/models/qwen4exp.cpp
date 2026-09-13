@@ -1399,7 +1399,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             ggml_tensor * v_view = ggml_permute(ctx0, v, 0, 2, 1, 3);
             if (v_trans) { v_view = ggml_transpose(ctx0, v_view); }
             const auto qsa_it=qsa_inps.find((uint32_t)hparams.dsv4_compress_ratios[il]);
-            const bool maskless=qsa_it!=qsa_inps.end() && qsa_it->second->maskless;
+            // without the mask, top_k is the only record of which cells are visible, and only the qsa3
+            // kernel reads it: every other flash-attention path ignores src[5] and would attend to the
+            // whole padded cache. qsa3 needs both packed layouts and bails below 128 queries, so the
+            // mask may only be dropped where those hold - a decode ubatch keeps it.
+            const bool qsa3=packed_keys && packed_values && qwen4exp_qsa_flag("LLAMA_QSA_FA_V3") &&
+                (n_query>=128 || qwen4exp_qsa_flag("QSA3_FORCE"));
+            const bool maskless=qsa3 && qsa_it!=qsa_inps.end() && qsa_it->second->maskless;
             ggml_tensor * mask = maskless ? nullptr : (ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask));
             ggml_tensor * indices = ggml_is_contiguous(top_k) ? top_k : ggml_cont(ctx0, top_k);
             GGML_ASSERT(indices->ne[1] == kq_mask->ne[1] && indices->ne[3] == kq_mask->ne[3]);

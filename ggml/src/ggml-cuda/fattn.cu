@@ -734,6 +734,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_flash_attn_ext_qsa(ctx, dst);
         return;
     }
+    // only the qsa kernel honours the selected-cell indices; the kernels below attend to every key, so
+    // a maskless sparse op reaching them would read cells the mask exists to hide
+    GGML_ASSERT((dst->src[3] || !dst->src[5]) && "sparse flash attention without a mask needs the qsa kernel");
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
