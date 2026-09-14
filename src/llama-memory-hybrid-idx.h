@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-memory-hybrid.h"
+#include "qsa-prefix-state.h"
 
 #include <memory>
 #include <vector>
@@ -90,7 +91,24 @@ public:
                              ggml_tensor * bias, ggml_tensor * tail_idxs,
                              const llama_ubatch * ubatch, uint32_t ratio) const;
 
+    void qsa_apply(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & slots);
+    void qsa_invalidate();
+    bool qsa_prefix_matches(const llama_ubatch & ubatch) const;
+    bool qsa_fast(int il, const llama_ubatch & ubatch) const;
+    ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks) const;
+    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
+    void qsa_commit(int il) const;
+
 private:
+    bool incremental_qsa = false;
+    bool qsa_recover_pending = false;
+    bool qsa_recover(llama_seq_id seq);
+    qsa_prefix_state qsa_prefix;
+    mutable std::vector<int64_t> qsa_ready;
+    std::vector<ggml_tensor *> qsa_keys;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_buffers;
+    bool qsa_metadata(ggml_tensor * cells, ggml_tensor * positions, ggml_tensor * bias,
+                      ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
     void set_input_qsa_impl(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                             ggml_tensor * bias, ggml_tensor * tail_idxs,
                             const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
@@ -144,6 +162,14 @@ public:
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+    bool qsa_prefix_matches(const llama_ubatch & u) const { return mem && mem->qsa_prefix_matches(u); }
+    bool qsa_fast(int il, const llama_ubatch & u) const { return mem && mem->qsa_fast(il, u); }
+    ggml_tensor * qsa_cache(ggml_context * ctx, int il) const {
+        return mem ? mem->qsa_cache(ctx, il, (get_idx()->get_n_kv()+3)/4) : nullptr;
+    }
+    void qsa_fill_updates(ggml_tensor * c, ggml_tensor * p, ggml_tensor * r) const { mem->qsa_fill_updates(c,p,r); }
+    void qsa_commit(int il) const { mem->qsa_commit(il); }
+
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
@@ -163,6 +189,7 @@ private:
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
+    const slot_info_vec_t qsa_slots;
 
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;

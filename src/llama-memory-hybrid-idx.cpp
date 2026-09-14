@@ -1,6 +1,8 @@
 #include "llama-memory-hybrid-idx.h"
 
 #include <cstdlib>
+#include "ggml-cpu.h"
+#include "ggml-alloc.h"
 
 #include "prefix.h"
 
@@ -78,7 +80,33 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+#if defined(GGML_USE_HIP)
+    incremental_qsa = mem_idx && offload && n_swa == 0;
+#endif
+    if (!incremental_qsa) { return; }
+    qsa_prefix = qsa_prefix_state(kv_size);
+    const int layers = model.hparams.n_layer_all;
+    qsa_keys.resize(layers, nullptr); qsa_ready.resize(layers, 0);
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> contexts;
+    for (int il=0; il<layers; ++il) {
+        if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] != 4) { continue; }
+        auto * buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+        auto & ctx = contexts[buft];
+        if (!ctx) {
+            ctx.reset(ggml_init({size_t(layers)*ggml_tensor_overhead(), nullptr, true}));
+            if (!ctx) { throw std::runtime_error("QSA cache context allocation failed"); }
+        }
+        qsa_keys[il] = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, model.hparams.indexer_head_size, (kv_size+3)/4);
+        ggml_format_name(qsa_keys[il], "cache_qsa_k_l%d", il);
+    }
+    for (auto & entry : contexts) {
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(entry.second.get(), entry.first);
+        if (!buffer) { throw std::runtime_error("QSA cache buffer allocation failed"); }
+        ggml_backend_buffer_clear(buffer, 0);
+        qsa_buffers.emplace_back(std::move(entry.second), buffer);
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -150,10 +178,14 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
-    return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
+    auto result = std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
+    if (result->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) { qsa_invalidate(); }
+    return result;
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
+    qsa_prefix.reset(); qsa_recover_pending = false; std::fill(qsa_ready.begin(), qsa_ready.end(), 0);
+    if (data) { for (const auto & entry : qsa_buffers) { ggml_backend_buffer_clear(entry.second.get(), 0); } }
     llama_memory_hybrid::clear(data);
 
     if (mem_idx) {
@@ -167,6 +199,13 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         return false;
     }
 
+    if (incremental_qsa && !qsa_prefix.valid) { qsa_recover_pending = true; }
+    if (incremental_qsa && qsa_prefix.valid && (seq_id < 0 || seq_id == qsa_prefix.sequence)) {
+        if (p1 < 0 || size_t(p1) >= qsa_prefix.cells.size()) {
+            qsa_prefix.truncate(std::max(0, p0));
+            for (auto & ready : qsa_ready) { ready = std::min<int64_t>(ready, qsa_prefix.cells.size()/4); }
+        } else { qsa_invalidate(); }
+    }
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
     }
@@ -175,6 +214,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    qsa_invalidate();
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
@@ -183,6 +223,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+    if (!qsa_prefix.valid || (qsa_prefix.sequence >= 0 && seq_id != qsa_prefix.sequence)) { qsa_invalidate(); }
     llama_memory_hybrid::seq_keep(seq_id);
 
     if (mem_idx) {
@@ -191,6 +232,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    qsa_invalidate();
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
@@ -199,6 +241,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    qsa_invalidate();
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {
@@ -215,6 +258,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
         }
     }
 
+    for (const auto & entry : qsa_buffers) {
+        mb[ggml_backend_buffer_get_type(entry.second.get())] += ggml_backend_buffer_get_size(entry.second.get());
+    }
     return mb;
 }
 
@@ -235,6 +281,7 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) { qsa_invalidate(); }
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 
@@ -267,6 +314,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+    qsa_invalidate();
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
         clear(true);
@@ -307,6 +355,9 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias) const {
+    if (tail_idxs && cell_blk->ne[1] == 1 && qsa_metadata(blk_cells, blk_pos, bias, tail_idxs, *ubatch, ratio)) {
+        return;
+    }
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -718,6 +769,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
     mem(mem),
     ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
+    qsa_slots(sinfos_idx),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
 
@@ -736,6 +788,9 @@ bool llama_memory_hybrid_idx_context::apply() {
 
     if (ctx_idx) {
         res = res & ctx_idx->apply();
+        if (res && i_cur < qsa_slots.size()) {
+            const_cast<llama_memory_hybrid_idx *>(mem)->qsa_apply(ctx_idx->get_ubatch(), qsa_slots[i_cur]);
+        } else if (!res) { const_cast<llama_memory_hybrid_idx *>(mem)->qsa_invalidate(); }
     }
 
     return res;
@@ -772,12 +827,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
 }
 
 bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch) const {
+    if (qsa_prefix_matches(ubatch)) { return true; }
     if (!qsa_scalar_visibility(ubatch)) { return false; }
     const llama_seq_id seq=ubatch.seq_id[0][0];
     return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq);
 }
 
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch) const {
+    if (qsa_prefix_matches(ubatch)) { return true; }
     if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !ubatch.pos || !ubatch.n_tokens ||
             !ubatch.n_pos || !ubatch.seq_id || !ubatch.n_seq_id) { return false; }
     if (ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
@@ -794,6 +851,119 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
         for (uint32_t j=0;j<get_idx()->get_n_kv();++j) {
             if (!cells.is_empty(j) && cells.seq_has(j,seq) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
         }
+    }
+    return true;
+}
+
+void llama_memory_hybrid_idx::qsa_invalidate() {
+    qsa_prefix.invalidate(); qsa_recover_pending = true; std::fill(qsa_ready.begin(), qsa_ready.end(), 0);
+}
+
+bool llama_memory_hybrid_idx::qsa_recover(llama_seq_id seq) {
+    if (mem_idx->get_n_stream() != 1) { return false; }
+    const auto & raw = mem_idx->get_cells(seq);
+    if (raw.size() != qsa_prefix.positions.size()) { return false; }
+    qsa_prefix_state rebuilt(qsa_prefix.positions.size());
+    rebuilt.cells.resize(raw.get_used(), -1);
+    for (uint32_t cell=raw.used_min(); cell<raw.used_max_p1(); ++cell) {
+        if (raw.is_empty(cell)) { continue; }
+        const int32_t pos = raw.pos_get(cell);
+        const auto & ext = raw.ext_get(cell);
+        if (pos < 0 || size_t(pos) >= rebuilt.cells.size() || rebuilt.cells[pos] >= 0 ||
+            !raw.seq_has(cell, seq) || raw.seq_get_all(cell).count() != 1 ||
+            !((ext.x == 0 && ext.y == 0) || (ext.x == pos && ext.y == pos))) { return false; }
+        rebuilt.cells[pos] = cell; rebuilt.positions[cell] = pos;
+    }
+    if (std::find(rebuilt.cells.begin(), rebuilt.cells.end(), -1) != rebuilt.cells.end()) { return false; }
+    rebuilt.sequence = seq;
+    for (size_t b=0; b<rebuilt.cells.size()/4; ++b) { rebuilt.block_positions.push_back(b*4); }
+    qsa_prefix = std::move(rebuilt);
+    return true;
+}
+
+void llama_memory_hybrid_idx::qsa_apply(const llama_ubatch & u, const llama_kv_cache::slot_info & slots) {
+    if (!incremental_qsa) { return; }
+    const auto reject = [&]() { qsa_invalidate(); qsa_recover_pending = false; };
+    if (!u.token || !u.pos || !u.n_tokens || slots.n_stream() != 1 ||
+        slots.size() != u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id || u.n_seq_id[0] != 1 || !u.seq_id[0]) {
+        reject(); return;
+    }
+    const auto seq = u.seq_id[0][0];
+    for (uint32_t i=0; i<u.n_tokens; ++i) {
+        if (u.n_seq_id[i] != 1 || !u.seq_id[i] || u.seq_id[i][0] != seq || int64_t(u.pos[i]) != int64_t(u.pos[0])+i) {
+            reject(); return;
+        }
+        for (uint32_t axis=1; axis<u.n_pos; ++axis) {
+            if (u.pos[i+axis*u.n_tokens] != u.pos[i]) { reject(); return; }
+        }
+    }
+    if (!qsa_prefix.valid && (!qsa_recover_pending || !qsa_recover(seq))) { qsa_recover_pending = false; return; }
+    qsa_recover_pending = false;
+    if (!qsa_prefix.apply(seq, u.pos[0], slots.idxs[0])) { reject(); }
+}
+
+bool llama_memory_hybrid_idx::qsa_prefix_matches(const llama_ubatch & u) const {
+    if (!incremental_qsa || !qsa_prefix.valid || !u.token || !u.pos || !u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id ||
+        u.pos[0] != qsa_prefix.begin || int64_t(u.n_tokens) != qsa_prefix.end-qsa_prefix.begin) { return false; }
+    for (uint32_t i=0; i<u.n_tokens; ++i) {
+        if (u.n_seq_id[i] != 1 || !u.seq_id[i] || u.seq_id[i][0] != qsa_prefix.sequence || u.pos[i] != u.pos[0]+int32_t(i)) { return false; }
+        for (uint32_t a=1; a<u.n_pos; ++a) { if (u.pos[i+a*u.n_tokens] != u.pos[i]) { return false; } }
+    }
+    return true;
+}
+
+bool llama_memory_hybrid_idx::qsa_fast(int il, const llama_ubatch & u) const {
+    return qsa_prefix_matches(u) && u.n_tokens <= 8 && qsa_keys.at(il) &&
+        qsa_ready.at(il) >= int64_t(qsa_prefix.previous_size/4) &&
+        qsa_prefix.cells.size()/4 >= (u.n_tokens+3)/4+1;
+}
+
+ggml_tensor * llama_memory_hybrid_idx::qsa_cache(ggml_context * ctx, int il, int64_t blocks) const {
+    if (!incremental_qsa || !qsa_keys.at(il)) { return nullptr; }
+    auto * k = qsa_keys[il]; GGML_ASSERT(blocks <= k->ne[1]);
+    return ggml_view_2d(ctx, k, k->ne[0], blocks, k->nb[1], 0);
+}
+
+void llama_memory_hybrid_idx::qsa_fill_updates(ggml_tensor * members, ggml_tensor * pos, ggml_tensor * rows) const {
+    const int count = rows->ne[0], complete = qsa_prefix.cells.size()/4;
+    const int first = qsa_prefix.begin/4, last = std::min(complete, (qsa_prefix.end+3)/4);
+    GGML_ASSERT(last-first <= count && complete >= count);
+    std::vector<int32_t> ids;
+    for (int b=first; b<last; ++b) { ids.push_back(b); }
+    for (int b=0; int(ids.size())<count; ++b) { if (b<first || b>=last) { ids.push_back(b); } }
+    auto * c = (int32_t *) members->data; auto * p = (int32_t *) pos->data; auto * w = (int64_t *) rows->data;
+    for (int i=0; i<count; ++i) {
+        w[i] = ids[i];
+        for (int j=0; j<4; ++j) { c[4*i+j] = qsa_prefix.cells[ids[i]*4+j]; p[j*count+i] = ids[i]*4; }
+    }
+}
+
+void llama_memory_hybrid_idx::qsa_commit(int il) const {
+    GGML_ASSERT(qsa_prefix.valid); qsa_ready.at(il) = qsa_prefix.cells.size()/4;
+}
+
+bool llama_memory_hybrid_idx::qsa_metadata(ggml_tensor * members, ggml_tensor * pos, ggml_tensor * bias,
+        ggml_tensor * tails, const llama_ubatch & u, uint32_t ratio) const {
+    if (ratio != 4 || bias->type != GGML_TYPE_I32 || !qsa_prefix_matches(u)) { return false; }
+    const size_t blocks = pos->ne[0]/4, complete = qsa_prefix.cells.size()/4;
+    if (complete > blocks) { return false; }
+    auto * c = (int32_t *) members->data; auto * p = (int32_t *) pos->data;
+    auto * lim = (int32_t *) bias->data; auto * tail = (int32_t *) tails->data;
+    GGML_ASSERT(c && lim && tail);
+    std::copy_n(qsa_prefix.cells.data(), complete*4, c);
+    std::fill(c+complete*4, c+blocks*4, 0);
+    if (p) {
+        for (int a=0; a<4; ++a) {
+            std::copy_n(qsa_prefix.block_positions.data(), complete, p+a*blocks);
+            std::fill(p+a*blocks+complete, p+(a+1)*blocks, 0);
+        }
+    }
+    std::copy_n(qsa_prefix.block_positions.data(), complete, lim);
+    std::fill(lim+complete, lim+blocks, INT32_MAX);
+    std::fill(tail, tail+3*u.n_tokens, -1);
+    for (uint32_t i=0; i<u.n_tokens; ++i) {
+        int32_t end = u.pos[i]+1, start = end/4*4; lim[blocks+i] = start;
+        for (int j=0; j<end-start; ++j) { tail[3*i+j] = qsa_prefix.cells[start+j]; }
     }
     return true;
 }

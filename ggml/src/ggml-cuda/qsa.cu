@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "qsa-decode.cuh"
 
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
