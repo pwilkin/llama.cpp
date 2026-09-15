@@ -3837,7 +3837,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: run GEMM + sigmoid + mix in one kernel
         const ggml_tensor * w = node->src[0], * lo = node->src[1];
-        if (w->type == GGML_TYPE_IQ4_NL && w->ne[0] == 320 && w->ne[1] == 10240 && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
+        if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
             ggml_cuda_hc_mix_args ma;
             const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
             if (count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
@@ -4957,7 +4957,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     const ggml_tensor * t = cgraph->nodes[n];
                     if (!reads(t, xn)) continue;
                     ++nread;
-                    if (t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                    if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
+                        ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                     if (t->op == GGML_OP_MUL && n >= 1) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn)) continue; }
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     ok = false;
@@ -5049,7 +5050,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (!reads(t, d)) continue;
                     ++nread;
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
-                    if (t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                    if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
+                        ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                     ok = false;
                 }
                 if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(d);
@@ -5086,6 +5088,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             for (int k = 0; k < i; ++k) { if (cgraph->nodes[k] == ex) { xi = k; break; } }
             if (xi < 0 || ex->op != GGML_OP_MUL_MAT_ID || ex->type != GGML_TYPE_F32) continue;
             if (!ggml_cuda_mmb_supported_mmid(ex->src[0], ex->src[1], ex->src[2], const_cast<ggml_tensor *>(ex))) continue;
+            // Other formats retain F32 expert outputs for the weighted reduction.
+            if (ex->src[0]->type != GGML_TYPE_IQ4_NL) continue;
             if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
             if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
             ggml_cuda_mmb_mark_bf16_only(ex);
@@ -5098,6 +5102,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             const ggml_tensor * glu = cgraph->nodes[i];
             if (glu->op != GGML_OP_GLU || !glu->src[0] || !glu->src[1] || glu->src[0]->op != GGML_OP_MUL_MAT_ID) continue;
             if (!ggml_cuda_mmb_supported_glu(glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu)) continue;
+            for (const auto * input : {glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2]}) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(input), const_cast<ggml_tensor *>(glu));
+            }
             bool ok = true; int nread = 0;
             for (int n = i + 1; n < cgraph->n_nodes && ok; ++n) {
                 const ggml_tensor * t = cgraph->nodes[n];
@@ -5154,6 +5161,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (count>0) {
                     params->add_alloc_dep(params->user_data,const_cast<ggml_tensor *>(args.xn),args.dst);
                     params->add_alloc_dep(params->user_data,const_cast<ggml_tensor *>(args.gate),args.dst);
+                    if (args.gate->op == GGML_OP_MUL_MAT && ggml_is_quantized(args.gate->src[0]->type) && ggml_cuda_mmb_supported_mm(args.gate->src[0], args.gate->src[1], args.gate)) {
+                        params->add_alloc_dep(params->user_data, args.gate->src[0], args.dst);
+                        params->add_alloc_dep(params->user_data, args.gate->src[1], args.dst);
+                    }
                     i+=count-1;
                     continue;
                 }
@@ -5209,6 +5220,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(pm.x), pm.out);
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(pm.state), pm.out);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(pm.w), pm.out);
                     continue;
                 }
                 ggml_cuda_gdn_conv_match gm;

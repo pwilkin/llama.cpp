@@ -351,7 +351,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(xn, "hc_norm", il);
 
     const bool pack_di = nt >= 128 && inject &&
-        loras->empty() && w_down->type == GGML_TYPE_IQ4_NL && w_down->type == w_inject->type &&
+        loras->empty() && ggml_is_quantized(w_down->type) && w_down->type == w_inject->type &&
         ggml_is_matrix(w_down) && ggml_is_matrix(w_inject) &&
         ggml_is_contiguous(w_down) && ggml_is_contiguous(w_inject) &&
         w_down->ne[0] == w_inject->ne[0];
