@@ -1,6 +1,36 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
+#define GDN_DPP_REDUCE 1
+template <int mask>
+static __device__ __forceinline__ float gdn_dpp_row_xmask(const float x) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x160 | mask, 0xf, 0xf, true));
+}
+static __device__ __forceinline__ float gdn_permlanex16_swap(const float x) {
+    return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(x), __float_as_int(x),
+                                                       0x76543210, 0xFEDCBA98, true, false));
+}
+static __device__ __forceinline__ float gdn_warp_reduce_sum32(float x) {
+    x += gdn_permlanex16_swap(x);
+    x += gdn_dpp_row_xmask<8>(x);
+    x += gdn_dpp_row_xmask<4>(x);
+    x += gdn_dpp_row_xmask<2>(x);
+    x += gdn_dpp_row_xmask<1>(x);
+    return x;
+}
+#endif
+
+template <int width, bool DPP>
+static __device__ __forceinline__ float gdn_reduce_sum(const float x) {
+#if defined(GDN_DPP_REDUCE)
+    if constexpr (DPP && width == 32) {
+        return gdn_warp_reduce_sum32(x);
+    }
+#endif
+    return warp_reduce_sum<width>(x);
+}
+
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -172,7 +202,7 @@ gated_delta_net_cuda(const float * q,
 // to advance only rows_per_lane state elements, so it is issue-bound rather than bandwidth-bound.
 // The recurrence is unchanged: every column executes the same operations in the same order as
 // gated_delta_net_cuda, with the FMA contractions spelled out so the results stay bit-identical.
-template <int S_v, int NUM_WARPS, int COLS, int TOKEN_TILE, bool keep_rs_t>
+template <int S_v, int NUM_WARPS, int COLS, int TOKEN_TILE, bool keep_rs_t, bool DPP>
 __global__ void __launch_bounds__(32 * NUM_WARPS, 1)
 gated_delta_net_tiled_cuda(const float * q,
                            const float * k,
@@ -286,7 +316,7 @@ gated_delta_net_tiled_cuda(const float * q,
                 for (int r = 0; r < rows_per_lane; r++) {
                     kv_shard = fmaf(s_shard[c][r], k_reg[r], kv_shard);
                 }
-                const float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+                const float kv_col = gdn_reduce_sum<warp_size, DPP>(kv_shard);
 
                 // delta[col] = (v[col] - g * kv[col]) * beta
                 const float delta_col = fmaf(-g_val, kv_col, v_shared[tt][colw + c]) * beta_val;
@@ -299,7 +329,7 @@ gated_delta_net_tiled_cuda(const float * q,
                     s_shard[c][r] = fmaf(g_val, s_shard[c][r], k_reg[r] * delta_col);
                     attn_partial  = fmaf(s_shard[c][r], q_reg[r], attn_partial);
                 }
-                attn_col[c] = warp_reduce_sum<warp_size>(attn_partial);
+                attn_col[c] = gdn_reduce_sum<warp_size, DPP>(attn_partial);
             }
 
             // every lane holds all COLS results; lane c writes column c
@@ -373,13 +403,23 @@ static void launch_gated_delta_net(
             const dim3 tiled_grid(H, n_seqs, 128 / (tiled_warps*tiled_cols));
             const dim3 tiled_block(32, tiled_warps, 1);
 
+            static const bool dpp = getenv("GGML_CUDA_GDN_DPP") != nullptr;
+
             const ggml_cuda_kernel_launch_params tiled_params =
                 ggml_cuda_kernel_launch_params(tiled_grid, tiled_block, 0, stream);
-            ggml_cuda_kernel_launch(
-                gated_delta_net_tiled_cuda<128, tiled_warps, tiled_cols, tiled_tile, keep_rs_t>, tiled_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
-                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
-                neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            if (dpp) {
+                ggml_cuda_kernel_launch(
+                    gated_delta_net_tiled_cuda<128, tiled_warps, tiled_cols, tiled_tile, keep_rs_t, true>, tiled_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                    neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            } else {
+                ggml_cuda_kernel_launch(
+                    gated_delta_net_tiled_cuda<128, tiled_warps, tiled_cols, tiled_tile, keep_rs_t, false>, tiled_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                    neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            }
             return;
         }
     }
