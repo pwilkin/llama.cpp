@@ -6377,7 +6377,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim))
+    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: b is a 2d transpose)
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -6412,7 +6412,15 @@ struct test_concat : public test_case {
             ggml_set_name(a, "a");
         }
         ggml_tensor * b;
-        if (v & 2) {
+        if (v & 16) {
+            // b transposed: contiguous along dim 1, strided along dim 0, as ggml_transpose leaves it
+            GGML_ASSERT(dim == 0 && ne_b[2] == 1 && ne_b[3] == 1);
+            b = ggml_new_tensor_2d(ctx, type, ne_b[1], ne_b[0]);
+            ggml_set_name(b, "b");
+
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transpose_of_b");
+        } else if (v & 2) {
             auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
             b = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(b, "b");
@@ -10581,6 +10589,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // concat(a, ggml_transpose(b), 0): b is contiguous along the axis dst is strided along
+    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I32}) {
+        test_cases.emplace_back(new test_concat(t, {3, 10240, 1, 1}, 2048, 0, 16)); // qwen4exp gdn conv input
+        test_cases.emplace_back(new test_concat(t, {3,   100, 1, 1},   77, 0, 16)); // ragged tiles
+        test_cases.emplace_back(new test_concat(t, {5,    33, 1, 1},   31, 0, 16));
+        test_cases.emplace_back(new test_concat(t, {1,    32, 1, 1},   32, 0, 16)); // exact tile
+        test_cases.emplace_back(new test_concat(t, {7,     1, 1, 1},    1, 0, 16)); // degenerate
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {
@@ -11675,6 +11692,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2048, 1)); // PP-2048
+
+    // qwen4exp gdn conv input: concat(state, ggml_transpose(x), 0), [3+2048, 10240]
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {32, 10240, 1, 1}, 2048, 0, 16)); // ne0=2080, 64B-aligned rows
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {0,  10240, 1, 1}, 2048, 0, 16)); // ne0=2048, pure transpose
     // qwen4exp (Qwen3.8-Flash-Next): 16 k/q groups, 48 value heads, d=128
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3));
