@@ -11695,6 +11695,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen4exp gdn conv input: concat(state, ggml_transpose(x), 0), [3+2048, 10240]
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 16));
+
+    // qwen4exp mHC head: bf16 [320, 10240] x [320, 1] -- one decode matvec per layer, twice
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 10240, 1, 320, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  2560, 1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {32, 10240, 1, 1}, 2048, 0, 16)); // ne0=2080, 64B-aligned rows
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {0,  10240, 1, 1}, 2048, 0, 16)); // ne0=2048, pure transpose
     // qwen4exp (Qwen3.8-Flash-Next): 16 k/q groups, 48 value heads, d=128
