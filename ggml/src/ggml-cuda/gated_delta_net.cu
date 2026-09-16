@@ -403,7 +403,7 @@ static void launch_gated_delta_net(
             const dim3 tiled_grid(H, n_seqs, 128 / (tiled_warps*tiled_cols));
             const dim3 tiled_block(32, tiled_warps, 1);
 
-            static const bool dpp = getenv("GGML_CUDA_GDN_DPP") != nullptr;
+            static const bool dpp = getenv("GGML_CUDA_NO_GDN_DPP") == nullptr;
 
             const ggml_cuda_kernel_launch_params tiled_params =
                 ggml_cuda_kernel_launch_params(tiled_grid, tiled_block, 0, stream);
