@@ -7799,6 +7799,180 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with a top-k sparse selection hint (DeepSeek V4 CSA shape).
+// The kq_mask encodes the same selection as the top_k indices, so a backend that ignores
+// the hint (CPU) computes the identical result densely — this is exactly the contract
+// that keeps sparse and dense paths interchangeable, and what this test verifies.
+struct test_flash_attn_ext_top_k : public test_case {
+    const int64_t kv;       // total KV size (compressed region + dense prefix)
+    const int64_t nb;       // batch size (query tokens)
+    const int64_t n_kv_raw; // dense prefix always attended
+    const int64_t n_top_k;  // selected keys per query token
+    const bool    sinks;
+    const int64_t ns;       // sequences (ne3); >1 exercises the split-K stream stride
+    const int64_t ov;       // % of each token's picks shared with its neighbours (dedup-union realism)
+    const ggml_type type_K; // K/V cache type; V is the same tensor, so one type covers both
+
+    static constexpr int64_t hs = 512; // V4 CSA head size, K == V latent
+    static constexpr int64_t nh = 64;  // V4 CSA query heads (MQA)
+
+    std::string vars() override {
+        return VARS_TO_STR8(kv, nb, n_kv_raw, n_top_k, sinks, ns, ov, type_K);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // only the active keys contribute compute on a sparse backend; count those so
+        // perf mode reports the useful-work rate
+        return 2 * nh * nb * ns * (hs + hs) * (n_kv_raw + n_top_k);
+    }
+
+    test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false, int64_t ns = 1, int64_t ov = 0,
+                              ggml_type type_K = GGML_TYPE_F16)
+        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), ns(ns), ov(ov), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, ns);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, 1, ns);
+        ggml_set_name(k, "k");
+
+        // V4 CSA attends over the K latent itself: V is the same cache tensor
+        ggml_tensor * v = ggml_view_4d(ctx, k, hs, kv, 1, ns, k->nb[1], k->nb[2], k->nb[3], 0);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nb, 1, ns);
+        ggml_set_name(t, "top_k");
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_add_top_k(out, t, n_kv_raw);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t range = kv - n_kv_raw; // size of the selectable compressed region
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "top_k") == 0 || strcmp(t->name, "m") == 0) {
+                continue; // filled together below
+            }
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+
+        // build a consistent (top_k, mask) pair: a deterministic per-token selection,
+        // strided so adjacent tokens select overlapping-but-different keys, with one
+        // deliberately invalid index (-1) whose mask slot stays -inf
+        std::vector<int32_t> top(n_top_k * nb * ns);
+        std::vector<ggml_fp16_t> mask(kv * nb * ns);
+        const ggml_fp16_t minus_inf = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_fp16_t zero      = ggml_fp32_to_fp16(0.0f);
+
+        for (int64_t s = 0; s < ns; ++s) {
+            for (int64_t b = 0; b < nb; ++b) {
+                const int64_t mrow = (s * nb + b) * kv;
+                const int64_t trow = (s * nb + b) * n_top_k;
+                for (int64_t i = 0; i < kv; ++i) {
+                    mask[mrow + i] = i < n_kv_raw ? zero : minus_inf;
+                }
+                for (int64_t j = 0; j < n_top_k; ++j) {
+                    // offset the selection by the stream too, so a dropped stream stride
+                    // reads another sequence's keys and shows up as a mismatch
+                    const bool shared = (int64_t) j * 100 < n_top_k * ov;
+                    int32_t idx = shared
+                        ? (int32_t) ((j * range) / n_top_k + s * 7) % (int32_t) range
+                        : (int32_t) ((j * range) / n_top_k + b + s * 7) % (int32_t) range;
+                    if (j == n_top_k - 1 && b == 0 && s == 0) {
+                        idx = -1; // exercise the ignore-invalid-index path
+                    } else {
+                        mask[mrow + n_kv_raw + idx] = zero;
+                    }
+                    top[trow + j] = idx;
+                }
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "top_k") == 0) {
+                ggml_backend_tensor_set(t, top.data(), 0, top.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                ggml_backend_tensor_set(t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
+struct test_qsa_prefill : public test_case {
+    const int dim, queries, keys, selected, streams, ratio;
+    const bool interleaved, poison;
+    ggml_tensor * k = nullptr, * v = nullptr, * mask = nullptr, * ids = nullptr;
+    test_qsa_prefill(int queries, int keys, int selected, bool interleaved=true, bool poison=false, int streams=1, int ratio=12, int dim=256)
+        : dim(dim), queries(queries), keys(keys), selected(selected), streams(streams), ratio(ratio), interleaved(interleaved), poison(poison) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL"; }
+    std::string vars() override { return VARS_TO_STR8(dim,queries,keys,selected,streams,ratio,interleaved,poison); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
+        q = ggml_permute(ctx,q,0,2,1,3);
+        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        if (interleaved) { k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3); }
+        mask = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,keys,queries,1,streams);
+        ids = ggml_new_tensor_4d(ctx,GGML_TYPE_I32,selected,queries,1,streams);
+        auto * out = ggml_flash_attn_ext(ctx,q,k,v,mask,1.0f/sqrtf(dim),0.0f,0.0f);
+        ggml_flash_attn_ext_add_top_k(out,ids,0);
+        ggml_prec_set_acc(out,GGML_PREC_F32);
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+            if (t->op==GGML_OP_NONE && t!=mask && t!=ids) init_tensor_uniform(t);
+        }
+        std::vector<int32_t> picks(ggml_nelements(ids));
+        std::vector<ggml_fp16_t> masks(ggml_nelements(mask),ggml_fp32_to_fp16(-INFINITY));
+        for (int stream=0;stream<streams;++stream) for (int q=0;q<queries;++q) {
+            for (int j=0;j<selected;++j) {
+                int key=1+(j*37+q*13+stream*7)%(keys-4);
+                if (key==3) key=4;
+                if (j==0) key=poison ? 3 : -1;
+                if (j==1) key=2;
+                picks[(stream*queries+q)*selected+j]=key;
+                if (key>=0 && !(poison && key==3)) masks[(stream*queries+q)*keys+key]=ggml_fp32_to_fp16(0.015625f*(key%5-2));
+            }
+        }
+        ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+        ggml_backend_tensor_set(mask,masks.data(),0,ggml_nbytes(mask));
+        if (poison) {
+            std::vector<ggml_fp16_t> nan(dim,ggml_fp32_to_fp16(NAN));
+            for (auto * t : {k,v}) for (int stream=0;stream<streams;++stream) for (int head=0;head<2;++head) {
+                ggml_backend_tensor_set(t,nan.data(),stream*t->nb[3]+head*t->nb[2]+3*t->nb[1],dim*sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10967,11 +11141,83 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   1, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  17, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 512, 512, 1, 1, GGML_TYPE_F16));
 
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    for (bool interleaved : {false,true}) {
+        test_cases.emplace_back(new test_qsa_prefill(128,512,17,interleaved));
+        test_cases.emplace_back(new test_qsa_prefill(129,4096,257,interleaved));
+        test_cases.emplace_back(new test_qsa_prefill(512,4096,2051,interleaved));
+        test_cases.emplace_back(new test_qsa_prefill(128,40064,2051,interleaved));
+    }
+    for (int q : {1,4,127}) test_cases.emplace_back(new test_qsa_prefill(q,4096,128));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,4));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,12,128));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,2560));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,2561));
+    test_cases.emplace_back(new test_qsa_prefill(128,512,17,true,true));
+    test_cases.emplace_back(new test_qsa_prefill(129,4096,257,true,true));
+
+    // sparse top-k FA: (kv, nb, n_kv_raw, n_top_k, sinks). The Vulkan sparse path engages
+    // when kv >= 3*(n_kv_raw + n_top_k) AND nb >= 64 (prefill-only); the nb < 64 cases
+    // and the kv=512 case verify dense-fallback parity with the hint attached, the
+    // nb=64/128 cases exercise the sparse shader itself.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  8,  64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768, 17,  64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(1024,  64,  65, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128, 256, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 257, 256, 512, false));
+    // ns > 1: the split-K partial-output path indexes O and L/M by stream, so these cover
+    // the stream stride in both regions (single tile and multi-tile).
+    // small-batch decode (speculative drafts): each token gets its own gathered top-k block,
+    // so cross-token rows must be masked out or the softmax double counts. kv must be large
+    // enough that compaction is worth it (the gather gates on kv >= 2*kv_c).
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   2, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   3, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   8, 1024, 512, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 16, 2304, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(65536, 63, 2304, 512, false));
+    // overlapping selections at the shapes where the compaction gate is tightest: with a
+    // deduplicated union these are admitted on the estimated union size rather than the
+    // worst case, so they cover the estimator's gate as well as the union itself.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86));
+    // quantised K/V: the gather relocates rows verbatim, so it should serve any type whose row
+    // is a whole number of 4-byte words. These are the shapes a DSv4 decode with -ctk q8_0 hits,
+    // which took the dense fallback entirely before the gather learned to address rows as bytes.
+    for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 1,  0, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   1, 1024, 512, false, 1,  0, tk));
+        // prefill widths (nb >= 64), where the sparse shaders run on a dequantised f16 scratch
+        // instead of the cache. ns=2 covers the scratch's stream stride, and the 4096 case is
+        // wide enough for the raw/selected split form.
+        test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,   64, 128, false, 1,  0, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,   64, 128, false, 2,  0, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128,  256, 512, false, 1,  0, tk));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true,  2));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 300, 256, 512, false, 3));
+
+    for (int kv : { 127, 128, 129 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, GGML_TYPE_F16));
     }
 
     return test_cases;
@@ -11424,7 +11670,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
     // lightning_indexer
-    for (int kv : { 256, 4096, 65536 }) {
+    for (int kv : { 256, 512, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {
             for (int nh : { 32, 64 }) {
                 for (int ns : { 1, 4 }) {
