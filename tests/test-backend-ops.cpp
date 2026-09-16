@@ -11113,6 +11113,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
+    // head_size 128 with a full token tile: the shapes the RDNA3.5 tiled kernel takes over
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  16, 1));            // exactly one tile
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  17, 1));            // partial trailing tile
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  64, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  16, 2));            // two sequences
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  48, 1, 3));         // qwen4exp: 16 groups, 48 v heads
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  33, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  20, 1, 3, true));   // permuted q/k/v
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  20, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  64, 1, 3, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  16, 1, 1, false, true));  // KDA stays untiled
+
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
@@ -11662,6 +11674,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2048, 1)); // PP-2048
+    // qwen4exp (Qwen3.8-Flash-Next): 16 k/q groups, 48 value heads, d=128
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3));
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
