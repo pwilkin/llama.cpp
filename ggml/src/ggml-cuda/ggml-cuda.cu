@@ -371,6 +371,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
 #endif  // defined(GGML_USE_HIP)
     }
 
+#if defined(GGML_USE_HIP)
+    // rocBLAS/Tensile picks a 128x128 macro tile for the short-M, long-K GEMMs that show up in
+    // hyper-connection down-projections (M=320, K=10240), which leaves 2/3 of the last tile row
+    // idle and only fills 48 workgroups on 40 CUs. hipBLASLt picks a 64x96 tile for the same
+    // shape and cuts those GEMMs by a third. Measured on gfx1151: pp2048 744 -> 779 t/s, decode
+    // unchanged. Only enabled where it has been measured; an explicit setting by the user wins.
+    for (int id = 0; id < info.device_count; ++id) {
+        if (GGML_CUDA_CC_IS_RDNA3_5(info.devices[id].cc)) {
+            setenv("ROCBLAS_USE_HIPBLASLT", "1", /*overwrite =*/ 0);
+            break;
+        }
+    }
+#endif  // defined(GGML_USE_HIP)
+
     if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
         GGML_LOG_INFO("The following devices will have suboptimal performance due to a lack of tensor cores:\n");
         for (size_t device_pos = 0; device_pos < turing_devices_without_mma.size(); device_pos++) {
