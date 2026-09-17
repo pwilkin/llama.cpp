@@ -1483,12 +1483,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
+// the J whose tile covers ncols_opt in the fewest tiles, among those that fit in shared memory
 template <ggml_type type, bool fallback>
-void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    const int    id    = ggml_cuda_get_device();
-    const int    cc    = ggml_cuda_info().devices[id].cc;
-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-
+static int mmq_select_J(const int cc, const size_t smpbo, const int64_t ncols_opt) {
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
@@ -1502,13 +1499,24 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
+        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
             ntiles_J_best = ntiles_x;
         }
     }
+
+    return J_best;
+}
+
+template <ggml_type type, bool fallback>
+void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const int    id    = ggml_cuda_get_device();
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+
+    const int J_best = mmq_select_J<type, fallback>(cc, smpbo, args.ncols_opt);
 
     switch (J_best) {
         case   8:
@@ -1568,7 +1576,18 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
 template <ggml_type type>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    if (args.nrows_x % 128 == 0) {
+    const int    id    = ggml_cuda_get_device();
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+
+    // The non-fallback kernel omits the bounds check in the src0 row direction, so it may only be
+    // used when nrows_x is a multiple of the tile height it will actually run with. Ask for the J
+    // it would pick, since the tile height follows from that - a hardcoded height is only correct
+    // while every config happens to use one.
+    const int J_nofb = mmq_select_J<type, false>(cc, smpbo, args.ncols_opt);
+    const int I_nofb = J_nofb ? ggml_cuda_mmq_get_I(type, J_nofb, /*fallback =*/ false, cc) : 0;
+
+    if (I_nofb > 0 && args.nrows_x % I_nofb == 0) {
         constexpr bool fallback = false;
         mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
     } else {
