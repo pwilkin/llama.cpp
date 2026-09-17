@@ -434,6 +434,7 @@ void launch_mul_mat_vec_f_cuda(
 
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int cc        = ggml_cuda_info().devices[device].cc;
 
     int64_t block_size_best = warp_size;
     int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
@@ -441,9 +442,11 @@ void launch_mul_mat_vec_f_cuda(
     if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
         max_block_size = 128;
     }
+    const int64_t max_block_size_iter = GGML_CUDA_CC_IS_RDNA3_5(cc)
+            ? std::max<int64_t>(warp_size, ncols/32) : max_block_size;
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
         const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
-        if (niter < niter_best) {
+        if (niter < niter_best && block_size <= max_block_size_iter) {
             niter_best      = niter;
             block_size_best = block_size;
         }
