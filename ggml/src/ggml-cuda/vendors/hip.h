@@ -280,26 +280,19 @@ static __device__ __forceinline__ int __vsub4(const int a, const int b) {
     return __vsubss4(a, b);
 }
 
+// 0xff in each byte of d that is non-zero, without going byte by byte:
+// adding 0x7f to the low 7 bits carries into bit 7 exactly when one of them was set, and
+// cannot carry out of the byte (0x7f + 0x7f = 0xfe), so or-ing d back in catches bit 7 too.
+static __device__ __forceinline__ unsigned int __vbyte_nonzero_mask(unsigned int d) {
+    unsigned int t = (d & 0x7f7f7f7fu) + 0x7f7f7f7fu;
+    t = (t | d) & 0x80808080u;
+    return (t >> 7) * 0xffu; // 0x01 per byte times 0xff stays inside the byte
+}
+
 static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
-    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
-    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
-    unsigned int c;
-    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vc[i] = va[i] == vb[i] ? 0xff : 0x00;
-    }
-    return c;
+    return ~__vbyte_nonzero_mask(a ^ b);
 }
 
 static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
-    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
-    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
-    unsigned int c;
-    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vc[i] = va[i] == vb[i] ? 0x00 : 0xff;
-    }
-    return c;
+    return __vbyte_nonzero_mask(a ^ b);
 }
