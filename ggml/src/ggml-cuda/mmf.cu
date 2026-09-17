@@ -160,8 +160,10 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
     // so the activations are read about once and the small weight matrix stays cached, and mmf
     // converts the activations to the weight type as it loads them. The cuBLAS path instead
     // converts the whole activation tensor in a separate pass, and the result back again.
+    // only the plain path: mul_mat_f_ids, which the ids path uses past 16 columns, has no
+    // masking for a partial row tile and would write past the end of dst
     static const bool no_narrow = getenv("GGML_CUDA_NO_MMF_NARROW") != nullptr;
-    const bool narrow_src0 = !no_narrow && src0_ne[1] <= MMF_NARROW_MAX_ROWS;
+    const bool narrow_src0 = !no_narrow && !mul_mat_id && src0_ne[1] <= MMF_NARROW_MAX_ROWS;
 
     if (!narrow_src0 && src0_ne[1] % mmf_get_rows_per_block(cc) != 0) {
         return false;
