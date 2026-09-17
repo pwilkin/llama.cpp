@@ -1,6 +1,11 @@
 #include "ggml.h"
 #include "mmf.cuh"
+
+#include <cstdlib>
 #include "mmid.cuh"
+
+// src0 row counts up to this take mmf even with many columns; see ggml_cuda_should_use_mmf
+#define MMF_NARROW_MAX_ROWS 64
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -151,7 +156,14 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
             return false;
         }
     }
-    if (src0_ne[1] % mmf_get_rows_per_block(cc) != 0) {
+    // A narrow src0 is the case cuBLAS handles worst and mmf handles best: one or two row tiles,
+    // so the activations are read about once and the small weight matrix stays cached, and mmf
+    // converts the activations to the weight type as it loads them. The cuBLAS path instead
+    // converts the whole activation tensor in a separate pass, and the result back again.
+    static const bool no_narrow = getenv("GGML_CUDA_NO_MMF_NARROW") != nullptr;
+    const bool narrow_src0 = !no_narrow && src0_ne[1] <= MMF_NARROW_MAX_ROWS;
+
+    if (!narrow_src0 && src0_ne[1] % mmf_get_rows_per_block(cc) != 0) {
         return false;
     }
 
@@ -173,7 +185,7 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
             return false;
         } else if (GGML_CUDA_CC_IS_CDNA1(cc) && (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
             return false;
-        } else if (src1_ncols > 16) {
+        } else if (src1_ncols > 16 && !narrow_src0) {
             return false;
         }
     }
