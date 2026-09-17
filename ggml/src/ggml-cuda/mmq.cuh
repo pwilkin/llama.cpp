@@ -900,6 +900,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
+    // a K_vram below the type's block size makes this zero, and the loops below then
+    // advance by zero and take a modulo by zero; on AMD neither traps, the kernel just spins
+    static_assert(blocks_per_iter > 0, "K_vram must be at least the quantization block size");
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
@@ -1062,6 +1065,9 @@ static __global__ void mul_mat_q(
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
+    // a K_vram below the type's block size makes this zero, and the loops below then
+    // advance by zero and take a modulo by zero; on AMD neither traps, the kernel just spins
+    static_assert(blocks_per_iter > 0, "K_vram must be at least the quantization block size");
 
     // kbc == k block continuous, current index in continuous ijk space.
     int kbc      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
@@ -1250,6 +1256,9 @@ static __global__ void mul_mat_q_stream_k_fixup(
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
+    // a K_vram below the type's block size makes this zero, and the loops below then
+    // advance by zero and take a modulo by zero; on AMD neither traps, the kernel just spins
+    static_assert(blocks_per_iter > 0, "K_vram must be at least the quantization block size");
 
     float sum[J / nwarps] = {0.0f};
     const int i = blockIdx.y*warp_size + threadIdx.x;
