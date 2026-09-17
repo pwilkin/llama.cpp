@@ -19,15 +19,13 @@ static __device__ __forceinline__ float qsa3_h2f(const uint16_t h) { return (flo
 #define QSA3_SENT 0x7FFFFFFF
 __global__ __launch_bounds__(256) void qsa3_rows_kernel(
         const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag,
-        const char * mask, size_t m1) {
+        const char * mask, size_t m1, int ns_pow2) {
     extern __shared__ int ent[];
     __shared__ int unsorted;
-    __shared__ int compact_bad;
-    __shared__ int n_visible;
-    __shared__ int scan[256];
     const int q = blockIdx.x, tid = threadIdx.x;
     const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
-    if (tid == 0) { unsorted = 0; compact_bad = 0; }
+    if (tid == 0) { unsorted = 0; }
+    for (int j = ns + tid; j < ns_pow2; j += 256) { ent[j] = QSA3_SENT; }
     __syncthreads();
     const auto * mq = reinterpret_cast<const uint16_t *>(mask + (size_t) q * m1);
     for (int j = tid; j < ns; j += 256) {
@@ -43,49 +41,25 @@ __global__ __launch_bounds__(256) void qsa3_rows_kernel(
     }
     __syncthreads();
     if (unsorted) {
-        int * dst = srow + (size_t) q * ns;
-
-        // A row is normally already ascending and only loses entries to the mask, and dropping
-        // entries from an ascending row leaves it ascending. So compact the survivors in place
-        // (a stable scan, ties keep their original order) and check the result: when it is
-        // ascending it IS the sorted row, at O(ns) instead of the O(ns^2) rank sort below.
-        const int chunk = (ns + 255) / 256;
-        const int lo    = tid * chunk;
-        const int hi    = min(lo + chunk, ns);
-
-        int n_keep = 0;
-        for (int j = lo; j < hi; ++j) { n_keep += ent[j] != QSA3_SENT; }
-
-        scan[tid] = n_keep;
-        __syncthreads();
-        if (tid == 0) { // 256 entries, exclusive scan
-            int acc = 0;
-            for (int t = 0; t < 256; ++t) { const int c = scan[t]; scan[t] = acc; acc += c; }
-            n_visible = acc;
-        }
-        __syncthreads();
-
-        int at = scan[tid];
-        for (int j = lo; j < hi; ++j) {
-            const int e = ent[j];
-            if (e != QSA3_SENT) { dst[at++] = e; }
-        }
-        for (int j = lo + n_visible; j < hi + n_visible && j < ns; ++j) { dst[j] = QSA3_SENT; }
-        __syncthreads();
-
-        for (int j = tid; j + 1 < n_visible; j += 256) {
-            if (dst[j] > dst[j+1]) { atomicOr(&compact_bad, 1); }
-        }
-        __syncthreads();
-
-        if (compact_bad) { // genuinely out of order: fall back to the rank sort
-            for (int j = tid; j < ns; j += 256) {
-                const int e = ent[j];
-                int rank = 0;
-                for (int k = 0; k < ns; ++k) { const int f = ent[k]; rank += (f < e) || (f == e && k < j); }
-                dst[rank] = e;
+        // Every selection row that the mask touches has to be sorted, and ranking each entry
+        // against every other one is O(ns^2) - 4.2M comparisons at ns=2048. Bitonic sort costs
+        // O(ns log^2 ns) instead. Equal keys are equal values, so stability is not needed.
+        for (int k = 2; k <= ns_pow2; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                for (int i = tid; i < ns_pow2; i += 256) {
+                    const int l = i ^ j;
+                    if (l > i) {
+                        const int a = ent[i];
+                        const int b = ent[l];
+                        if ((a > b) == ((i & k) == 0)) { ent[i] = b; ent[l] = a; }
+                    }
+                }
+                __syncthreads();
             }
         }
+
+        int * dst = srow + (size_t) q * ns;
+        for (int i = tid; i < ns; i += 256) { dst[i] = ent[i]; }
     }
     if (tid == 0) { sflag[q] = unsorted; }
 }
@@ -515,8 +489,14 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_pool_alloc<int>      srow(ctx.pool(), (size_t) n_q * ns);
     ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
     {
-        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) ns * sizeof(int), ctx.stream());
-        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), (const char *)m->data, m->nb[1]);
+        int ns_pow2 = 1;
+        while (ns_pow2 < ns) { ns_pow2 <<= 1; }
+        // the bitonic sort rounds the row up to a power of two, so it can ask for twice the
+        // shared memory the old rank sort did
+        GGML_ASSERT((size_t) ns_pow2 * sizeof(int) <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo &&
+                    "QSA selection row too large for the shared memory sort");
+        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) ns_pow2 * sizeof(int), ctx.stream());
+        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), (const char *)m->data, m->nb[1], ns_pow2);
         CUDA_CHECK(cudaGetLastError());
         const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
         ggml_cuda_kernel_launch(qsa3_merge_kernel, launch2, (const int *) ids->data, ids->nb[1], n_q, ns, nk,
