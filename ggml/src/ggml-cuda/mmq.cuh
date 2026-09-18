@@ -119,6 +119,12 @@ struct tile_x_sizes {
 #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
 #define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
 
+// round x up to a multiple of n, for any n, unlike the power-of-two GGML_PAD
+static constexpr __host__ __device__ size_t mmq_round_up(size_t x, size_t n) {
+    return ((x + n - 1)/n)*n;
+}
+
+
 enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1,
@@ -889,7 +895,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    int * tile_x = tile_y + mmq_round_up(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -900,6 +906,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
+    static_assert(blocks_per_iter > 0, "K_vram must be at least the quantization block size");
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
@@ -909,6 +916,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            // unbounded: mmq_round_up sized the destination for every l written here, and the
+            // overread lands in the slack the y buffer is allocated with. Bounding it costs 21%.
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
@@ -925,6 +934,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            // unbounded: mmq_round_up sized the destination for every l written here, and the
+            // overread lands in the slack the y buffer is allocated with. Bounding it costs 21%.
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
@@ -1062,6 +1073,7 @@ static __global__ void mul_mat_q(
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
+    static_assert(blocks_per_iter > 0, "K_vram must be at least the quantization block size");
 
     // kbc == k block continuous, current index in continuous ijk space.
     int kbc      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
@@ -1250,6 +1262,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
+    static_assert(blocks_per_iter > 0, "K_vram must be at least the quantization block size");
 
     float sum[J / nwarps] = {0.0f};
     const int i = blockIdx.y*warp_size + threadIdx.x;
@@ -1389,7 +1402,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+    return nbs_ids + nbs_x + mmq_round_up(nbs_y, config.nthreads*sizeof(int));
 }
 
 template <ggml_type type, int J, bool fallback>
