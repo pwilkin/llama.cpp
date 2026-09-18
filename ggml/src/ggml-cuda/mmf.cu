@@ -1,6 +1,10 @@
 #include "ggml.h"
 #include "mmf.cuh"
+
 #include "mmid.cuh"
+
+// src0 row counts up to this take mmf even with many columns; see ggml_cuda_should_use_mmf
+#define MMF_NARROW_MAX_ROWS 64
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -151,7 +155,9 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
             return false;
         }
     }
-    if (src0_ne[1] % mmf_get_rows_per_block(cc) != 0) {
+    const bool narrow_src0 = !mul_mat_id && src0_ne[1] <= MMF_NARROW_MAX_ROWS;
+
+    if (!narrow_src0 && src0_ne[1] % mmf_get_rows_per_block(cc) != 0) {
         return false;
     }
 
@@ -173,7 +179,7 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
             return false;
         } else if (GGML_CUDA_CC_IS_CDNA1(cc) && (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
             return false;
-        } else if (src1_ncols > 16) {
+        } else if (src1_ncols > 16 && !narrow_src0) {
             return false;
         }
     }
