@@ -338,7 +338,6 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         ggml_build_forward_expand(gf, inp->gather_mask);
 
         if (inp->gather) {
-            // the gather softmax keeps the head axis in ne[1], so its mask needs one copy per head
             inp->gather_mask_h = ggml_repeat_4d(ctx0, inp->gather_mask, n_sel, n_head, 1, n_tokens);
         }
     }
@@ -573,17 +572,14 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm &&
                 "GLM5-Next MTP block is missing - load the model with MTP enabled");
 
-    // the draft head consumes the trunk's post-norm hidden state, collapsed to n_embd
     GGML_ASSERT(hparams.n_embd_out() == (uint32_t) n_embd && "GLM5-Next MTP hidden width mismatch");
 
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
 
-    // the draft block has its own attention and indexer caches, and no recurrent layer
     auto * inp_hyb   = build_inp_mem_hybrid_k();
     auto * inp_attn  = inp_hyb->get_attn();
     auto * inp_kpool = build_inp_kpool(mctx_hyb);
 
-    // no recurrent layer runs in the draft graph, but the shared input still allocates the state index tensor
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -608,7 +604,6 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     res->add_input(std::move(inp));
 
-    // eh_proj([enorm(embed) ; hnorm(h)]) - embedding first, hidden state second
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
     cb(e_norm, "mtp_enorm", il);
 
@@ -618,13 +613,11 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
     cb(cur, "mtp_eh_proj", il);
 
-    // the NextN block is a plain DSA layer: no hyper-connections, no recurrent state
     ggml_tensor * inpSA = cur;
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
-    // keep only cache writes when neither logits nor hidden rows are needed
     const bool headless = n_outputs == 0 && !(cparams.embeddings_nextn && !cparams.embeddings_nextn_masked);
 
     ggml_tensor * prev_sel = nullptr;
@@ -637,7 +630,6 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
         ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
         GGML_ASSERT(head_w && "GLM5-Next MTP: missing both nextn.shared_head_head and output");
 
-        // keep valid zero-row h_nextn/logits tensors for the generic extraction paths
         cur = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         cur = build_norm(cur, head_norm, nullptr, LLM_NORM_RMS, -1);
         res->t_h_nextn = cur;
@@ -683,7 +675,6 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = ggml_add(ctx0, cur, ffn_inp);
     cb(cur, "mtp_post_ffn", il);
 
-    // the head norm seeds both the shared LM head and the next draft step
     ggml_tensor * head_norm = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
     GGML_ASSERT(head_norm && "GLM5-Next MTP: missing both nextn.shared_head_norm and output_norm");
     cur = build_norm(cur, head_norm, nullptr, LLM_NORM_RMS, -1);
@@ -935,7 +926,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_pool         = inp_kpool->pool_cells->ne[0];
     const int64_t n_new          = inp_kpool->n_new;
 
-    // a headless call maintains the caches but never scores pools, so it has no q
     ggml_tensor * iq = nullptr;
     if (!headless) {
         iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
@@ -958,8 +948,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
 
     if (headless && !inp_kpool->cache_safe) {
-        // no pooled-key cache to maintain; the key|gate write above is the only persistent
-        // effect. new_pool_idxs stays allocated for set_input.
         ggml_build_forward_expand(gf, inp_kpool->new_pool_idxs);
         return nullptr;
     }
@@ -991,7 +979,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     }
 
     if (headless) {
-        // pooled keys written; nothing reads a selection
         return nullptr;
     }
 
@@ -1111,15 +1098,11 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     GGML_ASSERT(hparams.n_rot() == 0 && "GLM5-Next MLA is nope-only");
 
     if (headless) {
-        // no attention output is read: write the MLA latent and the indexer caches, skip the
-        // whole q path, the pool scoring and the attention body. Only valid for the NextN
-        // block, whose output feeds nothing but the (empty) LM head.
         ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
         kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
         kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
         cb(kv_cmpr, "kv_cmpr", il);
 
-        // set_input fills the mask whether or not an op reads it, so keep it allocated
         ggml_build_forward_expand(gf, inp_attn->get_kq_mask());
 
         build_kpool_select(cur, nullptr, inp_attn->get_kq_mask(), layer, mctx_hyb, inp_kpool, il, /*headless=*/true);
@@ -1176,7 +1159,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         k_g = ggml_reshape_3d(ctx0, k_g, kv_lora_rank, n_sel, n_tokens); // F32 [kv_lora_rank, n_sel, n_tokens]
         cb(k_g, "kv_gathered", il);
 
-        // head axis in ne[1] so QK and AV run as strided-batched cuBLAS GEMMs instead of per-head GEMV
         ggml_tensor * q_g = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q_absorbed), kv_lora_rank, n_head, n_tokens);
 
         ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_g);                // [n_sel, n_head, n_tokens]
@@ -1188,7 +1170,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, k_g)); // [n_sel, kv_lora_rank, n_tokens]
         v_t = ggml_reshape_4d(ctx0, v_t, n_sel, kv_lora_rank, 1, n_tokens);
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v_t, kq);                // [kv_lora_rank, n_head, 1, n_tokens]
-        // wv_b is per-head with the head axis in ne[2], so hand it the familiar layout
         kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3);                      // [kv_lora_rank, 1, n_head, n_tokens]
         kqv = ggml_mul_mat(ctx0, layer.wv_b, kqv);                      // [n_embd_head_v, 1, n_head, n_tokens]
         cb(kqv, "kqv_gathered", il);
