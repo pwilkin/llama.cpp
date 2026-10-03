@@ -274,6 +274,7 @@ public:
     ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
     ggml_tensor * gather_mask   = nullptr; // F32     [n_sel, 1, 1, n_tokens] 0 for live selection slots, -inf for dead ones
+    ggml_tensor * gather_mask_h = nullptr; // F32     [n_sel, n_head, 1, n_tokens] gather_mask repeated over heads
     // n_new is never below 1, see build_inp_kpool
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   members of the pools completed this ubatch
     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
@@ -335,6 +336,11 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         ggml_set_input(inp->gather_mask);
         // Keep the mask allocated even when no op reads it, because set_input_kpool always fills it.
         ggml_build_forward_expand(gf, inp->gather_mask);
+
+        if (inp->gather) {
+            // the gather softmax keeps the head axis in ne[1], so its mask needs one copy per head
+            inp->gather_mask_h = ggml_repeat_4d(ctx0, inp->gather_mask, n_sel, n_head, 1, n_tokens);
+        }
     }
 
     inp->n_new = n_new;
@@ -1106,18 +1112,23 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         const int64_t n_sel = sel_idx->ne[0];
 
         ggml_tensor * k_g = mctx_hyb->gather_mla_rows(ctx0, sel_idx, n_sel*n_tokens, kv_lora_rank, il);
-        k_g = ggml_reshape_4d(ctx0, k_g, kv_lora_rank, n_sel, 1, n_tokens); // F32 [kv_lora_rank, n_sel, 1, n_tokens]
+        k_g = ggml_reshape_3d(ctx0, k_g, kv_lora_rank, n_sel, n_tokens); // F32 [kv_lora_rank, n_sel, n_tokens]
         cb(k_g, "kv_gathered", il);
 
-        ggml_tensor * q_g = ggml_permute(ctx0, q_absorbed, 0, 2, 3, 1); // [kv_lora_rank, 1, n_head, n_tokens]
+        // head axis in ne[1] so QK and AV run as strided-batched cuBLAS GEMMs instead of per-head GEMV
+        ggml_tensor * q_g = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q_absorbed), kv_lora_rank, n_head, n_tokens);
 
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_g);                // [n_sel, 1, n_head, n_tokens]
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_g);                // [n_sel, n_head, n_tokens]
         ggml_prec_set_acc(kq, GGML_PREC_F32);
-        kq = ggml_soft_max_ext(ctx0, kq, inp_kpool->gather_mask, kq_scale, 0.0f);
+        kq = ggml_reshape_4d(ctx0, kq, n_sel, n_head, 1, n_tokens);
+        kq = ggml_soft_max_ext(ctx0, kq, inp_kpool->gather_mask_h, kq_scale, 0.0f);
         cb(kq, "kq_soft_max_gathered", il);
 
-        ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, k_g)); // [n_sel, kv_lora_rank, 1, n_tokens]
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_t, kq);                // [kv_lora_rank, 1, n_head, n_tokens]
+        ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, k_g)); // [n_sel, kv_lora_rank, n_tokens]
+        v_t = ggml_reshape_4d(ctx0, v_t, n_sel, kv_lora_rank, 1, n_tokens);
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_t, kq);                // [kv_lora_rank, n_head, 1, n_tokens]
+        // wv_b is per-head with the head axis in ne[2], so hand it the familiar layout
+        kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3);                      // [kv_lora_rank, 1, n_head, n_tokens]
         kqv = ggml_mul_mat(ctx0, layer.wv_b, kqv);                      // [n_embd_head_v, 1, n_head, n_tokens]
         cb(kqv, "kqv_gathered", il);
 
