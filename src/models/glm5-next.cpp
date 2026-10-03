@@ -624,8 +624,34 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
+    // a forward with no output rows (catch-up after acceptance, draft-context prefill)
+    // persists only through its cache writes: the MLA latent, the indexer key|gate rows
+    // and the pooled keys. The attention output, FFN and LM head feed nothing, so the
+    // headless graph keeps the writes and drops those bodies.
+    const bool headless = n_outputs == 0;
+
     ggml_tensor * prev_sel = nullptr;
-    cur = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, &prev_sel, il);
+    cur = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, &prev_sel, il, headless);
+
+    if (headless) {
+        ggml_tensor * head_norm = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+        GGML_ASSERT(head_norm && "GLM5-Next MTP: missing both nextn.shared_head_norm and output_norm");
+        ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+        ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+        GGML_ASSERT(head_w && "GLM5-Next MTP: missing both nextn.shared_head_head and output");
+
+        // keep valid zero-row h_nextn/logits tensors for the generic extraction paths
+        cur = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+        cur = build_norm(cur, head_norm, nullptr, LLM_NORM_RMS, -1);
+        res->t_h_nextn = cur;
+
+        cur = build_lora_mm(head_w, cur, head_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     cb(cur, "mtp_attn_out", il);
 
     ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -900,7 +926,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
 ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
-        const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il) {
+        const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il,
+        bool headless) {
 
     const auto * mctx_lid = mctx_hyb->get_idx();
 
@@ -910,9 +937,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_pool         = inp_kpool->pool_cells->ne[0];
     const int64_t n_new          = inp_kpool->n_new;
 
-    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
-    iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
-    cb(iq, "indexer_q", il);
+    // a headless call maintains the caches but never scores pools, so it has no q
+    ggml_tensor * iq = nullptr;
+    if (!headless) {
+        iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+        iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
+        cb(iq, "indexer_q", il);
+    }
 
     // Per-token key and pool gate scores, cached together
     ggml_tensor * ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
@@ -927,6 +958,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     ggml_tensor * packed = ggml_concat(ctx0, ggml_concat(ctx0, ik, ig, 0), pzero, 0);
     packed = ggml_reshape_3d(ctx0, packed, 3*n_embd_indexer, 1, n_tokens);
     ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
+
+    if (headless && !inp_kpool->cache_safe) {
+        // no pooled-key cache to maintain; the key|gate write above is the only persistent
+        // effect. new_pool_idxs stays allocated for set_input.
+        ggml_build_forward_expand(gf, inp_kpool->new_pool_idxs);
+        return nullptr;
+    }
 
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, n_embd_indexer);
     const int64_t n_kv = mctx_lid->get_n_kv();
@@ -952,6 +990,11 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     if (inp_kpool->cache_safe) {
         // Write before the pool gather.
         ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+    }
+
+    if (headless) {
+        // pooled keys written; nothing reads a selection
+        return nullptr;
     }
 
     ggml_tensor * pooled = nullptr;
@@ -1058,7 +1101,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         ggml_tensor * cur, const llama_layer & layer,
         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
-        llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il) {
+        llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il, bool headless) {
 
     const auto * mctx_mla = mctx_hyb->get_attn();
 
@@ -1068,6 +1111,26 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     const float   kq_scale = 1.0f / sqrtf((float) n_embd_head_k_mla);
 
     GGML_ASSERT(hparams.n_rot() == 0 && "GLM5-Next MLA is nope-only");
+
+    if (headless) {
+        // no attention output is read: write the MLA latent and the indexer caches, skip the
+        // whole q path, the pool scoring and the attention body. Only valid for the NextN
+        // block, whose output feeds nothing but the (empty) LM head.
+        ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+        kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+        kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
+        cb(kv_cmpr, "kv_cmpr", il);
+
+        // set_input fills the mask whether or not an op reads it, so keep it allocated
+        ggml_build_forward_expand(gf, inp_attn->get_kq_mask());
+
+        build_kpool_select(cur, nullptr, inp_attn->get_kq_mask(), layer, mctx_hyb, inp_kpool, il, /*headless=*/true);
+
+        ggml_build_forward_expand(gf, kv_cmpr);
+        ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
+
+        return nullptr;
+    }
 
     ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
