@@ -2655,6 +2655,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
+        // [TAG_SOLVE_TRI_CUDA_GRAPHS]
+        if (node->op == GGML_OP_SOLVE_TRI) {
+            if (ggml_cuda_solve_tri_needs_sync(node)) {
+                // the rocBLAS trsm path allocates temporary device memory, which is not
+                // stream-capture safe and invalidates the HIP graph capture
+                // ref: https://github.com/ROCm/rocBLAS/issues/1240
+                use_cuda_graph = false;
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+#endif
+            }
+        }
+
         if (!use_cuda_graph) {
             break;
         }

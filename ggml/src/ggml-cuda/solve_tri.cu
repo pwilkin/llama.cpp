@@ -2,8 +2,13 @@
 #include "ggml.h"
 #include "solve_tri.cuh"
 
-#define MAX_N_FAST 64
-#define MAX_K_FAST 32
+// [TAG_SOLVE_TRI_CUDA_GRAPHS]
+bool ggml_cuda_solve_tri_needs_sync(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    return src0->ne[0] > MAX_N_FAST || src1->ne[0] > MAX_K_FAST;
+}
 
 static __global__ void get_batch_pointers(const float *  A,
                                           float *        X,
@@ -265,6 +270,9 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                            src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
                            dst->nb[3] / sizeof(float), ctx.stream());
     } else {
+        // note: this path should not be reached when recording CUDA graphs, because rocBLAS
+        // allocates temporary device memory and invalidates the stream capture
+        GGML_ASSERT(ggml_cuda_solve_tri_needs_sync(dst));
         solve_tri_f32_cublas(ctx, (const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
                              ne02, ne03, src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
                              src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
