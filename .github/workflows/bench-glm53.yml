@@ -29,6 +29,8 @@ name: Benchmark GLM-5.3-Flash (on-demand)
 #   - -ngl 99, without which the model runs on CPU.
 #   - HF_HUB_CACHE points at $RUNNER_TEMP: the runner's $HOME is a ~63 GiB
 #     container overlay while $RUNNER_TEMP is on the 1.4 TiB scratch disk.
+#   - MODEL_ENDPOINT/HF_ENDPOINT default to huggingface.co: the runner's own
+#     mirror was dropping connections part-way through the ~102 GB download.
 
 on:
   workflow_dispatch:
@@ -41,6 +43,10 @@ on:
         description: 'llama-bench repetitions per test (-r)'
         required: false
         default: '3'
+      hf_endpoint:
+        description: 'HuggingFace endpoint to download the model from'
+        required: false
+        default: 'https://huggingface.co'
       skip_ops:
         description: 'Skip test-backend-ops'
         required: false
@@ -188,6 +194,10 @@ jobs:
       - name: llama-bench
         env:
           REPS: ${{ inputs.reps }}
+          # the runner's default HF mirror was dropping connections mid-download, so
+          # override it with the real endpoint unless told otherwise
+          MODEL_ENDPOINT: ${{ inputs.hf_endpoint }}
+          HF_ENDPOINT: ${{ inputs.hf_endpoint }}
           # the runner's $HOME is a ~63 GiB container overlay while $RUNNER_TEMP sits on
           # the 1.4 TiB scratch disk, so point the HF cache at the big filesystem
           HF_HUB_CACHE: ${{ runner.temp }}/hf
@@ -225,7 +235,7 @@ jobs:
           # n_ctx is n_prompt + n_gen + n_depth = 2048 + 256 + 30000.
           # HIP_LAUNCH_BLOCKING is deliberately NOT set: it serialises every
           # kernel launch and would invalidate every throughput number.
-          timeout 7200 ./build/bin/llama-bench \
+          timeout 14400 ./build/bin/llama-bench \
             -hf unsloth/GLM-5.3-Flash-GGUF:UD-IQ2_XXS \
             -p 2048 -n 256 \
             -d 0,30000 \
