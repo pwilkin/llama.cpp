@@ -31,6 +31,9 @@ name: Benchmark GLM-5.3-Flash (on-demand)
 #     container overlay while $RUNNER_TEMP is on the 1.4 TiB scratch disk.
 #   - MODEL_ENDPOINT/HF_ENDPOINT default to huggingface.co: the runner's own
 #     mirror was dropping connections part-way through the ~102 GB download.
+#   - GGML_CUDA_ENABLE_UNIFIED_MEMORY=1: the runner's GPU carveout is 64 GB and
+#     the model needs ~92 GiB, so the weights buffer uses managed memory and
+#     spills into system RAM.
 
 on:
   workflow_dispatch:
@@ -198,6 +201,9 @@ jobs:
           # override it with the real endpoint unless told otherwise
           MODEL_ENDPOINT: ${{ inputs.hf_endpoint }}
           HF_ENDPOINT: ${{ inputs.hf_endpoint }}
+          # the runner's GPU exposes only a 64 GB carveout while the model needs ~92 GiB,
+          # so let the weights buffer spill into system RAM through managed memory
+          GGML_CUDA_ENABLE_UNIFIED_MEMORY: 1
           # the runner's $HOME is a ~63 GiB container overlay while $RUNNER_TEMP sits on
           # the 1.4 TiB scratch disk, so point the HF cache at the big filesystem
           HF_HUB_CACHE: ${{ runner.temp }}/hf
