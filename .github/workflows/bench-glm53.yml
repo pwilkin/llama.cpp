@@ -31,9 +31,11 @@ name: Benchmark GLM-5.3-Flash (on-demand)
 #     container overlay while $RUNNER_TEMP is on the 1.4 TiB scratch disk.
 #   - MODEL_ENDPOINT/HF_ENDPOINT default to huggingface.co: the runner's own
 #     mirror was dropping connections part-way through the ~102 GB download.
-#   - GGML_CUDA_ENABLE_UNIFIED_MEMORY=1: the runner's GPU carveout is 64 GB and
-#     the model needs ~92 GiB, so the weights buffer uses managed memory and
-#     spills into system RAM.
+#   - n_cpu_moe selects the memory mode. 0 (full GPU offload) cannot fit the
+#     runner's 64 GB carveout, so the weights buffer uses managed memory and
+#     spills into system RAM - which reads slowly and skews the numbers. A
+#     non-zero value keeps the expert weights of the first N layers on the CPU,
+#     which fits the carveout and uses plain device memory.
 
 on:
   workflow_dispatch:
