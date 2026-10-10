@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmw.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1951,6 +1952,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_cuda_mmw_supported_mm(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_mmw(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -1976,6 +1981,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
             return false;
         }
+    }
+
+    if (ggml_cuda_mmw_supported_mmid(src0, src1, dst->src[2], dst, cc)) {
+        return false;
     }
 
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
@@ -2019,6 +2028,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
+        if (ggml_cuda_mmw_supported_mmid(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mul_mat_id_mmw(ctx, src0, src1, ids, dst);
+            return;
+        }
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -5976,6 +5989,16 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
         for (int id = 0; id < info.device_count; ++id) {
             if (blackwell_mma_available(info.devices[id].cc)) {
                 features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
+                break;
+            }
+        }
+    }
+
+    {
+        const auto & info = ggml_cuda_info();
+        for (int id = 0; id < info.device_count; ++id) {
+            if (ggml_cuda_mmw_available(info.devices[id].cc)) {
+                features.push_back({ "MMW", "1"});
                 break;
             }
         }
