@@ -202,7 +202,13 @@ jobs:
           MODEL_ENDPOINT: ${{ inputs.hf_endpoint }}
           HF_ENDPOINT: ${{ inputs.hf_endpoint }}
           # the runner's GPU exposes only a 64 GB carveout while the model needs ~92 GiB,
-          # so let the weights buffer spill into system RAM through managed memory
+          # so let the weights buffer spill into system RAM through managed memory.
+          # CAVEAT: with this set, the shallow-depth llama-bench rows on these runners have
+          # measured physically impossible throughput (a 2048-token prefill in 25 ms), i.e.
+          # the timed work did not read the weights. Only the depth-30000 rows were
+          # self-consistent, and they measured the ~4.4 GB/s spill bandwidth rather than the
+          # kernels. Treat every number from this lane as indicative until it is re-run on a
+          # runner whose carveout holds the model.
           GGML_CUDA_ENABLE_UNIFIED_MEMORY: 1
           # the runner's $HOME is a ~63 GiB container overlay while $RUNNER_TEMP sits on
           # the 1.4 TiB scratch disk, so point the HF cache at the big filesystem
