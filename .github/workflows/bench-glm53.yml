@@ -100,6 +100,15 @@ jobs:
             nproc
             free -g
             df -h "$RUNNER_TEMP" . "$HOME"
+            # how much memory the GPU can actually address, and why: the GTT window is
+            # sized from amdttm.pages_limit at driver init and defaults to RAM/2, which is
+            # what caps a large model on a runner that does not set it
+            cat /proc/cmdline
+            echo "amdttm.pages_limit = $(cat /sys/module/amdttm/parameters/pages_limit 2>/dev/null || echo unset)"
+            echo "gtt_total = $(cat /sys/class/drm/card0/device/mem_info_gtt_total 2>/dev/null)"
+            echo "vram_total = $(cat /sys/class/drm/card0/device/mem_info_vram_total 2>/dev/null)"
+            id
+            if sudo -n true 2>/dev/null; then echo "passwordless sudo: yes"; else echo "passwordless sudo: no"; fi
             rocminfo | grep -E '^  Name|Marketing Name' | head -6
             rocm-smi --showproductname | head -8
             cmake --version | head -1
