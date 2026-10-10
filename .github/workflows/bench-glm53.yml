@@ -27,6 +27,8 @@ name: Benchmark GLM-5.3-Flash (on-demand)
 #     the default -b 2048 the requested -ub 4096 row would silently run at
 #     2048 and the two rows would be identical.
 #   - -ngl 99, without which the model runs on CPU.
+#   - HF_HUB_CACHE points at $RUNNER_TEMP: the runner's $HOME is a ~63 GiB
+#     container overlay while $RUNNER_TEMP is on the 1.4 TiB scratch disk.
 
 on:
   workflow_dispatch:
@@ -186,6 +188,9 @@ jobs:
       - name: llama-bench
         env:
           REPS: ${{ inputs.reps }}
+          # the runner's $HOME is a ~63 GiB container overlay while $RUNNER_TEMP sits on
+          # the 1.4 TiB scratch disk, so point the HF cache at the big filesystem
+          HF_HUB_CACHE: ${{ runner.temp }}/hf
         run: |
           set +e
           set -uo pipefail
@@ -204,14 +209,13 @@ jobs:
           fi
           reps=$(( 10#$reps ))
 
-          # UD-IQ2_XXS is four shards, ~102 GB, and the download lands in the
-          # HF cache under $HOME. Fail fast rather than after an hour of
-          # downloading if the runner cannot hold it.
+          # UD-IQ2_XXS is four shards, ~102 GB. Fail fast rather than after an
+          # hour of downloading if the filesystem holding the cache cannot take it.
           need=$(( 105 * 1024 * 1024 * 1024 ))
-          home_bytes=$(df -B1 --output=avail "$HOME" | tail -1)
-          echo "disk free on HOME: $(( home_bytes / 1073741824 )) GiB"
-          if [ "$home_bytes" -lt "$need" ]; then
-            echo "::error::need $(( need / 1073741824 )) GiB free for the model, have $(( home_bytes / 1073741824 )) GiB" >&2
+          cache_bytes=$(df -B1 --output=avail "$RUNNER_TEMP" | tail -1)
+          echo "disk free for the model cache: $(( cache_bytes / 1073741824 )) GiB"
+          if [ "$cache_bytes" -lt "$need" ]; then
+            echo "::error::need $(( need / 1073741824 )) GiB free for the model, have $(( cache_bytes / 1073741824 )) GiB" >&2
             exit 1
           fi
 
