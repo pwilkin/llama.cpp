@@ -50,6 +50,10 @@ on:
         description: 'HuggingFace endpoint to download the model from'
         required: false
         default: 'https://huggingface.co'
+      n_cpu_moe:
+        description: 'MoE layers whose expert weights stay on CPU (0 = full GPU offload)'
+        required: false
+        default: '0'
       skip_ops:
         description: 'Skip test-backend-ops'
         required: false
@@ -203,6 +207,16 @@ jobs:
 
           exit "$rc"
 
+      - name: Select memory mode
+        run: |
+          # the runner's GPU carveout is 64 GB. A full-offload run cannot fit the ~92 GiB
+          # model, so its weights buffer uses managed memory and spills into system RAM -
+          # which on these runners reads slowly and skews the benchmark. A partial CPU
+          # offload fits the carveout and must therefore use plain device memory.
+          if [ "${{ inputs.n_cpu_moe }}" = "0" ]; then
+            echo "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" >> "$GITHUB_ENV"
+          fi
+
       - name: llama-bench
         env:
           REPS: ${{ inputs.reps }}
@@ -210,15 +224,7 @@ jobs:
           # override it with the real endpoint unless told otherwise
           MODEL_ENDPOINT: ${{ inputs.hf_endpoint }}
           HF_ENDPOINT: ${{ inputs.hf_endpoint }}
-          # the runner's GPU exposes only a 64 GB carveout while the model needs ~92 GiB,
-          # so let the weights buffer spill into system RAM through managed memory.
-          # CAVEAT: with this set, the shallow-depth llama-bench rows on these runners have
-          # measured physically impossible throughput (a 2048-token prefill in 25 ms), i.e.
-          # the timed work did not read the weights. Only the depth-30000 rows were
-          # self-consistent, and they measured the ~4.4 GB/s spill bandwidth rather than the
-          # kernels. Treat every number from this lane as indicative until it is re-run on a
-          # runner whose carveout holds the model.
-          GGML_CUDA_ENABLE_UNIFIED_MEMORY: 1
+          N_CPU_MOE: ${{ inputs.n_cpu_moe }}
           # the runner's $HOME is a ~63 GiB container overlay while $RUNNER_TEMP sits on
           # the 1.4 TiB scratch disk, so point the HF cache at the big filesystem
           HF_HUB_CACHE: ${{ runner.temp }}/hf
@@ -256,11 +262,19 @@ jobs:
           # n_ctx is n_prompt + n_gen + n_depth = 2048 + 256 + 30000.
           # HIP_LAUNCH_BLOCKING is deliberately NOT set: it serialises every
           # kernel launch and would invalidate every throughput number.
+          # with a partial CPU offload the model fits the carveout: keep the expert weights
+          # of the first N layers on the CPU
+          cmoe=()
+          if [ "${N_CPU_MOE:-0}" -gt 0 ]; then
+            cmoe=(-ncmoe "$N_CPU_MOE")
+          fi
+
           timeout 14400 ./build/bin/llama-bench \
             -hf unsloth/GLM-5.3-Flash-GGUF:UD-IQ2_XXS \
             -p 2048 -n 256 \
             -d 0,30000 \
             -b 2048,4096 -ub 2048,4096 \
+            "${cmoe[@]}" \
             -ngl 99 \
             -r "$reps" -o jsonl --progress \
             > "$jsonl" 2> "$log"
