@@ -437,7 +437,7 @@ gated_delta_net_kda_chunked_cuda(const float * __restrict__ q,
     }
 
     const int dim  = tid % D;
-    const int half = __builtin_amdgcn_readfirstlane(tid / D); // whole warps, so the loads below get scalar offsets
+    const int half = __builtin_amdgcn_readfirstlane(tid / D);
     float pf[3 * C];
     float pv[VPT];
     float pb;

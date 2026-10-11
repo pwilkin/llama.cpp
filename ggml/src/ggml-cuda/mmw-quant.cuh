@@ -321,7 +321,7 @@ struct mmw_q8_0 {
     }
     // for a positive finite d, d * q is fma(q + 128, d, -128 * d): -128 * d is exact, so the rounding is the same and q = 0 gives +0. q + 128 is the byte with its top bit flipped, read by v_cvt_f32_ubyteN; other d keep the per-weight multiply.
     static __device__ __forceinline__ void decode(const slot & f, uint32_t (&p)[16]) {
-        const uint32_t d16 = __builtin_amdgcn_perm(0u, f.d, 0x0c0c0100u);   // opaque: a & 0xffff can be hoisted next to the load
+        const uint32_t d16 = __builtin_amdgcn_perm(0u, f.d, 0x0c0c0100u);
         const float d = mmw_h2f((uint16_t) d16);
         const uint32_t q[8] = {f.q0.x, f.q0.y, f.q0.z, f.q0.w, f.q1.x, f.q1.y, f.q1.z, f.q1.w};
         if (d16 - 1u < 0x7bffu) {
