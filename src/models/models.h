@@ -7,6 +7,8 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex>
+#include <vector>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2550,6 +2552,7 @@ struct llama_model_clef : public llama_model_qwen35 {
 };
 
 struct llama_ple_disk;
+struct llama_ple_async;
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
@@ -2561,8 +2564,29 @@ struct llama_model_qwen4exp : public llama_model_base {
     // counted as created but never allocated, mapped or read, and build_ple takes its
     // rows from this reader instead of ggml_get_rows.
     std::shared_ptr<llama_ple_disk> ple_disk;
+    // A1 (2026-10-10): the PLE rows of the batch gathered ahead of each ubatch on a worker thread
+    // (llama-ple-async.h); one ring per model, driven from llama_context::decode. LLAMA_PLE_ASYNC=0 disables.
+    mutable std::shared_ptr<llama_ple_async> ple_async;
+    mutable std::mutex ple_async_mutex;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // bf16 twins of the f32 weights that decode reads as mat-vecs (router ffn_gate_inp, ssm_alpha / ssm_beta, the hc inject
+    // projections; B6, 2026-10-10): half the bytes per token where the values are bf16-exact (lower 16 bits zero), built
+    // lazily on the first graph with loaded weights. LLAMA_BF16_TWINS=0 disables. nullptr = no twin for this weight.
+    ggml_tensor * bf16_twin(const ggml_tensor * w) const;
+    mutable std::mutex bf16_twins_mutex;
+    mutable bool bf16_twins_tried = false;
+    mutable std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
+    mutable std::vector<ggml_context *> bf16_twin_ctxs;
+    mutable std::vector<ggml_backend_buffer_t> bf16_twin_bufs;
+
+    // C3 (wave 8): wq holds [q | gate] per head. LLAMA_WQ_DEINTERLEAVE (default on) permutes its rows once, in place on the
+    // weight's own (device) buffer, to [all q rows | all gate rows] on the first graph with loaded weights, so Qcur and the gate
+    // are plain views of Qcur_full and the gate needs no CONT. True when every attention wq has been permuted.
+    bool wq_deinterleaved() const;
+    mutable std::mutex wq_deint_mutex;
+    mutable int wq_deint_state = -1;   // -1 not decided yet, 0 off / not possible, 1 permuted
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
@@ -2586,13 +2610,18 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+        // q_first > 0 (LLAMA_FN_LAST_ATTN_TRIM, the last layer only): queries, indexer queries, selection and attention for
+        // rows [q_first, n_tokens) only; K/V and the indexer keys of every row are still stored. When the trim is taken,
+        // *tile_out_ids gets the output rows relative to q_first (the returned tensor has n_tokens - q_first rows).
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor ** tile_out_ids = nullptr);
 
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
@@ -2616,13 +2645,17 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // q_first > 0: the selection for query rows [q_first, n_tokens) only (q_first a multiple of the score strip),
+        // with q_pos their positions; the indexer keys of every row are stored as before
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor * q_pos = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
@@ -2642,14 +2675,25 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
-        // one conv history per cache tensor: delta-net and PLE each have their own
+        // the padded f16 destinations of LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD: ONE buffer per graph, written and read by one
+        // layer at a time. Never one per layer: a ggml_new_tensor in a graph is a leaf, and ggml-alloc allocates every leaf
+        // before the first node, so per-layer buffers would all be resident for the whole graph (on the fork line,
+        // 48 x 40.5 MiB + 36 x 25 MiB at ub 2048, 2.8 GB of a 5.3 GB Flash-Next compute buffer, 10-11)
+        ggml_tensor * hc_xn_pad_buf    = nullptr;
+        ggml_tensor * gdn_norm_pad_buf = nullptr;
+        ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
+
+        // one conv history per cache tensor: delta-net and PLE each have their own. Returns [state_cols + T, channels, n_seqs]
+        // (tokens on ne[0]); channels_first (x is [channels, T, n_seqs]) returns [channels, state_cols + T, n_seqs] instead,
+        // with the same cache layout
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                            int   il);
+                            int   il,
+                           bool   channels_first = false);
 
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);

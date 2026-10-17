@@ -260,10 +260,15 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    bool d16 = false;   // stores float16_t (the MUL_MAT+CPY(f16) fusion)
+    bool glu = false;   // d16 MUL_MAT_ID gate projection storing silu(gate) * up (the MUL_MAT_ID+CPY(f16)+SWIGLU fusion)
+    bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl, GGML_VK_MM_PREFETCH)
+    bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok); on MUL_MAT_ID keys the REG_A tile; on the F32 x F32 dense key the QSA scorer epilogue variant
+    bool hcmix = false; // the int8 MMQ hc up GEMM with the gated hc pre in its epilogue (HC_UP_MIX, mul_mmq_cm1.comp HC_EPI)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix);
     }
 };
 
@@ -517,6 +522,10 @@ static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGM
                                                                              GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
                                                                              GGML_OP_SOFT_MAX, GGML_OP_RESHAPE };
 
+// qwen4exp PLE layer (LLAMA_PLE_CONV_FUSED): 4 conv taps (MUL, then MUL + ADD), SiLU, + gated value, + residual
+static constexpr std::initializer_list<ggml_op> ple_conv_pattern { GGML_OP_MUL, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_ADD,
+                                                                   GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_ADD, GGML_OP_ADD };
+
 static constexpr std::initializer_list<ggml_op> snake_pattern              { GGML_OP_MUL,      GGML_OP_SIN,
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
@@ -525,6 +534,23 @@ static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_R
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                    GGML_OP_TOP_K };
+
+// qwen4exp QSA indexer scorer as build_qsa_top_k emits it (QSA_SCORE, see ggml_vk_match_qsa_score): the GEMM, the relu, the
+// four head slices summed and the block bias. graph_optimize keeps it in this order; without that the mask build's FILL
+// and views are hoisted into the head sum and the chain never fuses.
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                    GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_ADD };
+// the same chain without the bias ADD: the maskless path applies the visibility through the compact-limits ops
+// (cast, repeat, sub, step, log, add), which follow the head sum, so the 12-op pattern above never matches there
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern_nobias { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                           GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD };
 
 static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 1, 0, 0 }, // permute->src[0] == get_rows
@@ -633,6 +659,7 @@ enum rms_norm_mode {
     RMS_NORM_VIEW_SET_ROWS,
     RMS_NORM_MUL_MUL,   // short rows only: normalised * gamma * gate
     RMS_NORM_SCALE,     // short rows only: scale(rms_norm(x))
+    RMS_NORM_MUL_SIGMUL_CPY, // short rows only: f16(normalised * gamma * sigmoid(z)), the qwen4exp GDN output norm
     RMS_NORM_COUNT,
 };
 
@@ -815,6 +842,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q8_1_x4_f16;   // f16 input (int8 MMQ with an f16 B)
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -830,6 +858,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_get_rows_flat[GGML_TYPE_COUNT];       // GGML_VK_GET_ROWS_FLAT: narrow rows, one thread per element
+    vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];   //   (f32 / f16 / bf16 / i32 sources)
     vk_pipeline pipeline_get_rows_back_f32;
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_set_f32;
@@ -848,6 +878,7 @@ struct vk_device_struct {
 
     // indexed by num_additional_fused_ops == num_adds - 1
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
+    vk_pipeline pipeline_multi_add_f16in[MAX_FUSED_ADDS];   // f16 sources, f32 sum and store (MoE combine of f16 expert outputs)
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
 
     vk_pipeline pipeline_add_id_f32;
@@ -887,6 +918,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_small_f32;          // one subgroup per row, ne00 <= 256
     vk_pipeline pipeline_rms_norm_mul_small_f32;
     vk_pipeline pipeline_rms_norm_mul_mul_small_f32;  // + second multiplier (gated norm)
+    vk_pipeline pipeline_rms_norm_mul_sigmul_small_f32_f16;  // gated norm with sigmoid(z), f16 store (LLAMA_GDN_NORM_F16)
     vk_pipeline pipeline_rms_norm_scale_small_f32;    // + SCALE (the GDN q/k l2 norm)
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
@@ -963,6 +995,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
+    vk_pipeline pipeline_topk_radix_qsa_reg[4]; // register-resident rows of up to {8,16,32,64} * BLOCK_SIZE cells (GGML_VK_TOPK_QSA_REG)
+    vk_pipeline pipeline_qsa_block_select_reg[4]; // A2: fused maskless block selection, rows of up to {8,16,32,64} * BLOCK_SIZE blocks (GGML_VK_QSA_BLOCK_SELECT)
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
@@ -978,6 +1012,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline_dsv4_hc_pre_gated_x16_f32;   // f16 x, f32 gate
+    vk_pipeline pipeline_dsv4_hc_pre_gated_x16_g16_f32;   // f16 x, f16 gate (LLAMA_HC_GATE_F16: the hc up GEMM's f16 store)
+    vk_pipeline pipeline_dsv4_hc_pre_gated_x16_f16;       // f16 x, f32 gate, f16 mixed stream (wave 6)
+    vk_pipeline pipeline_dsv4_hc_pre_gated_x16_g16_f16;   // f16 x, f16 gate, f16 mixed stream
+    // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
+    vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -988,6 +1028,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
     vk_pipeline pipeline_snake_f32;
+    vk_pipeline pipeline_ple_conv_silu_add_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
     vk_pipeline pipeline_pool1d_f32;
@@ -1000,6 +1041,8 @@ struct vk_device_struct {
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_gdn_chunk_prep, pipeline_gdn_chunk_scan;   // chunked prefill form (GGML_VK_GDN_CHUNK)
+    vk_pipeline pipeline_coopmat_layout_check[2];  // wave32, wave64: RDNA3/RADV fragment layout probe (ggml_vk_check_coopmat_rdna3_layout)
+    bool coopmat_rdna3_layout {};                   // the probe passed: the manual-fragment "_mf" MUL_MAT_ID pipelines may be used
     uint32_t gdn_chunk_scan_nsplit = 1;   // scan workgroups per value head
     // One pipeline per supported indexer head count; see LI_NH_VALUES.
     vk_pipeline pipeline_lightning_indexer_f16[LI_NH_COUNT];
@@ -1151,6 +1194,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_SCALE_PC 0x20   // MUL_MAT + SCALE (non-ID mat-vec): the scale and bias ride in the push constants
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1236,6 +1280,10 @@ class vk_perf_logger {
   public:
     void print_timings(bool force = false);
 
+    // dense MUL_MAT pipeline calls per print interval (which int8 / f16 / XL variant each call took; printed with the timings)
+    std::map<std::string, uint64_t> path_counts;
+    void count_path(const std::string & key) { path_counts[key] += 1; }
+
 
     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops);
 
@@ -1281,6 +1329,7 @@ class vk_perf_logger {
 };
 
 struct ggml_backend_vk_context {
+    bool get_rows_flat {};   // the GET_ROWS being recorded uses the flat pipeline (ggml_vk_get_rows -> ggml_vk_op_f32 elements)
     std::string name;
 
     vk_device device;
@@ -1316,6 +1365,7 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+    uint32_t prealloc_y_last_row_pad {};   // GGML_VK_DENSE_YPAD: row pad (elements) of the staged f16 B in prealloc_y, 0 = contiguous
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
@@ -1355,7 +1405,18 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    bool fused_qsa_score {};        // QSA scorer: MUL_MAT + RELU + head sum (+ block bias) in the GEMM epilogue (GGML_VK_QSA_SCORE)
+    bool fused_qsa_block_select {};   // A2: TOP_K .. CONCAT of qwen4exp_select_complete_blocks in one dispatch (GGML_VK_QSA_BLOCK_SELECT)
+    const ggml_tensor * qsa_score_bias {};
     bool fused_hc_post_gate {};
+    bool fused_ple_conv {};   // PLE_CONV_SILU_ADD (GGML_VK_PLE_CONV)
+    // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none
+    int fused_hc_post_norm {};
+    // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
+    bool fused_mm_cpy16 {};
+    bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
+    bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
+    bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {

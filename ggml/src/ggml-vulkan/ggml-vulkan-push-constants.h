@@ -15,6 +15,21 @@ struct vk_mat_mat_push_constants {
     uint32_t padded_N;
 };
 
+// matmul_f32_f32_qsa (QSA_EPI in mul_mm.comp): the plain push constants plus the block-bias addressing
+struct vk_mat_mat_qsa_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
+};
+
+// matmul_q8_0_q8_1_hcmix (HC_EPI in mul_mmq_cm1.comp): the plain push constants plus the x / mixed addressing and the mix scale
+struct vk_mat_mat_hcmix_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t hc_n_embd; uint32_t hc_x_offset; uint32_t hc_x_s1; uint32_t hc_x_s2; uint32_t hc_d_offset; uint32_t hc_d_s1;
+    float hc_scale;
+    uint32_t hc_zero;   // 0: keeps the epilogue's f16 gate rounding opaque to the shader compiler
+    uint32_t hc_round;  // 1: f16 gate (the unfused chain casts it), 0: f32 gate
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;
@@ -29,6 +44,8 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
+    float fuse_scale;   // MAT_VEC_FUSION_FLAGS_SCALE_PC
+    float fuse_bias;
 };
 
 struct vk_mat_vec_p021_push_constants {
@@ -211,6 +228,24 @@ struct vk_op_dsv4_hc_post_push_constants {
     float    gate_scale_in;
     float    gate_scale_out;
 };
+
+// dsv4_hc_post_norm.comp: strides in elements; every operand has unit element stride and no misalignment
+struct vk_op_dsv4_hc_post_norm_push_constants {
+    uint32_t n_embd;
+    uint32_t hc;
+    uint32_t n_tokens;
+    uint32_t sx1;
+    uint32_t sr1; uint32_t sr2;
+    uint32_t sp0; uint32_t sp1;
+    uint32_t sg1;
+    uint32_t so1; uint32_t so2;
+    uint32_t sn1; uint32_t sn2;
+    float    eps;
+    uint32_t gate;
+    float    gate_in;
+    float    gate_out;
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
 
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
@@ -536,6 +571,25 @@ struct vk_op_topk_push_constants {
     uint32_t last_pass;
 };
 
+// QSA_BLOCK_SELECT (A2): one dispatch per strip for qwen4exp's maskless block selection
+struct vk_op_qsa_block_select_push_constants {
+    uint32_t n_blocks;
+    uint32_t budget;
+    uint32_t n_query;
+    uint32_t n_stream;
+    uint32_t r;
+    uint32_t width;       // r*budget + r-1
+    uint32_t c_stride_s;  // block cells: elements per stream
+    uint32_t t_stride_q;  // tail: elements per query
+    uint32_t t_stride_s;  // tail: elements per stream
+    // compact visibility read in the kernel (halo-box #117 limits): block b is visible to query q iff
+    // limits[row(q)*l_blocks + b] < limits[l_tails_off + q], row(q) = limits[l_rowidx_off + q] (0 when l_rowidx_off is ~0u)
+    uint32_t l_mode;        // 0: the scores carry the visibility; 1: apply it from the limits buffer
+    uint32_t l_blocks;      // start-row stride (0 with one sequence row)
+    uint32_t l_tails_off;   // element offset of the per-query tail starts
+    uint32_t l_rowidx_off;  // element offset of the per-query sequence rows, ~0u: one row
+};
+
 struct vk_op_topk_radix_push_constants {
     uint32_t ncols;
     uint32_t k;
@@ -621,6 +675,16 @@ struct vk_op_conv_transpose_1d_push_constants {
     uint32_t nb1;
 
     int32_t s0;
+};
+
+struct vk_op_ple_conv_push_constants {
+    uint32_t ne0, ne1, ne2;
+    uint32_t p_off, p_nb1, p_nb2;
+    uint32_t tap1, tap2, tap3;
+    uint32_t w_off, w_nb1;
+    uint32_t g_off, g_nb1, g_nb2;
+    uint32_t h_off, h_nb1, h_nb2;
+    uint32_t d_off, d_nb1, d_nb2;
 };
 
 struct vk_op_snake_push_constants {
@@ -866,6 +930,8 @@ template <> inline void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p)
 struct vk_quantize_q8_1_push_constants {
     uint32_t ne;
     uint32_t num_blocks;
+    uint32_t row4;      // a row-strided source: row length and row stride in vec4s (0: packed)
+    uint32_t stride4;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {
