@@ -243,9 +243,37 @@ jobs:
           echo "VULKAN_SDK=$VULKAN_SDK" >> "$GITHUB_ENV"
           echo "$sdk_root/bin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          # FindVulkan wants an unversioned libvulkan.so; the runner ships only the versioned runtime loader.
+          vk_lib=""
+          for lib in "$sdk_root/lib/libvulkan.so" "$sdk_root"/x86_64/lib/libvulkan.so /usr/lib/x86_64-linux-gnu/libvulkan.so /lib/x86_64-linux-gnu/libvulkan.so; do
+            if [ -f "$lib" ]; then
+              vk_lib="$lib"
+              break
+            fi
+          done
+          if [ -z "$vk_lib" ]; then
+            for lib in "$sdk_root"/lib/libvulkan.so.1 "$sdk_root"/x86_64/lib/libvulkan.so.1 /usr/lib/x86_64-linux-gnu/libvulkan.so.1 /lib/x86_64-linux-gnu/libvulkan.so.1; do
+              if [ -f "$lib" ]; then
+                mkdir -p "$RUNNER_TEMP/vkdev"
+                ln -sf "$lib" "$RUNNER_TEMP/vkdev/libvulkan.so"
+                vk_lib="$RUNNER_TEMP/vkdev/libvulkan.so"
+                break
+              fi
+            done
+          fi
+          if [ -z "$vk_lib" ]; then
+            echo "::error::no Vulkan loader found in the SDK or system library paths" >&2
+            exit 1
+          fi
+          echo "VULKAN_LIBRARY=$vk_lib" >> "$GITHUB_ENV"
+          echo "VULKAN_LIBRARY=$vk_lib" | tee -a "$log"
           {
             echo "== SDK root =="
             ls "$sdk_root"
+            echo "== SDK lib =="
+            ls "$sdk_root/lib"
+            echo "== SDK Vulkan libraries =="
+            find "$sdk_root" -name 'libvulkan*' 2> /dev/null | head -10 || true
             echo "== glslc =="
             glslc --version | head -2
             echo "== SPIRV-Headers cmake config =="
@@ -283,6 +311,9 @@ jobs:
               ;;
             vulkan)
               cmake_extra=(-DGGML_VULKAN=ON -DGGML_HIP=OFF -DGGML_CUDA=OFF)
+              if [ -n "${VULKAN_LIBRARY:-}" ]; then
+                cmake_extra+=("-DVulkan_LIBRARY=$VULKAN_LIBRARY")
+              fi
               ;;
             *)
               echo "::error::unknown backend '$backend'" >&2
