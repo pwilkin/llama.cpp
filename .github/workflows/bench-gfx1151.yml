@@ -166,6 +166,52 @@ jobs:
             echo "- repetitions: \`$INPUT_REPS\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Report Vulkan environment
+        if: ${{ inputs.backend == 'vulkan' }}
+        run: |
+          # The DevLab pool has only been observed running the HIP backend; print Vulkan configure requirements before the build can fail.
+          set +e
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          {
+            echo "glslc (PATH and version):"
+            if command -v glslc; then
+              glslc --version || echo "glslc version unavailable"
+            else
+              echo "glslc not found on PATH"
+            fi
+
+            echo "SPIRV-Headers CMake config:"
+            for dir in /usr/lib/cmake/SPIRV-Headers /usr/share/cmake/SPIRV-Headers /usr/lib/x86_64-linux-gnu/cmake/SPIRV-Headers; do
+              found=0
+              for config in "$dir"/*Config.cmake "$dir"/*-config.cmake; do
+                if [ -f "$config" ]; then
+                  echo "$config"
+                  found=1
+                fi
+              done
+              [ "$found" -eq 1 ] || echo "not found in $dir"
+            done
+
+            echo "libvulkan (ldconfig cache):"
+            if command -v ldconfig > /dev/null 2>&1; then
+              ldconfig -p | grep -E 'libvulkan\.so' || echo "libvulkan not found in ldconfig cache"
+            else
+              echo "ldconfig not found on PATH"
+            fi
+
+            echo "Vulkan ICDs (/usr/share/vulkan/icd.d):"
+            ls -la /usr/share/vulkan/icd.d || echo "ICD directory not found or unreadable"
+
+            echo "vulkaninfo --summary (first 40 lines):"
+            if command -v vulkaninfo; then
+              vulkaninfo --summary 2>&1 | head -40 || echo "vulkaninfo summary unavailable"
+            else
+              echo "vulkaninfo not found on PATH"
+            fi
+          } 2>&1 | tee "$RUNNER_TEMP/logs/vulkan-env.log"
+          exit 0
+
       - name: Build
         id: build
         env:
