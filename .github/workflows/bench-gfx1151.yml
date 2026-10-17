@@ -38,6 +38,9 @@
 #                   smaller fallbacks in the same repo: IQ2_XS 68026093024, Q2_0 66423878624
 #   qwen38-27b      unsloth/Qwen3.8-27B-GGUF                    UD-Q4_K_XL 1 file    17559178144
 #   ornith-35b-a3b  ornith-ai/Ornith-1.5-35B-A3B-GGUF           Q4_K_M     1 file    21713463040
+#   qwen36-35b-a3b-q8_0  bartowski/Qwen_Qwen3.6-35B-A3B-GGUF       Q8_0      1 file    37812647552
+#   qwen38-27b-q8_0      unsloth/Qwen3.8-27B-GGUF                  Q8_0      1 file    29047086048
+#   qwen35-2b-q8_0       bartowski/Qwen_Qwen3.5-2B-GGUF            Q8_0      1 file    2080140384
 #
 # The defaults are about 115 GB of download. Each model is deleted before the next
 # one is fetched, but the largest single model plus its KV cache must fit in RAM:
@@ -78,7 +81,7 @@ on:
         type: choice
         options: [hip, vulkan]
       models:
-        description: 'Comma-separated subset of flash-next,qwen38-27b,ornith-35b-a3b'
+        description: 'Comma-separated subset of flash-next,qwen38-27b,ornith-35b-a3b,qwen36-35b-a3b-q8_0,qwen38-27b-q8_0,qwen35-2b-q8_0'
         required: false
         default: 'flash-next,qwen38-27b,ornith-35b-a3b'
       reps:
@@ -353,6 +356,15 @@ jobs:
               ornith-35b-a3b)
                 echo 'ornith-ai/Ornith-1.5-35B-A3B-GGUF|Ornith-1.5-35B-Q4_K_M.gguf|21713463040'
                 ;;
+              qwen36-35b-a3b-q8_0)
+                echo 'bartowski/Qwen_Qwen3.6-35B-A3B-GGUF|Qwen_Qwen3.6-35B-A3B-Q8_0.gguf|37812647552'
+                ;;
+              qwen38-27b-q8_0)
+                echo 'unsloth/Qwen3.8-27B-GGUF|Qwen3.8-27B-Q8_0.gguf|29047086048'
+                ;;
+              qwen35-2b-q8_0)
+                echo 'bartowski/Qwen_Qwen3.5-2B-GGUF|Qwen_Qwen3.5-2B-Q8_0.gguf|2080140384'
+                ;;
               *) return 1 ;;
             esac
           }
@@ -363,7 +375,7 @@ jobs:
             name=$(printf '%s' "$name" | tr -d '[:space:]')
             [ -n "$name" ] || continue
             if ! model_spec "$name" > /dev/null; then
-              echo "::error::unknown model '$name'; choose from flash-next,qwen38-27b,ornith-35b-a3b" >&2
+              echo "::error::unknown model '$name'; choose from flash-next,qwen38-27b,ornith-35b-a3b,qwen36-35b-a3b-q8_0,qwen38-27b-q8_0,qwen35-2b-q8_0" >&2
               exit 1
             fi
           done
