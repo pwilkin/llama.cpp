@@ -212,6 +212,53 @@ jobs:
           } 2>&1 | tee "$RUNNER_TEMP/logs/vulkan-env.log"
           exit 0
 
+      # The pool has Mesa and the loader but no shader compiler or dev headers, so the lane installs them itself.
+      - name: Provide the Vulkan toolchain
+        if: ${{ inputs.backend == 'vulkan' }}
+        run: |
+          # the pool has Mesa and the loader but no glslc, headers or SPIRV-Headers config,
+          # so find_package(Vulkan) fails; try the distro packages, else the Lunarg SDK
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          log="$RUNNER_TEMP/logs/vulkan-env.log"
+          if command -v glslc > /dev/null 2>&1; then
+            echo "glslc already present: $(command -v glslc)" | tee -a "$log"
+            exit 0
+          fi
+          if sudo -n true 2> /dev/null; then
+            echo "installing glslc, libvulkan-dev, spirv-headers and vulkan-tools" | tee -a "$log"
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq glslc libvulkan-dev spirv-headers vulkan-tools
+          fi
+          if ! command -v glslc > /dev/null 2>&1; then
+            ver=$(curl -fsSL https://vulkan.lunarg.com/sdk/latest/linux.txt | tr -d '[:space:]')
+            echo "fetching the Vulkan SDK $ver" | tee -a "$log"
+            curl -fsSL -o "$RUNNER_TEMP/vulkan_sdk.tar.xz" "https://sdk.lunarg.com/sdk/download/$ver/linux/vulkan_sdk.tar.xz"
+            mkdir -p "$RUNNER_TEMP/vulkan_sdk"
+            tar -xJf "$RUNNER_TEMP/vulkan_sdk.tar.xz" -C "$RUNNER_TEMP/vulkan_sdk"
+            glslc_path=$(find "$RUNNER_TEMP/vulkan_sdk" -type f -name glslc -print -quit)
+            if [ -z "$glslc_path" ]; then
+              echo "::error::no glslc in the SDK tarball" >&2
+              exit 1
+            fi
+            sdk_root=$(dirname "$(dirname "$glslc_path")")
+            echo "VULKAN_SDK=$sdk_root" >> "$GITHUB_ENV"
+            echo "$sdk_root/bin" >> "$GITHUB_PATH"
+          fi
+          {
+            echo "== glslc =="
+            glslc --version | head -2
+            echo "== SPIRV-Headers cmake config =="
+            find /usr "$RUNNER_TEMP/vulkan_sdk" -name 'SPIRV-Headers*onfig.cmake' 2> /dev/null | head -5
+            echo "== vulkaninfo =="
+            if command -v vulkaninfo > /dev/null 2>&1; then
+              vulkaninfo --summary 2>&1 | head -30
+            else
+              echo "vulkaninfo not found"
+            fi
+          } 2>&1 | tee -a "$log"
+          exit 0
+
       - name: Build
         id: build
         env:
