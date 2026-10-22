@@ -1221,7 +1221,7 @@ struct llama_moe_cache::impl {
             pending_updates.clear();
             std::vector<ggml_moe_single_bank_write> writes;
             std::vector<ggml_moe_single_map_write> maps;
-            size_t budget = 32*1024*1024, remaining = 4;
+            size_t budget = 32*1024*1024, remaining = 16;
             const size_t first = maintenance_next_group % groups.size();
             maintenance_next_group = (first + 1) % groups.size();
             for (size_t offset = 0; offset < groups.size(); ++offset) {
