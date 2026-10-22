@@ -3,12 +3,13 @@
 #include "common.cuh"
 #include "convert.cuh"
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 
 template <bool write_dots = false>
 static __global__ void gdn_ab_bf16_f32(
         const nv_bfloat16 * alpha, const nv_bfloat16 * beta, const float * x,
         const float * dt, const float * a, float * gate, float * sigmoid, float * dots = nullptr) {
+    ggml_cuda_pdl_sync();
     __shared__ float partial[32];
     const int tid = threadIdx.x;
     const bool is_beta = blockIdx.x >= 48;

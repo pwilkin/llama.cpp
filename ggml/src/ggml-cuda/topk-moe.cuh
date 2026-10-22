@@ -32,7 +32,7 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * logits,
                                    const ggml_tensor * ids);
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 struct ggml_cuda_moe_single_publish;
 void ggml_cuda_op_topk_moe_single_publish(ggml_backend_cuda_context & ctx, const ggml_tensor * logits,
         ggml_tensor * weights, ggml_tensor * ids, const ggml_tensor * clamp,

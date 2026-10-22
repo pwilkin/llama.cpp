@@ -1,7 +1,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "topk-moe.cuh"
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 #include "moe-single-publish.cuh"
 #endif
 
@@ -360,7 +360,7 @@ __global__ void topk_moe_cuda(const float *         logits,
     topk_moe_device<n_experts, has_bias, false>(logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
 }
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 template <bool full_cta>
 __launch_bounds__(TOPK_MOE_ROWS_PER_BLOCK * WARP_SIZE, 1)
 static __global__ void topk_moe_single_publish_cuda(const float * logits, float * weights, int32_t * ids,

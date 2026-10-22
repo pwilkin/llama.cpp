@@ -3,7 +3,11 @@
 #include "common.cuh"
 #include "ggml-moe-single.h"
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
+
+#if !defined(GGML_USE_HIP)
+#include <cuda/atomic>
+#endif
 
 struct ggml_cuda_moe_single_publish {
     const float * input;
@@ -18,11 +22,19 @@ struct ggml_cuda_moe_single_publish {
 };
 
 static __device__ uint32_t ggml_moe_single_load(const uint32_t * ptr) {
+#if defined(GGML_USE_HIP)
     return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    return cuda::atomic_ref<const uint32_t, cuda::thread_scope_system>(*ptr).load(cuda::memory_order_acquire);
+#endif
 }
 
 static __device__ void ggml_moe_single_store(uint32_t * ptr, uint32_t value) {
+#if defined(GGML_USE_HIP)
     __hip_atomic_store(ptr, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*ptr).store(value, cuda::memory_order_release);
+#endif
 }
 
 static __device__ void ggml_moe_single_fail(ggml_moe_single_control * control, uint32_t * abort, uint32_t error) {

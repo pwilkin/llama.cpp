@@ -2242,7 +2242,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
         case GGML_OP_CUSTOM:
             if (!ggml_moe_single_is_op(dst)) return false;
             ggml_moe_single_compute(ctx, dst);
@@ -3610,7 +3610,7 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 struct ggml_cuda_topk_single_publish_match {
     ggml_tensor * publication;
     ggml_moe_single_layer * layer;
@@ -3628,7 +3628,8 @@ static bool ggml_cuda_match_topk_single_publish(ggml_backend_cuda_context * ctx,
     static const bool concurrent = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && std::atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
     if (!variant || disabled || concurrent || getenv("HIP_HOST_COHERENT") || ctx->curr_stream_no != 0 ||
             !ctx->stream_context().concurrent_events.empty() || ggml_cuda_info().devices[ctx->device].warp_size != 32 ||
-            !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx->device].cc) || i < 0 || i >= graph->n_nodes ||
+            (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx->device].cc) &&
+             ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_BLACKWELL) || i < 0 || i >= graph->n_nodes ||
             ops.size() != 10 || graph->n_nodes - i <= 10 || !args.softmax || !args.norm || args.sigmoid || args.sqrt_softplus ||
             args.delayed_softmax || args.prob_bias || args.scale) return false;
     const auto shape = [](const ggml_tensor * t, ggml_type type, int64_t n0, int64_t n1) {
@@ -3710,7 +3711,7 @@ static bool ggml_cuda_topk_single_publish_ranges(ggml_backend_cuda_context * ctx
 }
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 static bool ggml_cuda_match_moe_shared_tail(ggml_backend_cuda_context * ctx, const ggml_cgraph * graph, int i) {
     static const bool enabled = getenv("GGML_CUDA_MOE_SHARED_TAIL") != nullptr && strcmp(getenv("GGML_CUDA_MOE_SHARED_TAIL"), "1") == 0;
     static const bool concurrent = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && std::atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
@@ -3756,7 +3757,7 @@ static bool ggml_cuda_moe_shared_tail_ranges(ggml_backend_cuda_context * ctx, co
 }
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 static bool ggml_cuda_match_qsa_pool(ggml_backend_cuda_context * ctx, const ggml_cgraph * graph, int i) {
     static const bool enabled = getenv("GGML_CUDA_QSA_POOL") != nullptr && strcmp(getenv("GGML_CUDA_QSA_POOL"), "1") == 0;
     static const bool concurrent = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && std::atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
@@ -3947,7 +3948,7 @@ static bool ggml_cuda_qsa_mask_ranges(ggml_backend_cuda_context * ctx, const ggm
 }
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 static bool ggml_cuda_match_gdn_conv_norm(ggml_backend_cuda_context * ctx, const ggml_cgraph * graph, int i) {
     static const bool enabled = getenv("GGML_CUDA_GDN_CONV_NORM") != nullptr && strcmp(getenv("GGML_CUDA_GDN_CONV_NORM"), "1") == 0;
     static const bool concurrent = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && std::atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
@@ -4026,6 +4027,9 @@ static bool ggml_cuda_gdn_conv_norm_ranges(ggml_backend_cuda_context * ctx, cons
     }
     return true;
 }
+#endif
+
+#if defined(GGML_USE_HIP)
 struct ggml_cuda_gdn_history_match {
     std::array<int, 4> skip{};
     int conv = -1;
@@ -4267,7 +4271,7 @@ static bool ggml_cuda_gdn_history_ranges(ggml_backend_cuda_context * ctx, const 
 
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 static bool ggml_cuda_match_gdn_ab(ggml_backend_cuda_context * ctx, const ggml_cgraph * graph, int i) {
     static const bool enabled = getenv("GGML_CUDA_GDN_AB") != nullptr && strcmp(getenv("GGML_CUDA_GDN_AB"), "1") == 0;
     static const bool concurrent = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && std::atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
@@ -4858,7 +4862,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
     if (ggml_cuda_match_moe_shared_tail(cuda_ctx, cgraph, i) && ggml_cuda_moe_shared_tail_ranges(cuda_ctx, cgraph, i)) {
         ggml_tensor * const * n = cgraph->nodes + i;
         const ggml_cuda_kernel_launch_params launch_params(dim3(10), dim3(256), 0, cuda_ctx->stream());
@@ -4870,7 +4874,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
     if (ggml_cuda_match_qsa_pool(cuda_ctx, cgraph, i) && ggml_cuda_qsa_pool_ranges(cuda_ctx, cgraph, i)) {
         ggml_tensor * const * n = cgraph->nodes + i;
         const ggml_cuda_kernel_launch_params launch_params(dim3(1), dim3(128), 0, cuda_ctx->stream());
@@ -4895,7 +4899,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
     if (ggml_cuda_match_gdn_conv_norm(cuda_ctx, cgraph, i) && ggml_cuda_gdn_conv_norm_ranges(cuda_ctx, cgraph, i)) {
         ggml_tensor * const * n = cgraph->nodes + i;
         const ggml_cuda_kernel_launch_params launch_params(dim3(80), dim3(256), 0, cuda_ctx->stream());
@@ -4909,7 +4913,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
     if (ggml_cuda_match_gdn_ab(cuda_ctx, cgraph, i) && ggml_cuda_gdn_ab_ranges(cuda_ctx, cgraph, i)) {
         const ggml_cuda_kernel_launch_params launch_params(dim3(96), dim3(256), 0, cuda_ctx->stream());
         ggml_cuda_kernel_launch(gdn_ab_bf16_f32<false>, launch_params,
@@ -5064,7 +5068,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
                     ggml_cuda_topk_single_publish_match publication_match;
                     if (ggml_cuda_match_topk_single_publish(cuda_ctx, cgraph, i, ops, args, publication_match) &&
                             ggml_cuda_topk_single_publish_ranges(cuda_ctx, cgraph, i, publication_match)) {
@@ -6803,14 +6807,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
             if (ggml_cuda_match_moe_shared_tail(cuda_ctx, cgraph, i)) {
                 for (int j = 0; j < 3; ++j) {
                     params->add_alloc_dep(params->user_data, cgraph->nodes[i + j]->src[0], cgraph->nodes[i + 2]);
                 }
             }
 #endif
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
             if (ggml_cuda_match_qsa_pool(cuda_ctx, cgraph, i)) {
                 ggml_tensor * gather = cgraph->nodes[i];
                 for (ggml_tensor * input : {gather->src[0],gather->src[1],gather->src[0]->view_src,gather->src[1]->view_src}) {
@@ -6826,13 +6830,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 #endif
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
             if (ggml_cuda_match_gdn_conv_norm(cuda_ctx, cgraph, i)) {
                 ggml_tensor * const * n = cgraph->nodes + i;
                 for (ggml_tensor * t : {n[0]->src[0],n[0]->src[1],n[1],n[4]}) {
                     params->add_alloc_dep(params->user_data, t, n[7]);
                 }
             }
+#endif
+#if defined(GGML_USE_HIP)
             if (ggml_cuda_gdn_history_enabled(cuda_ctx)) {
                 ggml_cuda_gdn_history_match match;
                 if (ggml_cuda_match_gdn_history(cuda_ctx, cgraph, i, match)) {
@@ -6844,7 +6850,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 #endif
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
             if (ggml_cuda_match_gdn_ab(cuda_ctx, cgraph, i)) {
                 params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], cgraph->nodes[i + 8]);
                 params->add_alloc_dep(params->user_data, cgraph->nodes[i + 4], cgraph->nodes[i + 8]);
@@ -6925,7 +6931,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                 ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
                             ggml_cuda_topk_single_publish_match publication_match;
                             if (ggml_cuda_match_topk_single_publish(cuda_ctx, cgraph, i, ops, args, publication_match)) {
                                 add_alloc_deps(i, publication_match.index);
@@ -7492,7 +7498,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     switch (op->op) {
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
         case GGML_OP_CUSTOM:
             return ggml_moe_single_is_op(op);
 #endif
@@ -8116,6 +8122,8 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_hip_copy_input_batch") == 0) {
         return (void *) ggml_backend_hip_copy_input_batch;
     }
+#endif
+#if defined(GGML_CUDA_MOE_SINGLE)
     if (strcmp(name, "ggml_moe_single_get_api") == 0) {
         return (void *) ggml_moe_single_get_api;
     }

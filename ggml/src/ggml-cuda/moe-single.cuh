@@ -3,14 +3,14 @@
 #include "ggml-moe-single.h"
 #include "moe-single-publish.cuh"
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 
 static void ggml_moe_single_publish_marker(ggml_tensor *, int, int, void *) {
-    GGML_ABORT("single-graph MoE publication requires ROCm");
+    GGML_ABORT("single-graph MoE publication requires a supported GPU backend");
 }
 
 static void ggml_moe_single_merge_marker(ggml_tensor *, int, int, void *) {
-    GGML_ABORT("single-graph MoE merge requires ROCm");
+    GGML_ABORT("single-graph MoE merge requires a supported GPU backend");
 }
 
 static bool ggml_moe_single_is_op(const ggml_tensor * op) {
@@ -18,6 +18,16 @@ static bool ggml_moe_single_is_op(const ggml_tensor * op) {
     ggml_custom_op_params params;
     memcpy(&params, op->op_params, sizeof(params));
     return params.fun == ggml_moe_single_publish_marker || params.fun == ggml_moe_single_merge_marker;
+}
+
+static __device__ uint64_t ggml_moe_single_clock() {
+#if defined(GGML_USE_HIP)
+    return wall_clock64();
+#else
+    uint64_t ticks;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ticks));
+    return ticks;
+#endif
 }
 
 template <bool parallel>
@@ -36,18 +46,22 @@ static __global__ void ggml_moe_single_merge_kernel(const float * gpu, const int
         failed = ggml_moe_single_load(&control->cancel.value) || ggml_moe_single_load(abort) || ggml_moe_single_load(&control->error.value);
         if (!failed && slots[row] == zero_slot) {
             const uint32_t request = ggml_moe_single_load(&control->request.value);
-            const uint64_t start = wall_clock64();
+            const uint64_t start = ggml_moe_single_clock();
             while (ggml_moe_single_load(&control->completed.value) != request) {
                 if (ggml_moe_single_load(&control->cancel.value) || ggml_moe_single_load(abort) || ggml_moe_single_load(&control->error.value)) {
                     failed = true;
                     break;
                 }
-                if (wall_clock64() - start > timeout_ticks) {
+                if (ggml_moe_single_clock() - start > timeout_ticks) {
                     ggml_moe_single_fail(control, abort, GGML_MOE_SINGLE_TIMEOUT);
                     failed = true;
                     break;
                 }
+#if defined(GGML_USE_HIP)
                 __builtin_amdgcn_s_sleep(1);
+#elif __CUDA_ARCH__ >= 700
+                __nanosleep(64);
+#endif
             }
             failed |= ggml_moe_single_load(abort) != 0 || ggml_moe_single_load(&control->error.value) != 0;
         }
@@ -86,7 +100,7 @@ static void ggml_moe_single_destroy(ggml_moe_single_layer * layer) {
     }
     if (layer->host) {
         ggml_cuda_storage_changed();
-        CUDA_CHECK(hipHostFree(layer->host));
+        CUDA_CHECK(cudaFreeHost(layer->host));
     }
     delete layer;
 }
@@ -98,14 +112,20 @@ static ggml_moe_single_layer * ggml_moe_single_create(ggml_backend_t backend, in
     for (int i = 0; i < n_expert; ++i) if (map[i] < -1 || map[i] >= zero_slot) return nullptr;
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     ggml_cuda_set_device(ctx->device);
-    hipDeviceProp_t prop;
-    CUDA_CHECK(hipGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
     if (!prop.canMapHostMemory) return nullptr;
+    if (prop.major < 7 && !GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[ctx->device].cc)) return nullptr;
+#if defined(GGML_USE_HIP)
     int wall_clock_khz = 0;
-    if (hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, ggml_cuda_get_physical_device(ctx->device)) != hipSuccess || wall_clock_khz <= 0) {
+    if (hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, ggml_cuda_get_physical_device(ctx->device)) != cudaSuccess || wall_clock_khz <= 0) {
         GGML_LOG_ERROR("single-graph MoE requires a constant-frequency HIP wall clock\n");
         return nullptr;
     }
+    const uint64_t timeout_ticks = uint64_t(wall_clock_khz)*1000*30;
+#else
+    const uint64_t timeout_ticks = UINT64_C(30000000000);
+#endif
     auto * layer = new ggml_moe_single_layer{};
     static std::atomic<uint64_t> next_cookie{1};
     layer->creation_cookie = next_cookie.fetch_add(1, std::memory_order_relaxed);
@@ -115,22 +135,29 @@ static ggml_moe_single_layer * ggml_moe_single_create(ggml_backend_t backend, in
     layer->n_used = n_used;
     layer->n_embd = n_embd;
     layer->zero_slot = zero_slot;
-    layer->timeout_ticks = uint64_t(wall_clock_khz)*1000*30;
+    layer->timeout_ticks = timeout_ticks;
     const size_t ids_size = n_used*sizeof(int32_t);
     const size_t input_size = n_embd*sizeof(float);
     const size_t bytes = sizeof(ggml_moe_single_control) + 2*ids_size + input_size + size_t(n_embd)*n_used*sizeof(float);
     void * host = nullptr;
     void * device = nullptr;
-    if (hipHostMalloc(&host, bytes, hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess) {
+    unsigned int alloc_flags = cudaHostAllocMapped;
+#if defined(GGML_USE_HIP)
+    alloc_flags |= hipHostMallocCoherent;
+#endif
+    if (cudaHostAlloc(&host, bytes, alloc_flags) != cudaSuccess) {
         delete layer;
         return nullptr;
     }
     ggml_cuda_storage_changed();
     memset(host, 0, bytes);
     layer->host = static_cast<ggml_moe_single_control *>(host);
+    bool coherent = true;
+#if defined(GGML_USE_HIP)
     unsigned int flags = 0;
-    if (hipHostGetFlags(&flags, host) != hipSuccess || !(flags & hipHostMallocCoherent) ||
-            hipHostGetDevicePointer(&device, host, 0) != hipSuccess) {
+    coherent = hipHostGetFlags(&flags, host) == cudaSuccess && (flags & hipHostMallocCoherent);
+#endif
+    if (!coherent || cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess) {
         ggml_moe_single_destroy(layer);
         return nullptr;
     }
@@ -145,12 +172,12 @@ static ggml_moe_single_layer * ggml_moe_single_create(ggml_backend_t backend, in
     layer->device_trace_ids = layer->device_ids + n_used;
     layer->device_input = reinterpret_cast<float *>(layer->device_trace_ids + n_used);
     layer->device_output = layer->device_input + n_embd;
-    if (hipMalloc(reinterpret_cast<void **>(&layer->device_map), n_expert*sizeof(int32_t)) != hipSuccess) {
+    if (cudaMalloc(reinterpret_cast<void **>(&layer->device_map), n_expert*sizeof(int32_t)) != cudaSuccess) {
         ggml_moe_single_destroy(layer);
         return nullptr;
     }
     ggml_cuda_storage_changed();
-    CUDA_CHECK(hipMemcpy(layer->device_map, map, n_expert*sizeof(int32_t), hipMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(layer->device_map, map, n_expert*sizeof(int32_t), cudaMemcpyHostToDevice));
     return layer;
 }
 
@@ -186,10 +213,15 @@ static bool ggml_moe_single_update(ggml_backend_t backend, const ggml_moe_single
     *mutation_started = false;
     if (!ggml_backend_is_cuda(backend) || !banks || !n_banks || !maps || !n_maps) return false;
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
-    if (hipSetDevice(ggml_cuda_get_physical_device(ctx->device)) != hipSuccess) return false;
+    if (cudaSetDevice(ggml_cuda_get_physical_device(ctx->device)) != cudaSuccess) return false;
     const auto stream = ctx->streams[ctx->device][ctx->curr_stream_no];
+#if defined(GGML_USE_HIP)
     hipStreamCaptureStatus capture;
-    if (!stream || hipStreamIsCapturing(stream, &capture) != hipSuccess || capture != hipStreamCaptureStatusNone) return false;
+    if (!stream || hipStreamIsCapturing(stream, &capture) != cudaSuccess || capture != hipStreamCaptureStatusNone) return false;
+#else
+    cudaStreamCaptureStatus capture;
+    if (!stream || cudaStreamIsCapturing(stream, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone) return false;
+#endif
     for (size_t i = 0; i < n_banks; ++i) {
         const auto & w = banks[i];
         if (!w.bank || !w.bank->data || !w.bank->buffer || w.bank->view_src || !w.data || !w.size ||
@@ -206,14 +238,14 @@ static bool ggml_moe_single_update(ggml_backend_t backend, const ggml_moe_single
     bool success = true;
     for (size_t i = 0; success && i < n_banks; ++i) {
         const auto & w = banks[i];
-        success = hipMemcpyAsync(static_cast<uint8_t *>(w.bank->data) + w.offset, w.data, w.size, hipMemcpyHostToDevice, stream) == hipSuccess;
+        success = cudaMemcpyAsync(static_cast<uint8_t *>(w.bank->data) + w.offset, w.data, w.size, cudaMemcpyHostToDevice, stream) == cudaSuccess;
     }
-    success = hipStreamSynchronize(stream) == hipSuccess && success;
+    success = cudaStreamSynchronize(stream) == cudaSuccess && success;
     for (size_t i = 0; success && i < n_maps; ++i) {
         const auto & w = maps[i];
-        success = hipMemcpyAsync(w.layer->device_map, w.map, size_t(w.layer->n_expert)*sizeof(int32_t), hipMemcpyHostToDevice, stream) == hipSuccess;
+        success = cudaMemcpyAsync(w.layer->device_map, w.map, size_t(w.layer->n_expert)*sizeof(int32_t), cudaMemcpyHostToDevice, stream) == cudaSuccess;
     }
-    return hipStreamSynchronize(stream) == hipSuccess && success;
+    return cudaStreamSynchronize(stream) == cudaSuccess && success;
 }
 
 static const ggml_moe_single_update_api_v1 * ggml_moe_single_get_update_api_v1() {

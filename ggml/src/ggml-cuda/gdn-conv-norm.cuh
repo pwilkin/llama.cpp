@@ -3,13 +3,14 @@
 #include "common.cuh"
 #include "unary.cuh"
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 
 template <bool write_intermediates = false, bool direct_history = false>
 static __global__ void gdn_conv_norm_f32(
         const float * x, const float * w, float * silu, float * q, float * k,
         float eps_q, float eps_k, float scale_out, float * raw = nullptr, float * norms = nullptr,
         float * history = nullptr, const int32_t * state_id = nullptr) {
+    ggml_cuda_pdl_sync();
     __shared__ float values_norm[128];
     __shared__ float scale_norm;
     const int tid = threadIdx.x;

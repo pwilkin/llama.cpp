@@ -862,7 +862,7 @@ struct llama_moe_cache::impl {
             }
         }
 
-        if (single_requested && !model.hparams.no_alloc && devices.size() == 1 && std::strncmp(ggml_backend_name(devices[0].backend), "ROCm", 4) == 0) {
+        if (single_requested && !model.hparams.no_alloc && devices.size() == 1) {
             auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[0].backend));
             auto get_api = reinterpret_cast<ggml_moe_single_get_api_t>(ggml_backend_reg_get_proc_address(reg, "ggml_moe_single_get_api"));
             single_api = get_api ? get_api() : nullptr;
@@ -1405,7 +1405,7 @@ struct llama_moe_cache::impl {
     }
 
     bool copy_cpu_result_async(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
-        if (!hybrid || devices.size() != 1 || backend != devices[0].backend || std::strncmp(ggml_backend_name(backend), "ROCm", 4) != 0 || cpu_outputs.find(src) == cpu_outputs.end()) {
+        if (!hybrid || devices.size() != 1 || backend != devices[0].backend || cpu_outputs.find(src) == cpu_outputs.end()) {
             return false;
         }
         const auto host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));

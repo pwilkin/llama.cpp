@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_CUDA_MOE_SINGLE)
 
 static __device__ __forceinline__ float moe_shared_tail_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
@@ -11,13 +11,19 @@ static __device__ __forceinline__ float moe_shared_tail_sigmoid(float x) {
 static __device__ __forceinline__ float moe_shared_tail_add(float routed, float shared, float gate, float & product) {
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
+#if defined(GGML_USE_HIP)
     product = shared * gate;
     return routed + product;
+#else
+    product = __fmul_rn(shared, gate);
+    return __fadd_rn(routed, product);
+#endif
 }
 
 template <bool diagnostics>
 static __global__ void moe_shared_tail_f32(const float * gate_input, const float * shared, const float * routed,
                                           float * dst, float * gate_output, float * product_output) {
+    ggml_cuda_pdl_sync();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= 2560) return;
     const float gate = moe_shared_tail_sigmoid(gate_input[0]);
