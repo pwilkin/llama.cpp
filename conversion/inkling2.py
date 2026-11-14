@@ -188,21 +188,9 @@ class Inkling2Model(TextModel):
         if any(p in name for p in ("visual.", "vision_tower.", "mtp.", "markov_head", "nextn_predict")):
             return None
         name = name.replace("model.language_model.", "model.").replace("model.llm.", "model.")
-        name = name.replace("model.unembed.weight", "lm_head.weight")
-        name = name.replace("model.embed.weight", "model.embed_tokens.weight")
-        name = name.replace("model.embed_norm.", "model.embed_tokens.embed_norm.")
+        # the mapping table cannot shift a block index: attn_queries.{i} feeds block i + 1
         name = re.sub(r"attn_res\.attn_queries\.(\d+)", lambda m: f"layers.{int(m[1]) + 1}.attention_input.query", name)
-        name = re.sub(r"attn_res\.mlp_queries\.(\d+)", r"layers.\1.mlp_input.query", name)
-        name = name.replace("attn_res.output_query", "final_input.query")
-        for old, new in (("wq_du", "q_proj"), ("wk_dv", "k_proj"), ("wv_dv", "v_proj"), ("wr_du", "r_proj"), ("wo_ud", "o_proj"), ("gate_attn", "gate_proj"), ("attn_sink_proj", "sink_proj")):
-            name = name.replace(f".attn.{old}", f".self_attn.{new}")
-        name = name.replace(".attn.", ".self_attn.")
-        name = name.replace("attn_sconv.", "post_attention_convolution.").replace("mlp_sconv.", "post_mlp_convolution.")
-        name = re.sub(r"(convolution|sconv)\.weight$", r"\1.conv1d.weight", name)
-        name = re.sub(r"(convolution|sconv)\.static_w$", r"\1.static_weight", name)
-        name = re.sub(r"(convolution|sconv)\.weight_proj$", r"\1.weight_proj.weight", name)
-        name = name.replace(".mlp_norm.", ".post_attention_layernorm.").replace(".attn_norm.", ".input_layernorm.")
-        name = re.sub(r"\.(q|k|v)_input_norm\.", r".\1_input_layernorm.", name)
+        # the table maps a module, not its bias: gate.weight is the router, gate.bias the score correction
         name = name.replace("mlp.gate.bias", "mlp.gate.e_score_correction_bias")
         return name, gen
 
@@ -273,15 +261,17 @@ class Inkling2Model(TextModel):
             data_torch = data_torch.reshape(shape[0], shape[1] // 2, 2, shape[2]).transpose(1, 2).reshape(shape)
             name = name.replace(".w13_weight", ".gate_up_proj")
         name = name.replace(".w2_weight", ".down_proj")
-        if name.endswith(".static_weight"):
-            data_torch = data_torch.flip(0).T.contiguous()
-            name = name.replace(".static_weight", ".conv1d.weight")
-        elif name.endswith(".conv1d.weight"):
+        for static, conv in ((".static_weight", ".conv1d.weight"), (".static_w", ".weight")):
+            if name.endswith(static):
+                data_torch = data_torch.flip(0).T.contiguous()
+                name = name.removesuffix(static) + conv
+        if name.endswith((".conv1d.weight", "sconv.weight")):
             data_torch = data_torch.squeeze(1) if data_torch.ndim == 3 else data_torch
         elif name.endswith(".rel_logits_proj.proj"):
             data_torch = data_torch.T.contiguous()
-        if name.endswith((".query", ".scale", ".proj", ".gate_up_proj", ".down_proj", ".e_score_correction_bias")):
-            new_name = self.map_tensor_name(name, try_suffixes=())
+        # a name the table maps without a suffix is a bare parameter
+        new_name = self.tensor_map.get_name(name)
+        if new_name is not None:
             suffix = ".bias" if name.endswith(".e_score_correction_bias") else ".weight"
             yield new_name + suffix, data_torch
         else:
