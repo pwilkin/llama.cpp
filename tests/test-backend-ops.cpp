@@ -13200,8 +13200,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, true));
 
     // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) with sinks
-    for (int hs : {64, 128, 256}) {
-        for (int nq : {1, 3}) {
+    for (int hs : {64, 80, 128, 256}) {
+        for (int nq : {1, 3, 35}) {
             for (int mh : {2, 8}) {
                 for (ggml_type tv : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 2}, 512, nq, true, true, 0, 0, GGML_PREC_F32,
