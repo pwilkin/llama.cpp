@@ -2173,7 +2173,7 @@ class TextModel(ModelBase):
             res = "grok-2"
         if chkhsh == "5635e1c8d621dff7b4825f41f2f97b6ceb39bcf2d5c541db28577080d6efd5e5":
             # ref: https://huggingface.co/thinkingmachines/Inkling-2-Small
-            res = "gpt-4o"
+            res = "inkling2"
         if chkhsh == "f5c965e4198da6e7525072d87d1ecf4c51d981fd486c7c4ec728ef9cec7e03fc":
             # ref: https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B
             res = "gpt-4o"

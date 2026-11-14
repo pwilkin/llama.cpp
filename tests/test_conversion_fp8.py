@@ -453,7 +453,7 @@ class TestInkling2PackedConversion(unittest.TestCase):
 
     def converter(self, path, tensors, quant_groups, ftype=gguf.LlamaFileType.ALL_F32, eager=False):
         """Writes the checkpoint to path and returns an Inkling2Model on it."""
-        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": self.N_EMBD, "moe_intermediate_size": self.N_FF, "n_routed_experts": self.N_EXPERT}
+        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": self.N_EMBD, "moe_intermediate_size": self.N_FF, "n_routed_experts": self.N_EXPERT, "layer_types": ["hybrid_sliding", "hybrid"]}
         (path / "config.json").write_text(json.dumps(hp))
         (path / "hf_quant_config.json").write_text(json.dumps({"model": {"parameter_groups": quant_groups}}))
         save_file(tensors, path / "model.safetensors")
@@ -629,7 +629,7 @@ class TestInkling2TextNames(unittest.TestCase):
     ))
 
     def convert(self, tensors):
-        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": 8}
+        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": 8, "layer_types": ["hybrid_sliding", "hybrid"]}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             (path / "config.json").write_text(json.dumps(hp))
