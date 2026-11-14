@@ -2678,6 +2678,11 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_GPT4O;
                 clean_spaces = false;
             } else if (
+                tokenizer_pre == "inkling2") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_GPT4O;
+                special_bos_id = LLAMA_TOKEN_NULL;
+                clean_spaces = false;
+            } else if (
                 tokenizer_pre == "granite-embed-multi-97m") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI;
                 clean_spaces = false;
@@ -2964,10 +2969,6 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             { LLM_KV_TOKENIZER_SUFFIX_ID, special_fim_suf_id },
             { LLM_KV_TOKENIZER_MIDDLE_ID, special_fim_mid_id },
         };
-
-        if (ml.get_arch() == LLM_ARCH_INKLING2) {
-            special_bos_id = LLAMA_TOKEN_NULL;
-        }
 
         for (const auto & it : special_token_types) {
             const std::string & key = kv(std::get<0>(it));

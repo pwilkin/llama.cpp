@@ -2,7 +2,7 @@
 #include "../llama-memory-hybrid-iswa.h"
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
-    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_RELATIVE_LENGTH, hparams.n_relative);
     ml.get_key(LLM_KV_ATTENTION_RELATIVE_EXTENT, hparams.n_relative_extent);
@@ -38,12 +38,14 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("inkling2: invalid logarithmic scale");
     }
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+    hparams.expert_router_f32 = true;
+    hparams.expert_weights_norm_eps = 1e-20f;
     hparams.rope_pattern.fill(false);
     uint64_t max_channels = 0;
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         if (!hparams.n_head_kv(il) || hparams.n_head(il) % hparams.n_head_kv(il) ||
             hparams.n_embd_head_k(il) != hparams.n_embd_head_v(il) || !hparams.n_expert_used(il) ||
-            hparams.n_expert_used(il) > hparams.n_expert || !hparams.n_ff(il)) {
+            hparams.n_expert_used(il) > hparams.n_expert || !hparams.n_ff_exp(il)) {
             throw std::runtime_error("inkling2: invalid attention or expert dimensions");
         }
         max_channels = std::max<uint64_t>(max_channels, 2ull * hparams.n_embd_k_gqa(il) + 2ull * hparams.n_embd);
@@ -103,8 +105,8 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         l.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
         l.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
         l.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
-        l.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*hparams.n_ff(i), n_expert}, 0);
-        l.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff(i), n_embd, n_expert}, 0);
+        l.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*hparams.n_ff_exp(i), n_expert}, 0);
+        l.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff_exp(i), n_embd, n_expert}, 0);
     }
 }
 
@@ -250,30 +252,30 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             q = ggml_mul(ctx0, q, tau);
             r = ggml_mul(ctx0, r, tau);
         }
-        auto * bank = ggml_pad(ctx0, l.attn_rel_bias, 0, 1, 0, 0);
-        auto * index = ggml_reshape_1d(ctx0, distances[swa], ggml_nelements(distances[swa]));
-        auto * profiles = ggml_get_rows(ctx0, bank, index);
-        const int64_t n_kv = distances[swa]->ne[0];
-        profiles = ggml_reshape_3d(ctx0, profiles, hparams.n_relative, n_kv, n_tokens);
-        auto * bias = ggml_mul_mat(ctx0, profiles, r);
-        bias = ggml_cont(ctx0, ggml_permute(ctx0, bias, 0, 2, 1, 3));
         auto * mask = swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
         const int64_t streams = mask->ne[3];
-        bias = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0,
-                ggml_reshape_4d(ctx0, bias, n_kv, n_tokens/streams, streams, nh), 0, 1, 3, 2)), n_kv, n_tokens/streams, nh, streams);
+        const int64_t n_kv = distances[swa]->ne[0];
         auto * sinks = build_lora_mm(l.attn_sink_proj, inputs[0]);
-        sinks = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0,
-                ggml_reshape_3d(ctx0, sinks, nh, n_tokens/streams, streams), 1, 0, 2, 3)), 1, n_tokens/streams, nh, streams);
-        ggml_tensor * fa_mask = nullptr;
+        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x nh
+        auto * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, l.attn_rel_bias, 0, 1, 0, 0), r);
         if (cparams.flash_attn) {
             // exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))).
-            fa_mask = ggml_add(ctx0, ggml_sub(ctx0, bias, sinks), ggml_cast(ctx0, mask, GGML_TYPE_F32));
-            fa_mask = ggml_cast(ctx0, fa_mask, GGML_TYPE_F16);
+            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, nh, n_tokens));
+        } else {
+            // build_attn scales the bias along with QK; FA adds the mask after scaling QK.
+            table = ggml_scale(ctx0, table, sqrtf(hd));
+        }
+        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        auto * bias = ggml_get_rows(ctx0, table, distances[swa]);
+        bias = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, bias, nh, n_kv, n_tokens/streams, streams), 2, 0, 1, 3));
+        ggml_tensor * fa_mask = nullptr;
+        if (cparams.flash_attn) {
+            fa_mask = ggml_cast(ctx0, ggml_add(ctx0, bias, ggml_cast(ctx0, mask, GGML_TYPE_F32)), GGML_TYPE_F16);
             sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
             bias = nullptr;
         } else {
-            // build_attn scales the bias along with QK; FA adds the mask after scaling QK.
-            bias = ggml_scale(ctx0, bias, sqrtf(hd));
+            sinks = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0,
+                    ggml_reshape_3d(ctx0, sinks, nh, n_tokens/streams, streams), 1, 0, 2, 3)), 1, n_tokens/streams, nh, streams);
         }
         cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, bias, sinks, nullptr, 1.0f/sqrtf(hd), il, fa_mask);
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(l.wqkv_gate, inputs[0])));
