@@ -588,6 +588,90 @@ class TestInkling2PackedConversion(unittest.TestCase):
                     self.written_bytes(tensor, path / "tensor.bin")
 
 
+class TestInkling2TextNames(unittest.TestCase):
+    """The checkpoint names (model.llm.*) and the transformers names (model.language_model.*) give the same GGUF tensors."""
+
+    # checkpoint name, transformers name, shape; a 4th entry is the transformers shape when it differs
+    NAMES = (
+        ("embed.weight", "embed_tokens.weight", (16, 8)),
+        ("embed_norm.weight", "embed_tokens.embed_norm.weight", (8,)),
+        ("norm.weight", "norm.weight", (8,)),
+        ("unembed.weight", "lm_head.weight", (16, 8)),
+        ("attn_res.attn_queries.0", "layers.1.attention_input.query", (3, 8)),
+        ("attn_res.mlp_queries.0", "layers.0.mlp_input.query", (8,)),
+        ("attn_res.mlp_queries.1", "layers.1.mlp_input.query", (8,)),
+        ("attn_res.output_query", "final_input.query", (8,)),
+        ("layers.0.attn.k_sconv.weight", "layers.0.self_attn.k_sconv.conv1d.weight", (4, 4), (4, 1, 4)),
+        ("layers.1.attn.k_sconv.static_w", "layers.1.self_attn.k_sconv.static_weight", (3, 4)),
+    ) + tuple((f"layers.{i}.{old}", f"layers.{i}.{new}", *shapes) for i in range(2) for old, new, *shapes in (
+        ("attn_norm.weight", "input_layernorm.weight", (8,)),
+        ("mlp_norm.weight", "post_attention_layernorm.weight", (8,)),
+        ("q_input_norm.weight", "q_input_layernorm.weight", (8,)),
+        ("k_input_norm.weight", "k_input_layernorm.weight", (8,)),
+        ("v_input_norm.weight", "v_input_layernorm.weight", (8,)),
+        ("attn.wq_du.weight", "self_attn.q_proj.weight", (8, 8)),
+        ("attn.wk_dv.weight", "self_attn.k_proj.weight", (4, 8)),
+        ("attn.wv_dv.weight", "self_attn.v_proj.weight", (4, 8)),
+        ("attn.wr_du.weight", "self_attn.r_proj.weight", (4, 8)),
+        ("attn.wo_ud.weight", "self_attn.o_proj.weight", (8, 8)),
+        ("attn.gate_attn.weight", "self_attn.gate_proj.weight", (8, 8)),
+        ("attn.attn_sink_proj.weight", "self_attn.sink_proj.weight", (2, 8)),
+        ("attn.q_l2_clip.scale", "self_attn.q_l2_clip.scale", (2, 4)),
+        ("attn.rel_l2_clip.scale", "self_attn.rel_l2_clip.scale", (2, 2)),
+        ("attn.rel_logits_proj.proj", "self_attn.rel_logits_proj.proj", (2, 5)),
+        ("attn.k_sconv.weight_proj", "self_attn.k_sconv.weight_proj.weight", (6, 8)),
+        ("attn.v_sconv.weight", "self_attn.v_sconv.conv1d.weight", (4, 3), (4, 1, 3)),
+        ("attn.v_sconv.weight_proj", "self_attn.v_sconv.weight_proj.weight", (6, 8)),
+        ("attn_sconv.weight", "post_attention_convolution.conv1d.weight", (8, 3), (8, 1, 3)),
+        ("mlp_sconv.weight", "post_mlp_convolution.conv1d.weight", (8, 3), (8, 1, 3)),
+        ("mlp.gate.weight", "mlp.gate.weight", (2, 8)),
+        ("mlp.gate.bias", "mlp.gate.e_score_correction_bias", (2,)),
+    ))
+
+    def convert(self, tensors):
+        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": 8}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(json.dumps(hp))
+            save_file(tensors, path / "model.safetensors")
+            model = Inkling2Model(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf", hparams=hp)
+            model.prepare_tensors()
+            return {name: gguf.LazyNumpyTensor.to_eager(info.tensor) for name, info in model.gguf_writer.tensors[0].items()}
+
+    def test_checkpoint_and_transformers_names(self):
+        checkpoint, transformers = {}, {}
+        for index, (old, new, shape, *new_shape) in enumerate(self.NAMES):
+            tensor = torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(shape) / 100 + index
+            checkpoint["model.llm." + old] = tensor
+            transformers[new if new.startswith("lm_head.") else "model.language_model." + new] = tensor.reshape(*new_shape) if new_shape else tensor
+        actual = self.convert(checkpoint)
+        self.assertEqual(len(actual), len(self.NAMES))
+        source = {name: tensor.numpy() for name, tensor in checkpoint.items()}
+        for target, expected in (
+            ("token_embd.weight", source["model.llm.embed.weight"]),
+            ("output.weight", source["model.llm.unembed.weight"]),
+            ("output_res_query.weight", source["model.llm.attn_res.output_query"]),
+            ("blk.1.attn_res_query.weight", source["model.llm.attn_res.attn_queries.0"]),  # attn_queries.{i} feeds block i + 1
+            ("blk.1.ffn_res_query.weight", source["model.llm.attn_res.mlp_queries.1"]),
+            ("blk.0.attn_q.weight", source["model.llm.layers.0.attn.wq_du.weight"]),
+            ("blk.0.attn_rel.weight", source["model.llm.layers.0.attn.wr_du.weight"]),
+            ("blk.0.attn_rel_bias.weight", source["model.llm.layers.0.attn.rel_logits_proj.proj"].T),
+            ("blk.0.attn_k_conv.weight", source["model.llm.layers.0.attn.k_sconv.weight"]),
+            ("blk.1.attn_k_conv.weight", source["model.llm.layers.1.attn.k_sconv.static_w"][::-1].T),  # static taps are [kernel, channels], newest first
+            ("blk.0.attn_k_conv_proj.weight", source["model.llm.layers.0.attn.k_sconv.weight_proj"]),
+            ("blk.0.attn_post_conv.weight", source["model.llm.layers.0.attn_sconv.weight"]),
+            ("blk.0.ffn_post_conv.weight", source["model.llm.layers.0.mlp_sconv.weight"]),
+            ("blk.0.attn_q_inp_norm.weight", source["model.llm.layers.0.q_input_norm.weight"]),
+            ("blk.0.ffn_gate_inp.weight", source["model.llm.layers.0.mlp.gate.weight"]),
+            ("blk.0.exp_probs_b.bias", source["model.llm.layers.0.mlp.gate.bias"]),
+        ):
+            np.testing.assert_array_equal(actual[target], expected, target)
+        renamed = self.convert(transformers)
+        self.assertEqual(renamed.keys(), actual.keys())
+        for name in actual:
+            np.testing.assert_array_equal(renamed[name], actual[name], name)
+
+
 class TestInkling2VisionConversion(unittest.TestCase):
     def test_original_names_and_hwc_weights(self):
         from conversion import get_model_class
@@ -617,29 +701,48 @@ class TestInkling2VisionConversion(unittest.TestCase):
             "hidden_size": 8, "native_patch_size": 20, "adapter_merge_size": 2, "num_hidden_layers": 1,
             "num_attention_heads": 2, "mlp_ratio": 4.0, "posemb_grid_size": 3, "projection_hidden_dim": 12,
             "projector_bias": False, "layer_norm_eps": 1e-5, "temporal_patch_size": 2}}
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            (path / "config.json").write_text(json.dumps(config))
-            save_file(tensors, path / "model.safetensors")
-            model = Inkling2VisionModel(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf", hparams=config)
-            model.set_gguf_parameters()
-            model.prepare_tensors()
-            actual = {name: gguf.LazyNumpyTensor.to_eager(info.tensor) for name, info in model.gguf_writer.tensors[0].items()}
-            self.assertEqual(len(actual), len(shapes))
-            self.assertTrue(all(name.startswith(("v.", "mm.")) for name in actual))
-            for target, source in (("v.patch_embd.weight", "backbone.embeddings.patch_embedding.weight"),
-                                   ("v.class_embd", "backbone.embeddings.class_embedding"),
-                                   ("v.class_position_embd.weight", "backbone.embeddings.cls_position_embedding"),
-                                   ("v.blk.0.ls1.weight", "backbone.layers.0.ls_1.gamma"),
-                                   ("v.blk.0.ffn_up.weight", "backbone.layers.0.mlp.c_fc.weight"),
-                                   ("mm.2.weight", "proj_out.weight")):
-                np.testing.assert_array_equal(actual[target], tensors["model.visual." + source].numpy())
-            kv = model.gguf_writer.kv_data[0]
-            for key, value in ((gguf.Keys.ClipVision.PROJECTOR_TYPE, "inkling2"),
-                               (gguf.Keys.ClipVision.PATCH_SIZE, 20), (gguf.Keys.ClipVision.SPATIAL_MERGE_SIZE, 2),
-                               (gguf.Keys.ClipVision.POSITION_GRID_SIZE, 3), (gguf.Keys.ClipVision.Projector.HIDDEN_SIZE, 12),
-                               (gguf.Keys.ClipVision.Projector.USE_BIAS, False)):
-                self.assertEqual(kv[key].value, value)
+
+        def convert(tensors):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                (path / "config.json").write_text(json.dumps(config))
+                save_file(tensors, path / "model.safetensors")
+                model = Inkling2VisionModel(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf", hparams=config)
+                model.set_gguf_parameters()
+                model.prepare_tensors()
+                return {name: gguf.LazyNumpyTensor.to_eager(info.tensor) for name, info in model.gguf_writer.tensors[0].items()}, model.gguf_writer.kv_data[0]
+
+        actual, kv = convert(tensors)
+        self.assertEqual(len(actual), len(shapes))
+        self.assertTrue(all(name.startswith(("v.", "mm.")) for name in actual))
+        for target, source in (("v.patch_embd.weight", "backbone.embeddings.patch_embedding.weight"),
+                               ("v.class_embd", "backbone.embeddings.class_embedding"),
+                               ("v.class_position_embd.weight", "backbone.embeddings.cls_position_embedding"),
+                               ("v.blk.0.ls1.weight", "backbone.layers.0.ls_1.gamma"),
+                               ("v.blk.0.ffn_up.weight", "backbone.layers.0.mlp.c_fc.weight"),
+                               ("mm.2.weight", "proj_out.weight")):
+            np.testing.assert_array_equal(actual[target], tensors["model.visual." + source].numpy())
+        for key, value in ((gguf.Keys.ClipVision.PROJECTOR_TYPE, "inkling2"),
+                           (gguf.Keys.ClipVision.PATCH_SIZE, 20), (gguf.Keys.ClipVision.SPATIAL_MERGE_SIZE, 2),
+                           (gguf.Keys.ClipVision.POSITION_GRID_SIZE, 3), (gguf.Keys.ClipVision.Projector.HIDDEN_SIZE, 12),
+                           (gguf.Keys.ClipVision.Projector.USE_BIAS, False)):
+            self.assertEqual(kv[key].value, value)
+
+        # the same checkpoint under the transformers names gives the same tensors
+        def transformers_name(name):
+            if name.endswith(".embeddings.position_embedding"):
+                name += ".weight"
+            for old, new in (("visual.backbone.ln_pre.", "vision_tower.pre_layernorm."), ("visual.backbone.", "vision_tower."),
+                             ("visual.proj_in.", "vision_tower.merger.linear_1."), ("visual.proj_out.", "vision_tower.merger.linear_2."),
+                             (".ln_1.", ".layernorm_before."), (".ln_2.", ".layernorm_after."), (".mlp.c_fc.", ".mlp.fc1."),
+                             (".mlp.c_proj.", ".mlp.fc2."), (".ls_1.gamma", ".lambda_1"), (".ls_2.gamma", ".lambda_2")):
+                name = name.replace(old, new)
+            return name
+
+        renamed, _ = convert({transformers_name(name): tensor for name, tensor in tensors.items()})
+        self.assertEqual(renamed.keys(), actual.keys())
+        for name in actual:
+            np.testing.assert_array_equal(renamed[name], actual[name], name)
 
 
 if __name__ == "__main__":
