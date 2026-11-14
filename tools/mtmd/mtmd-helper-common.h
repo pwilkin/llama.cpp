@@ -173,4 +173,5 @@ struct decode_embd_batch {
 
 // Internal image-loader bridge; the public bitmap API accepts RGB.
 bool mtmd_image_needs_alpha(const mtmd_context * ctx);
-mtmd_bitmap * mtmd_bitmap_init_from_rgba(const mtmd_context * ctx, uint32_t nx, uint32_t ny, const unsigned char * data);
+// composites RGBA on the checkerboard background of the models that need alpha
+mtmd_bitmap * mtmd_bitmap_init_from_rgba(uint32_t nx, uint32_t ny, const unsigned char * data);

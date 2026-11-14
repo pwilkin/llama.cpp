@@ -475,7 +475,7 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
         auto * data = stbi_load_from_memory(buf, len, &nx, &ny, &nc, needs_alpha ? 4 : 3);
         if (data) {
             result = needs_alpha
-                ? mtmd_bitmap_init_from_rgba(ctx, nx, ny, placeholder ? nullptr : data)
+                ? mtmd_bitmap_init_from_rgba(nx, ny, placeholder ? nullptr : data)
                 : mtmd_bitmap_init(nx, ny, placeholder ? nullptr : data);
             mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
             stbi_image_free(data);

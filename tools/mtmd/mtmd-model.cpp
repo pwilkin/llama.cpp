@@ -801,6 +801,7 @@ struct mtmd_model_loader {
                             !std::isfinite(hparams.eps) || hparams.eps <= 0.0f || !std::isfinite(hparams.rope_theta) || hparams.rope_theta <= 0.0f) {
                             throw std::runtime_error("inkling2: invalid vision dimensions or RoPE base");
                         }
+                        hparams.set_limit_image_tokens(1, 4096);
                         hparams.set_warmup_n_tokens(4);
                     } break;
                 case PROJECTOR_TYPE_MUSE_GLIMMER:
@@ -4426,7 +4427,6 @@ int mtmd_model::n_temporal_merge() const {
         case PROJECTOR_TYPE_LFM3VL:
         case PROJECTOR_TYPE_NEMOTRON_OMNI:
         case PROJECTOR_TYPE_LING3VL:
-        case PROJECTOR_TYPE_INKLING2:
             return 2;
         default:
             return 1;
