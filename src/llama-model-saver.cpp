@@ -193,15 +193,9 @@ void llama_model_saver::add_kv_from_model() {
     // add_kv(LLM_KV_GENERAL_SOURCE_URL,                ???);
     // add_kv(LLM_KV_GENERAL_SOURCE_HF_REPO,            ???);
 
-    add_kv(LLM_KV_VOCAB_SIZE, hparams.n_vocab_padded ? hparams.n_vocab_padded : vocab.n_tokens());
-    if (hparams.n_relative > 0) {
-        add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH, hparams.n_relative);
-        add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT, hparams.n_relative_extent);
-        add_kv(LLM_KV_ATTENTION_QK_CLIP, hparams.f_qk_clip);
-        add_kv(LLM_KV_ATTENTION_RELATIVE_CLIP, hparams.f_relative_clip);
-        add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR, hparams.n_log_scale_floor);
-        add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA, hparams.f_log_scale_alpha);
-        add_kv(LLM_KV_VOCAB_SIZE_UNPADDED, hparams.n_vocab_unpadded);
+    add_kv(LLM_KV_VOCAB_SIZE,                        hparams.n_vocab_padded ? hparams.n_vocab_padded : vocab.n_tokens());
+    if (hparams.n_vocab_unpadded > 0) {
+        add_kv(LLM_KV_VOCAB_SIZE_UNPADDED,           hparams.n_vocab_unpadded);
     }
     add_kv(LLM_KV_CONTEXT_LENGTH,                    hparams.n_ctx_train);
     add_kv(LLM_KV_EMBEDDING_LENGTH,                  hparams.n_embd);
@@ -336,6 +330,14 @@ void llama_model_saver::add_kv_from_model() {
         }
     }
     add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
+    if (hparams.n_relative > 0) {
+        add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,     hparams.n_relative);
+        add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,     hparams.n_relative_extent);
+        add_kv(LLM_KV_ATTENTION_QK_CLIP,             hparams.f_qk_clip);
+        add_kv(LLM_KV_ATTENTION_RELATIVE_CLIP,       hparams.f_relative_clip);
+        add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR,     hparams.n_log_scale_floor);
+        add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA,     hparams.f_log_scale_alpha);
+    }
     add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      hparams.dsv4_o_group_count);
     add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        hparams.dsv4_o_lora_rank);
     add_kv(LLM_KV_ATTENTION_PASS_LORA_RANK,          hparams.metis_pass_lora_rank);

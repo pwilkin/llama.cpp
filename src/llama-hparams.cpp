@@ -206,13 +206,14 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
 }
 
 uint32_t llama_hparams::n_embd_r() const {
-    if (n_sconv_channels != 0) {
-        return n_sconv_channels * (n_shortconv_l_cache - 1);
-    }
-
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;
+    }
+
+    if (n_sconv_channels != 0) {
+        // for Inkling2 models, checked before LFM2 as they set n_shortconv_l_cache too
+        return n_sconv_channels * (n_shortconv_l_cache - 1);
     }
 
     if (n_shortconv_l_cache != 0) {
