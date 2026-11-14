@@ -17,8 +17,6 @@ __all__ = [
 
 
 TEXT_MODEL_MAP: dict[str, str] = {
-    "Inkling2ForConditionalGeneration": "inkling2",
-    "Inkling2ForCausalLM": "inkling2",
     "NEOChatModel": "sensenova_u1",
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
@@ -146,6 +144,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "HYV3ForCausalLM": "hunyuan",
     "HYV4ForCausalLM": "hy_v4",
     "IQuestCoderForCausalLM": "llama",
+    "Inkling2ForCausalLM": "inkling2",
+    "Inkling2ForConditionalGeneration": "inkling2",
     "InternLM2ForCausalLM": "internlm",
     "InternLM3ForCausalLM": "internlm",
     "JAISLMHeadModel": "jais",
@@ -337,7 +337,6 @@ TEXT_MODEL_MAP: dict[str, str] = {
 
 
 MMPROJ_MODEL_MAP: dict[str, str] = {
-    "Inkling2ForConditionalGeneration": "inkling2",
     "AudioFlamingo3ForConditionalGeneration": "ultravox",
     "ChatterboxModel": "chatterbox",
     "ClefModel": "clef",
@@ -371,6 +370,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "GraniteSpeechPlusForConditionalGeneration": "granite",
     "HunYuanVLForConditionalGeneration": "hunyuan",
     "Idefics3ForConditionalGeneration": "smolvlm",
+    "Inkling2ForConditionalGeneration": "inkling2",
     "InternVisionModel": "internvl",
     "JanusForConditionalGeneration": "januspro",
     "KimiK25ForConditionalGeneration": "kimivl",
