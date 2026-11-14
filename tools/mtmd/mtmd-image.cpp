@@ -513,6 +513,27 @@ private:
 
 
 //
+// mtmd_image_preprocessor
+//
+
+mtmd_image_preproc_out mtmd_image_preprocessor::preprocess_video_frames(const std::vector<mtmd_image_u8> & frames) const {
+    mtmd_image_preproc_out result;
+    for (const auto & frame : frames) {
+        auto output = preprocess_video_frame(frame);
+        for (auto & entry : output.entries) {
+            result.entries.push_back(std::move(entry));
+        }
+        if (output.has_overview() || (output.grid_x > 0 && output.grid_y > 0)) {
+            GGML_ASSERT(frames.size() == 1);
+            result.grid_x = output.grid_x;
+            result.grid_y = output.grid_y;
+            result.overview = std::move(output.overview);
+        }
+    }
+    return result;
+}
+
+//
 // mtmd_image_preprocessor_llava_uhd
 //
 
@@ -2145,22 +2166,9 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const mt
     return output;
 }
 
-mtmd_image_preproc_out mtmd_image_preprocessor::preprocess_video_frames(const std::vector<mtmd_image_u8> & frames) const {
-    mtmd_image_preproc_out result;
-    for (const auto & frame : frames) {
-        auto output = preprocess_video_frame(frame);
-        for (auto & entry : output.entries) {
-            result.entries.push_back(std::move(entry));
-        }
-        if (output.has_overview() || (output.grid_x > 0 && output.grid_y > 0)) {
-            GGML_ASSERT(frames.size() == 1);
-            result.grid_x = output.grid_x;
-            result.grid_y = output.grid_y;
-            result.overview = std::move(output.overview);
-        }
-    }
-    return result;
-}
+//
+// mtmd_image_preprocessor_inkling2
+//
 
 mtmd_image_preproc_out mtmd_image_preprocessor_inkling2::preprocess(const mtmd_image_u8 & img) const {
     return preprocess_pair(img, nullptr);

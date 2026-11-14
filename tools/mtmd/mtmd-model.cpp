@@ -3859,11 +3859,11 @@ int mtmd_model::n_output_tokens_x(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_MUSE_GLIMMER:
         case PROJECTOR_TYPE_LFM3VL:
             return (img->nx() / params.patch_size) / 2;
-        case PROJECTOR_TYPE_INKLING2:
         case PROJECTOR_TYPE_STEP3VL:
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
         case PROJECTOR_TYPE_MINICPM_OCR_1_0:
+        case PROJECTOR_TYPE_INKLING2:
             return img->nx() / (params.patch_size * params.n_merge);
         case PROJECTOR_TYPE_DEEPSEEKOCR:
         case PROJECTOR_TYPE_DEEPSEEKOCR2:
@@ -3894,11 +3894,11 @@ int mtmd_model::n_output_tokens_y(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_MUSE_GLIMMER:
         case PROJECTOR_TYPE_LFM3VL:
             return (img->ny() / params.patch_size) / 2;
-        case PROJECTOR_TYPE_INKLING2:
         case PROJECTOR_TYPE_STEP3VL:
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
         case PROJECTOR_TYPE_MINICPM_OCR_1_0:
+        case PROJECTOR_TYPE_INKLING2:
             return img->ny() / (params.patch_size * params.n_merge);
         default:
             break;
@@ -3989,8 +3989,8 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
                 int y_patch = img->ny() / (params.patch_size * 2);
                 n_patches = x_patch * y_patch;
             } break;
-        case PROJECTOR_TYPE_INKLING2:
         case PROJECTOR_TYPE_STEP3VL:
+        case PROJECTOR_TYPE_INKLING2:
             {
                 int x_patch = img->nx() / (params.patch_size * params.n_merge);
                 int y_patch = img->ny() / (params.patch_size * params.n_merge);
@@ -4306,8 +4306,8 @@ int mtmd_model::n_mmproj_embd() const {
             return mm_model_mlp_3_w->ne[1];
         case PROJECTOR_TYPE_MINIMAX_M3:
             return mm_merger_fc2_b->ne[0];
-        case PROJECTOR_TYPE_INKLING2:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
+        case PROJECTOR_TYPE_INKLING2:
             return mm_2_w->ne[1];
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
@@ -4420,13 +4420,13 @@ int mtmd_model::n_mmproj_embd() const {
 // this logic should be refactored in near future to distinctly handle "merge frames" and "batching"
 int mtmd_model::n_temporal_merge() const {
     switch (proj_type) {
-        case PROJECTOR_TYPE_INKLING2:
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_LFM3VL:
         case PROJECTOR_TYPE_NEMOTRON_OMNI:
         case PROJECTOR_TYPE_LING3VL:
+        case PROJECTOR_TYPE_INKLING2:
             return 2;
         default:
             return 1;
