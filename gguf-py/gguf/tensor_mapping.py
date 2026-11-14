@@ -1931,6 +1931,7 @@ class TensorNameMap:
             "vision_model.embeddings.cls_register_token", # Nemotron Omni
             "model.vision_model.embeddings.class_embedding", # Deepseek-OCR
             "model.vision_tower.embeddings.class_embedding", # inkling2
+            "model.visual.backbone.embeddings.class_embedding", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_ROPE_FREQS: (
@@ -1963,6 +1964,7 @@ class TensorNameMap:
             "vision_model.conv1", # Step3-VL
             "model.vision_embedder.patch_dense", # gemma4 unified
             "model.vision_tower.patch_embedder.patch_embedding", # muse-glimmer
+            "model.visual.backbone.embeddings.patch_embedding", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_NORM: (
@@ -1977,6 +1979,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.V_ENC_EMBD_CLS_POS: (
             "model.vision_tower.embeddings.cls_position_embedding", # inkling2
+            "model.visual.backbone.embeddings.cls_position_embedding", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_POS: (
@@ -1997,6 +2000,7 @@ class TensorNameMap:
             "model.vision_tower.patch_embedder.position_embedding_table", # gemma4
             "vision_model.positional_embedding", # Step3-VL
             "model.vision_embedder.pos_embedding", # gemma4 unified
+            "model.visual.backbone.embeddings.position_embedding", # inkling2
         ),
 
         # TODO: I think these should all be moved to mapping_cfg?
@@ -2044,6 +2048,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.q_proj.linear", # gemma4
             "model.qwen2_model.model.model.layers.{bid}.self_attn.q_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.attn.q_proj", # muse-glimmer
+            "model.visual.backbone.layers.{bid}.self_attn.q_proj", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_Q_NORM: (
@@ -2075,6 +2080,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.k_proj.linear", # gemma4
             "model.qwen2_model.model.model.layers.{bid}.self_attn.k_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.attn.k_proj", # muse-glimmer
+            "model.visual.backbone.layers.{bid}.self_attn.k_proj", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_K_NORM: (
@@ -2106,6 +2112,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.v_proj.linear", # gemma4
             "model.qwen2_model.model.model.layers.{bid}.self_attn.v_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.attn.v_proj", # muse-glimmer
+            "model.visual.backbone.layers.{bid}.self_attn.v_proj", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_INPUT_NORM: (
@@ -2136,6 +2143,7 @@ class TensorNameMap:
             "model.qwen2_model.model.model.layers.{bid}.input_layernorm", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.norm1", # muse-glimmer
             "model.vision_tower.layers.{bid}.layernorm_before", # inkling2
+            "model.visual.backbone.layers.{bid}.ln_1", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_O: (
@@ -2167,6 +2175,7 @@ class TensorNameMap:
             "vision_encoder.blocks.{bid}.attn.proj", # dots3note
             "vision_model.transformer.resblocks.{bid}.attn.out_proj", # Step3-VL
             "model.vision_tower.layers.{bid}.attn.proj", # muse-glimmer
+            "model.visual.backbone.layers.{bid}.self_attn.out_proj", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_SINKS: (
@@ -2202,6 +2211,7 @@ class TensorNameMap:
             "model.qwen2_model.model.model.layers.{bid}.post_attention_layernorm", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.norm2", # muse-glimmer
             "model.vision_tower.layers.{bid}.layernorm_after", # inkling2
+            "model.visual.backbone.layers.{bid}.ln_2", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_FFN_UP: (
@@ -2232,6 +2242,7 @@ class TensorNameMap:
             "vision_model.transformer.resblocks.{bid}.mlp.c_fc", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.mlp.up_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.mlp.fc1", # muse-glimmer
+            "model.visual.backbone.layers.{bid}.mlp.c_fc", # inkling2
         ),
 
         MODEL_TENSOR.V_ENC_FFN_GATE: (
@@ -2273,6 +2284,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.mlp.down_proj", # gemma4
             "vision_model.transformer.resblocks.{bid}.mlp.c_proj", # Step3-VL
             "model.vision_tower.layers.{bid}.mlp.fc2", # muse-glimmer
+            "model.visual.backbone.layers.{bid}.mlp.c_proj", # inkling2
         ),
 
 
@@ -2312,6 +2324,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.lambda_1", # Intern-S1
             "vision_model.transformer.resblocks.{bid}.ls_1", # Step3-VL
             "model.vision_tower.layers.{bid}.lambda_1", # inkling2
+            "model.visual.backbone.layers.{bid}.ls_1", # inkling2
         ),
 
         MODEL_TENSOR.V_LAYER_SCALE_2: (
@@ -2320,6 +2333,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.lambda_2", # Intern-S1
             "vision_model.transformer.resblocks.{bid}.ls_2", # Step3-VL
             "model.vision_tower.layers.{bid}.lambda_2", # inkling2
+            "model.visual.backbone.layers.{bid}.ls_2", # inkling2
         ),
 
         MODEL_TENSOR.V_LAYER_OUT_SCALE: (
@@ -2338,6 +2352,7 @@ class TensorNameMap:
             "vision_model.ln_pre", # Step3-VL
             "model.vision_tower.ln_pre", # muse-glimmer
             "model.vision_tower.pre_layernorm", # inkling2
+            "model.visual.backbone.ln_pre", # inkling2
         ),
 
         MODEL_TENSOR.V_POST_NORM: (

@@ -325,21 +325,17 @@ class Inkling2VisionModel(MmprojModel):
         name, gen = item
         if not name.startswith(("model.visual.", "model.vision_tower.")):
             return None
-        name = name.replace("model.visual.backbone.embeddings.", "model.vision_tower.embeddings.")
-        name = name.replace("model.visual.backbone.ln_pre.", "model.vision_tower.pre_layernorm.")
-        name = name.replace("model.visual.backbone.layers.", "model.vision_tower.layers.")
-        name = name.replace("model.visual.proj_in.", "model.vision_tower.merger.linear_1.")
-        name = name.replace("model.visual.proj_out.", "model.vision_tower.merger.linear_2.")
-        for old, new in (("ln_1", "layernorm_before"), ("ln_2", "layernorm_after"), ("mlp.c_fc", "mlp.fc1"), ("mlp.c_proj", "mlp.fc2"), ("ls_1.gamma", "lambda_1"), ("ls_2.gamma", "lambda_2")):
-            name = name.replace("." + old, "." + new)
-        if name.endswith(("position_embedding", "lambda_1", "lambda_2")):
-            name += ".weight"
         return name, gen
 
+    # mm.{bid} takes the projector layer index, the mapping table cannot derive it from these names
+    _projector_layers = {"model.visual.proj_in": 1, "model.visual.proj_out": 2, "model.vision_tower.merger.linear_1": 1, "model.vision_tower.merger.linear_2": 2}
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        for index in (1, 2):
-            if name.startswith(f"model.vision_tower.merger.linear_{index}."):
-                suffix = name.rsplit(".", 1)[1]
-                yield self.format_tensor_name(gguf.MODEL_TENSOR.V_MMPROJ, bid=index, suffix="." + suffix), data_torch
-                return
+        module, _, suffix = name.rpartition(".")
+        if module in self._projector_layers:
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.V_MMPROJ, self._projector_layers[module], "." + suffix), data_torch
+            return
+        # these are bare parameters, they have no .weight
+        if name.endswith(("position_embedding", ".lambda_1", ".lambda_2", ".gamma")):
+            name = name.removesuffix(".gamma") + ".weight"
         yield from super().modify_tensors(data_torch, name, bid)
