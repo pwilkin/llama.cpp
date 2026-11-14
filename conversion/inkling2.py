@@ -246,17 +246,17 @@ class Inkling2Model(TextModel):
         w.add_attn_res_block_size(hp.get("n_layers_per_attn_res_block", 6))
         w.add_final_logit_softcapping(hp.get("final_logit_softcapping", 30.0))
         for key, field, default in (
-            ("ATTENTION_RELATIVE_LENGTH", "d_rel", 16),
-            ("ATTENTION_RELATIVE_EXTENT", "rel_extent", 1024),
-            ("ATTENTION_QK_CLIP", "qk_l2_clip_threshold", 22.627416997969522),
-            ("ATTENTION_RELATIVE_CLIP", "rel_l2_clip_threshold", 8.0),
-            ("ATTENTION_LOG_SCALE_FLOOR", "log_scaling_n_floor", 128000),
-            ("ATTENTION_LOG_SCALE_ALPHA", "log_scaling_alpha", 0.1),
-            ("VOCAB_SIZE_UNPADDED", "unpadded_vocab_size", 200058),
+            (gguf.Keys.Attention.RELATIVE_LENGTH, "d_rel", 16),
+            (gguf.Keys.Attention.RELATIVE_EXTENT, "rel_extent", 1024),
+            (gguf.Keys.Attention.QK_CLIP, "qk_l2_clip_threshold", 22.627416997969522),
+            (gguf.Keys.Attention.RELATIVE_CLIP, "rel_l2_clip_threshold", 8.0),
+            (gguf.Keys.Attention.LOG_SCALE_FLOOR, "log_scaling_n_floor", 128000),
+            (gguf.Keys.Attention.LOG_SCALE_ALPHA, "log_scaling_alpha", 0.1),
+            (gguf.Keys.LLM.VOCAB_SIZE_UNPADDED, "unpadded_vocab_size", 200058),
         ):
             value = hp.get(field, default)
             add = w.add_float32 if isinstance(default, float) else w.add_uint32
-            add(getattr(gguf.Keys.LLM, key).format(arch="inkling2"), value)
+            add(key.format(arch="inkling2"), value)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         if new_name.endswith(("_conv.weight", "_clip.weight", "_res_query.weight", "attn_rel_bias.weight")):
