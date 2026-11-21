@@ -742,6 +742,11 @@ void process_shaders() {
                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
 
+                if (!f16acc) {
+                    string_to_spv("flash_attn_f32_f16_rows", "flash_attn_cm1.comp",
+                        merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}, {"KV_ROWS", "1"}}), fp16, true, false, false);
+                }
+
                 std::map<std::string, std::string> fa_flip_dict = fa_base_dict;
                 fa_flip_dict.erase("DATA_A_IQ4_NL");
                 string_to_spv("flash_attn_f32_f16_flip", "flash_attn_cm1_flip.comp",

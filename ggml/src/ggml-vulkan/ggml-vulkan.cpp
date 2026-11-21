@@ -2387,6 +2387,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
             const bool flip = (fa.first.flags & 64) != 0;
+            const bool kv_rows = (fa.first.flags & (1u << 31)) != 0;
 
             const void * spv_data;
             size_t spv_size;
@@ -2410,12 +2411,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (f32acc) { spv_data = flash_attn_f32_f16_flip_cm1_data;        spv_size = flash_attn_f32_f16_flip_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_flip_f16acc_cm1_data; spv_size = flash_attn_f32_f16_flip_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_flip_cm1" : "flash_attn_f32_f16_flip_cm1";
+            } else if (kv_rows) {
+                if (!f32acc) continue;
+                spv_data = flash_attn_f32_f16_rows_cm1_data;
+                spv_size = flash_attn_f32_f16_rows_cm1_len;
+                name = "flash_attn_f32_f16_rows_cm1";
             } else {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", kv_rows ? 9 : 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -9122,8 +9128,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = bias ? get_fa_tuning_params_scalar(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc)
-                         : get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
+    if (bias) {
+        tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, 1, false);
+        if (tuning_params.path != FA_COOPMAT1 || !f32acc || (rows && k_type_eff == GGML_TYPE_BF16)) {
+            tuning_params = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+        }
+    } else {
+        tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
+    }
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;
@@ -16805,7 +16817,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 if (indexed_bias && (op->src[6]->ne[1] > 0x7fffff || !device->subgroup_shuffle || !device->subgroup_vote ||
                         ggml_nelements(op->src[6]) > UINT32_MAX || ggml_nelements(op->src[7]) > UINT32_MAX ||
-                        op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16 ||
                         (op->src[1]->ne[0] != 64 && op->src[1]->ne[0] != 128) || op->src[1]->ne[0] != op->src[2]->ne[0])) {
                     return false;
                 }
