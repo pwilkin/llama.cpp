@@ -1759,6 +1759,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
                 }
 
+                // the kernels have no pad path for the row lists
+                if (kv_rows->ne[0] % OP_FLASH_ATTN_EXT_NCPSG != 0 || kv_rows->ne[0] % OP_FLASH_ATTN_EXT_VEC_NCPSG != 0) {
+                    return false;
+                }
+
                 // the non-vec kernels attend over a contiguous F16 copy of the referenced rows:
                 // - F16 K/V is gathered directly
                 // - quantized K/V is first dequantized with kernel_flash_attn_ext_kv_*_f16
