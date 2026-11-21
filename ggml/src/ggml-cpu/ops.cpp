@@ -8869,6 +8869,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * bias_table   = dst->src[6];
+    const ggml_tensor * bias_indices = dst->src[7];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8973,12 +8975,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        // indexed bias: table[head, indices[col, query], query] is added to the mask, before its F16 rounding
+        const int64_t   n_bins = bias_table ? bias_table->ne[1] : 0;
+        const int64_t   iqb    = iq3*neq1 + iq1;
+        const int32_t * bidx   = bias_indices ? (const int32_t *) ((const char *) bias_indices->data + iqb*bias_indices->nb[1]) : nullptr;
+        const float   * btab   = bias_table   ? (const float   *) bias_table->data + iqb*n_bins*neq2 + iq2 : nullptr;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (bidx && (uint32_t) bidx[ic] < (uint64_t) n_bins) {
+                mv = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(mv + btab[bidx[ic]*neq2]));
+            }
+            mv *= slope;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9496,7 +9508,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && !kv_rows && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // the indexed bias is implemented in the one_chunk path only
+    const bool has_ibias = dst->src[6] != nullptr;
+
+    const bool use_split_kv_path = !use_ref && !kv_rows && !has_ibias && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9553,7 +9568,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !has_ibias &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
