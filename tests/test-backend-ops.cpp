@@ -9419,6 +9419,143 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with an indexed bias: table[head, indices[col, query], query] is added to the mask
+struct test_flash_attn_ext_indexed_bias : public test_case {
+    const int64_t hs;
+    const int64_t nh;      // K/V heads
+    const int64_t gqa;
+    const int64_t kv;      // mask columns
+    const int64_t nb;      // queries per stream
+    const int64_t n_streams;
+    const int64_t n_bins;
+    const bool    use_rows; // K/V row lists (ggml_flash_attn_ext_rows)
+    const bool    sinks;
+    const ggml_type type_KV;
+
+    std::vector<int32_t> rows;
+
+    std::string vars() override {
+        return VARS_TO_STR10(hs, nh, gqa, kv, nb, n_streams, n_bins, use_rows, sinks, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_indexed_bias(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 3, int64_t kv = 1000, int64_t nb = 8, int64_t n_streams = 1,
+                                     int64_t n_bins = 1025, bool use_rows = false, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_streams(n_streams), n_bins(n_bins), use_rows(use_rows), sinks(sinks), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_streams);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+        ggml_tensor * r = nullptr;
+
+        if (use_rows) {
+            // cache layout [hs, nh, n_cells], shared by all streams
+            ggml_tensor * k0 = ggml_new_tensor_3d(ctx, type_KV, hs, nh, 2*kv);
+            ggml_tensor * v0 = ggml_new_tensor_3d(ctx, type_KV, hs, nh, 2*kv);
+            ggml_set_name(k0, "k0");
+            ggml_set_name(v0, "v0");
+
+            k = ggml_permute(ctx, k0, 0, 2, 1, 3);
+            v = ggml_permute(ctx, v0, 0, 2, 1, 3);
+
+            r = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_streams);
+            ggml_set_name(r, "r");
+        } else {
+            k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, n_streams);
+            v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, n_streams);
+            ggml_set_name(k, "k");
+            ggml_set_name(v, "v");
+        }
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, n_streams);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nh*gqa, n_bins, nb*n_streams);
+        ggml_set_name(table, "table");
+
+        ggml_tensor * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb*n_streams);
+        ggml_set_name(indices, "indices");
+
+        ggml_tensor * out = use_rows ?
+            ggml_flash_attn_ext_rows(ctx, q, k, v, m, r, 1.0f/sqrtf(hs), 0.0f, 0.0f) :
+            ggml_flash_attn_ext     (ctx, q, k, v, m,    1.0f/sqrtf(hs), 0.0f, 0.0f);
+
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh*gqa);
+            ggml_set_name(s, "s");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
+
+        ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x1B1A5);
+
+        // per stream: distinct random cells, the tail of the list is padding
+        rows.assign(kv*n_streams, -1);
+        if (use_rows) {
+            std::vector<int32_t> order(2*kv);
+            for (int64_t s = 0; s < n_streams; ++s) {
+                for (int64_t i = 0; i < 2*kv; ++i) {
+                    order[i] = i;
+                }
+                std::shuffle(order.begin(), order.end(), gen);
+                const int64_t n_used = kv - (s*37) % std::max<int64_t>(1, kv/2);
+                for (int64_t i = 0; i < n_used; ++i) {
+                    rows[s*kv + i] = order[i];
+                }
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "r") == 0) {
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // 0/-INF like a causal mask, so that blocks can be all zero, all -INF or mixed (holes in stream 1 only)
+                std::vector<ggml_fp16_t> h(ggml_nelements(t));
+                for (int64_t s = 0; s < n_streams; ++s) {
+                    for (int64_t j = 0; j < nb; ++j) {
+                        const int64_t last = kv >= nb ? kv - nb + j : (j*kv)/nb;
+                        for (int64_t i = 0; i < kv; ++i) {
+                            const bool pad    = use_rows && rows[s*kv + i] < 0;
+                            const bool future = i > last;
+                            const bool drop   = s == 1 && i != last && (i + 3*j) % 13 == 0;
+                            h[(s*nb + j)*kv + i] = ggml_fp32_to_fp16(pad || future || drop ? -INFINITY : 0.0f);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "indices") == 0) {
+                // a few out-of-range bins, which get no bias
+                std::vector<int32_t> idx(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dis(-1, n_bins);
+                for (auto & x : idx) {
+                    x = dis(gen);
+                }
+                ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "table") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -13380,6 +13517,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 3000, 768,  nb, n_slices, GGML_TYPE_Q8_0));
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 2, 8, 4096, 1024, nb, n_slices));
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
+        }
+    }
+
+    // flash attention with an indexed bias (Inkling relative position bias)
+    for (int64_t nb : {1, 3, 8, 33, 512}) {
+        for (int64_t n_streams : {1, 2}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1000, nb, n_streams, 1025, false, true));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1280, nb, n_streams, 1025, true,  true));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3,  768, nb, n_streams, 1025, true,  true, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias( 64, 4, 2,  777, nb, n_streams,   17, false, false));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias( 64, 4, 2,  777, nb, n_streams,   17, false, true, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias( 64, 4, 2,  256, nb, n_streams,   17, true,  false));
         }
     }
 

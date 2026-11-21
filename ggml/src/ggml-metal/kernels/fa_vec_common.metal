@@ -14,6 +14,7 @@ constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
+constant bool    FC_flash_attn_ext_vec_has_ibias  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -44,6 +45,8 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * pad,
         device       char * dst,
         device const char * idx,
+        device const char * ibias_tab,
+        device const char * ibias_idx,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -274,6 +277,17 @@ kernel void kernel_flash_attn_ext_vec(
                 FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                     if ((iq1*Q + qq) >= args.ne01) {
                         sm[qq*C + tiisg] = -MAXHALF;
+                    }
+                }
+            }
+
+            if (FC_flash_attn_ext_vec_has_ibias) {
+                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                    if ((iq1*Q + qq) < args.ne01) {
+                        const int64_t iq = (int64_t) iq3*args.ne01 + iq1*Q + qq;
+
+                        sm[qq*C + tiisg] = (half) ((float) sm[qq*C + tiisg] +
+                                flash_attn_ext_ibias(ibias_tab, ibias_idx, iq, ic0*C + tiisg, args.ne11, args.n_bins, args.ne02, iq2));
                     }
                 }
             }

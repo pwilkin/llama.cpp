@@ -68,6 +68,18 @@ static inline float e8m0_to_fp32(uint8_t x) {
     return as_type<float>(bits);
 }
 
+// FLASH_ATTN_EXT indexed bias: table[head, idx[query, col], query], or 0 for an out-of-range bin
+static inline float flash_attn_ext_ibias(
+        device const char * tab, device const char * idx, int64_t query, int32_t col, int32_t n_cols, int32_t n_bins, int32_t n_head, int32_t head) {
+    if (col >= n_cols) {
+        return 0.0f;
+    }
+
+    const int32_t bin = ((device const int32_t *) idx)[query*n_cols + col];
+
+    return (uint32_t) bin < (uint32_t) n_bins ? ((device const float *) tab)[(query*n_bins + bin)*n_head + head] : 0.0f;
+}
+
 static inline float dot(float x, float y) {
     return x*y;
 }
